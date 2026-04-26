@@ -1,0 +1,192 @@
+"""E2E crystallizer (memory analysis) tests through HTTP API."""
+
+import pytest
+
+from tests.conftest import get_test_auth, get_admin_headers, uid as _uid
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+async def _write_memory(client, tenant_id, headers, content):
+    """Write a memory so crystallization has something to analyse."""
+    tag = _uid()
+    resp = await client.post(
+        "/api/v1/memories",
+        json={
+            "tenant_id": tenant_id,
+            "content": f"{content} [{tag}]",
+            "agent_id": f"cryst-agent-{tag}",
+            "fleet_id": f"cryst-fleet-{tag}",
+            "memory_type": "fact",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 201, f"Write memory failed: {resp.text}"
+    return resp.json()
+
+
+async def _crystallize(client, tenant_id, headers):
+    """Trigger crystallization; returns (status_code, data).
+
+    Crystallization processes all existing memories for the tenant, so it may
+    return 409 on repeated runs if the DB already has crystal summaries from
+    a prior run.  Callers should handle both 200 and 409.
+    """
+    resp = await client.post(
+        "/api/v1/crystallize",
+        json={"tenant_id": tenant_id},
+        headers=headers,
+    )
+    return resp.status_code, resp.json()
+
+
+# ---------------------------------------------------------------------------
+# POST /api/crystallize — trigger for a single tenant
+# ---------------------------------------------------------------------------
+
+
+async def test_trigger_crystallization(client):
+    """POST /api/crystallize returns a report_id and status='running'."""
+    tenant_id, headers = get_test_auth()
+    await _write_memory(client, tenant_id, headers, "Crystallize test fact")
+
+    code, data = await _crystallize(client, tenant_id, headers)
+    # 200 on clean DB, 409 if crystal summaries already exist
+    assert code in (200, 409), f"Unexpected status {code}: {data}"
+    if code == 200:
+        assert "report_id" in data
+        assert data["status"] == "running"
+
+
+# ---------------------------------------------------------------------------
+# POST /api/crystallize/all — admin only
+# ---------------------------------------------------------------------------
+
+
+async def test_trigger_crystallize_all_as_admin(client):
+    """POST /api/crystallize/all with admin key succeeds."""
+    tenant_id, auth_headers = get_test_auth()
+    admin_headers = get_admin_headers()
+
+    await _write_memory(client, tenant_id, auth_headers, "Crystallize-all test")
+
+    resp = await client.post(
+        "/api/v1/crystallize/all",
+        headers=admin_headers,
+    )
+    # 200 on clean DB, 409 if crystal summaries already exist
+    assert resp.status_code in (200, 409), f"Unexpected: {resp.text}"
+    if resp.status_code == 200:
+        data = resp.json()
+        assert "reports" in data
+        assert isinstance(data["reports"], list)
+
+
+async def test_crystallize_all_non_admin_forbidden(client):
+    """POST /api/crystallize/all without admin key returns 403."""
+    resp = await client.post(
+        "/api/v1/crystallize/all",
+        headers={"X-Tenant-ID": "some-tenant"},
+    )
+    assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# GET /api/crystallize/reports — list reports
+# ---------------------------------------------------------------------------
+
+
+async def test_list_reports(client):
+    """GET /api/crystallize/reports returns a list for the tenant."""
+    tenant_id, headers = get_test_auth()
+
+    # Trigger one so there's at least one report
+    await _write_memory(client, tenant_id, headers, "Report list test")
+    await _crystallize(client, tenant_id, headers)
+
+    resp = await client.get(
+        f"/api/v1/crystallize/reports?tenant_id={tenant_id}",
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    reports = resp.json()
+    assert isinstance(reports, list)
+    assert len(reports) >= 1
+    report = reports[0]
+    assert "id" in report
+    assert "tenant_id" in report
+    assert "status" in report
+    assert "trigger" in report
+
+
+# ---------------------------------------------------------------------------
+# GET /api/crystallize/reports/{id} — get report details
+# ---------------------------------------------------------------------------
+
+
+async def test_get_report_by_id(client):
+    """GET /api/crystallize/reports/{id} returns full report details."""
+    tenant_id, headers = get_test_auth()
+
+    await _write_memory(client, tenant_id, headers, "Report detail unique test")
+    await _crystallize(client, tenant_id, headers)
+
+    # Get report ID from the reports list (reliable regardless of crystallize outcome)
+    list_resp = await client.get(
+        f"/api/v1/crystallize/reports?tenant_id={tenant_id}&limit=1",
+        headers=headers,
+    )
+    assert list_resp.status_code == 200
+    reports = list_resp.json()
+    assert len(reports) >= 1
+    report_id = reports[0]["id"]
+
+    resp = await client.get(
+        f"/api/v1/crystallize/reports/{report_id}",
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["id"] == report_id
+    assert data["tenant_id"] == tenant_id
+    for key in ("summary", "hygiene", "health", "issues", "crystallization"):
+        assert key in data, f"Missing key '{key}' in report detail"
+
+
+async def test_get_report_not_found(client):
+    """GET /api/crystallize/reports/{id} returns 404 for non-existent report."""
+    _, headers = get_test_auth()
+    fake_id = "00000000-0000-0000-0000-000000000000"
+    resp = await client.get(
+        f"/api/v1/crystallize/reports/{fake_id}",
+        headers=headers,
+    )
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Auth required
+# ---------------------------------------------------------------------------
+
+
+async def test_crystallize_auth_required(client):
+    """POST /api/crystallize with valid auth is accepted."""
+    tenant_id, headers = get_test_auth()
+    await _write_memory(client, tenant_id, headers, "Auth-required test")
+
+    code, _ = await _crystallize(client, tenant_id, headers)
+    # 200 or 409 are both valid (means auth passed); anything else is a problem
+    assert code in (200, 409)
+
+
+async def test_reports_auth_required(client):
+    """GET /api/crystallize/reports requires auth."""
+    tenant_id, headers = get_test_auth()
+    resp = await client.get(
+        f"/api/v1/crystallize/reports?tenant_id={tenant_id}",
+        headers=headers,
+    )
+    assert resp.status_code == 200

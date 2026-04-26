@@ -1,0 +1,123 @@
+# Full local development stack — hot-reload, mirrors staging architecture
+# Usage: docker compose -f docker-compose.dev.yml up -d
+services:
+
+  # ── Infrastructure ──────────────────────────────────────────────
+
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: memclaw
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: memclaw
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U memclaw"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Core Storage API (hot-reload) ───────────────────────────────
+
+  core-storage-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    command: >
+      uvicorn core_storage_api.app:app
+      --host 0.0.0.0 --port 8002 --reload
+      --reload-dir /app/core-storage-api/src
+      --reload-dir /app/common
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./common:/app/common
+      - ./core-storage-api/src:/app/core-storage-api/src
+    environment:
+      PYTHONPATH: /app/core-storage-api/src:/app
+      DATABASE_URL: postgresql+asyncpg://memclaw:changeme@db:5432/memclaw
+      ALLOYDB_HOST: db
+      ALLOYDB_PORT: 5432
+      ALLOYDB_USER: memclaw
+      ALLOYDB_PASSWORD: changeme
+      ALLOYDB_DATABASE: memclaw
+      ALLOYDB_REQUIRE_SSL: "false"
+      ENVIRONMENT: development
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Core API (hot-reload) ───────────────────────────────────────
+
+  core-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    command: >
+      uvicorn core_api.app:app
+      --host 0.0.0.0 --port 8000 --reload
+      --reload-dir /app/core-api/src
+      --reload-dir /app/common
+    env_file:
+      - env.dev
+      - path: .env
+        required: false
+      - path: .env.local
+        required: false
+      - path: .env.test
+        required: false
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./common:/app/common
+      - ./core-api/src:/app/core-api/src
+      - ./migrations:/app/migrations
+      - ./plugin:/app/plugin
+      - ./static:/app/static
+      - ./VERSION:/app/VERSION:ro
+    environment:
+      PYTHONPATH: /app/core-api/src:/app
+      ALLOYDB_HOST: db
+      CORE_STORAGE_API_URL: http://core-storage-api:8002
+      REDIS_URL: redis://redis:6379/0
+      # Pass through provider keys from host
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+    depends_on:
+      core-storage-api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  pgdata:
+  redis_data:

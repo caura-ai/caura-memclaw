@@ -1,0 +1,337 @@
+"""ClassifyQuery — classify incoming query into a retrieval strategy.
+
+Examines the query tokens against the entity full-text index.  When entity
+matches are found the step short-circuits to an *entity_lookup* strategy
+(graph-expanded, scored by hop distance) so downstream embedding and scored
+search can be skipped.  Otherwise the query is routed to keyword or semantic
+search based on the adaptive FTS weight.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import string
+import types
+from uuid import UUID
+
+from core_api.clients.storage_client import get_storage_client
+from core_api.constants import (
+    ENTITY_STOPWORDS,
+    ENTITY_TOKEN_MIN_LENGTH,
+    FTS_WEIGHT_BOOSTED,
+    GRAPH_HOP_BOOST,
+    GRAPH_MAX_BOOSTED_MEMORIES,
+    GRAPH_MAX_EXPANDED_ENTITIES,
+)
+from core_api.pipeline.context import PipelineContext
+from core_api.pipeline.step import StepResult
+from core_api.pipeline.steps.search.retrieval_types import (
+    RetrievalPlan,
+    RetrievalStrategy,
+)
+from core_api.schemas import EntityLinkOut
+
+_GRAPH_HOP_BOOST_FALLBACK = GRAPH_HOP_BOOST[max(GRAPH_HOP_BOOST)]
+
+_RECENT_CONTEXT_RE = re.compile(
+    r"\b(what was i|what did i|my recent|my latest"
+    r"|most recent|latest updates?|recent updates?"
+    r"|what happened recently|catch me up"
+    r"|what have i missed|what did we)\b",
+    re.IGNORECASE,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Step
+# ---------------------------------------------------------------------------
+
+
+class ClassifyQuery:
+    @property
+    def name(self) -> str:
+        return "classify_query"
+
+    async def execute(self, ctx: PipelineContext) -> StepResult | None:
+        query: str = ctx.data["query"]
+        sp: dict = ctx.data["search_params"]
+        tenant_id: str = ctx.data["tenant_id"]
+        fleet_ids: list[str] | None = ctx.data.get("fleet_ids")
+        fleet_ids = fleet_ids or None  # normalise [] → None for consistent fleet filtering
+        caller_agent_id: str | None = ctx.data.get("caller_agent_id")
+        filter_agent_id: str | None = ctx.data.get("filter_agent_id")
+        memory_type_filter: str | None = ctx.data.get("memory_type_filter")
+        status_filter: str | None = ctx.data.get("status_filter")
+        graph_max_hops: int = sp["graph_max_hops"]
+        top_k: int = sp["top_k"]
+
+        # Tokenize, strip punctuation, and filter to meaningful tokens.
+        tokens = [
+            stripped
+            for t in query.split()
+            if (stripped := t.strip(string.punctuation))
+            and len(stripped) >= ENTITY_TOKEN_MIN_LENGTH
+            and stripped.lower() not in ENTITY_STOPWORDS
+        ]
+
+        if tokens:
+            try:
+                sc = get_storage_client()
+                matched_ids = await self._entity_fts(sc, tokens, tenant_id, fleet_ids)
+
+                if matched_ids:
+                    entity_hops = await self._expand_per_fleet(
+                        sc,
+                        matched_ids,
+                        tenant_id,
+                        fleet_ids,
+                        graph_max_hops,
+                        use_union=True,
+                    )
+
+                    filtered_rows = await self._collect_memories(
+                        sc,
+                        entity_hops,
+                        tenant_id,
+                        top_k,
+                        fleet_ids=fleet_ids,
+                        caller_agent_id=caller_agent_id,
+                        filter_agent_id=filter_agent_id,
+                        memory_type_filter=memory_type_filter,
+                        status_filter=status_filter,
+                    )
+
+                    if filtered_rows:
+                        plan = RetrievalPlan(
+                            strategy=RetrievalStrategy.ENTITY_LOOKUP,
+                            matched_entity_ids=matched_ids,
+                            skip_embedding=True,
+                            skip_scored_search=True,
+                        )
+                        # min_similarity is not applied to entity_lookup results:
+                        # these rows are retrieved by graph traversal (hop boost)
+                        # rather than vector similarity, so vec_sim is None and the
+                        # cosine threshold is not meaningful here.
+                        # PostFilterResults will SKIP via its guard.
+                        ctx.data["filtered_rows"] = filtered_rows
+                        ctx.data["retrieval_plan"] = plan
+                        logger.info(
+                            "classify_query: entity_lookup (%d entities)",
+                            len(matched_ids),
+                        )
+                        return None
+                    # Preserve entity_hops so _entity_boost_pipeline can skip
+                    # re-expansion on the keyword/semantic fallthrough path.
+                    ctx.data["_classified_entity_hops"] = entity_hops
+                    logger.info("classify_query: entity matched but no linked memories, falling through")
+            except Exception:
+                logger.warning(
+                    "classify_query: entity lookup failed, falling back to search",
+                    exc_info=True,
+                )
+
+        # TEMPORAL: ExtractTemporalHint already set temporal_window upstream.
+        temporal_window = ctx.data.get("temporal_window")
+        if temporal_window is not None:
+            overrides = {
+                "freshness_decay_days": max(temporal_window.days, 1),
+                "freshness_floor": 0.3,
+            }
+            plan = RetrievalPlan(
+                strategy=RetrievalStrategy.TEMPORAL,
+                search_param_overrides=overrides,
+            )
+            ctx.data["retrieval_plan"] = plan
+            logger.info(
+                "classify_query: temporal (window=%dd)",
+                temporal_window.days,
+            )
+            return None
+
+        # RECENT_CONTEXT: recency-intent keywords.
+        if _RECENT_CONTEXT_RE.search(query):
+            overrides = {
+                "freshness_decay_days": 7,
+                "freshness_floor": 0.2,
+                "top_k": min(sp["top_k"], 5),
+            }
+            plan = RetrievalPlan(
+                strategy=RetrievalStrategy.RECENT_CONTEXT,
+                search_param_overrides=overrides,
+            )
+            ctx.data["retrieval_plan"] = plan
+            logger.info("classify_query: recent_context")
+            return None
+
+        # No entity / temporal / recency match — keyword vs semantic search.
+        if sp["fts_weight"] >= FTS_WEIGHT_BOOSTED:
+            plan = RetrievalPlan(strategy=RetrievalStrategy.KEYWORD_SEARCH)
+            logger.info("classify_query: keyword_search (fts_weight=%.2f)", sp["fts_weight"])
+        else:
+            plan = RetrievalPlan(strategy=RetrievalStrategy.SEMANTIC_SEARCH)
+            logger.info("classify_query: semantic_search (fts_weight=%.2f)", sp["fts_weight"])
+
+        ctx.data["retrieval_plan"] = plan
+        return None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _expand_per_fleet(
+        sc: object,
+        seed_ids: list[UUID],
+        tenant_id: str,
+        fleet_ids: list[str] | None,
+        max_hops: int,
+        *,
+        use_union: bool = True,
+    ) -> dict[UUID, tuple[int, float]]:
+        """Call expand_graph per fleet in parallel, merge by keeping lowest hop."""
+        ids_to_expand = fleet_ids if fleet_ids else [None]
+
+        results = await asyncio.gather(
+            *(
+                sc.expand_graph(
+                    {
+                        "seed_entity_ids": [str(eid) for eid in seed_ids],
+                        "tenant_id": tenant_id,
+                        "fleet_id": fid,
+                        "max_hops": max_hops,
+                        "use_union": use_union,
+                    }
+                )
+                for fid in ids_to_expand
+            ),
+            return_exceptions=True,
+        )
+
+        merged: dict[UUID, tuple[int, float]] = {}
+        for partial in results:
+            if isinstance(partial, BaseException):
+                logger.warning("expand_graph failed for a fleet: %s", partial)
+                continue
+            # Storage client returns {entity_id_str: [hop, weight], ...}
+            for eid_str, hop_weight in partial.items():
+                eid = UUID(eid_str)
+                hop, weight = hop_weight[0], hop_weight[1]
+                if (
+                    eid not in merged
+                    or hop < merged[eid][0]
+                    or (hop == merged[eid][0] and weight > merged[eid][1])
+                ):
+                    merged[eid] = (hop, weight)
+        return merged
+
+    @staticmethod
+    async def _entity_fts(
+        sc: object,
+        tokens: list[str],
+        tenant_id: str,
+        fleet_ids: list[str] | None,
+    ) -> list[UUID]:
+        """Full-text search against the entity index via storage client."""
+        data = {
+            "tokens": tokens,
+            "tenant_id": tenant_id,
+        }
+        if fleet_ids:
+            data["fleet_ids"] = fleet_ids
+        result = await sc.fts_search_entities(data)
+        return [UUID(eid) for eid in result]
+
+    @staticmethod
+    async def _collect_memories(
+        sc: object,
+        entity_hops: dict[UUID, tuple[int, float]],
+        tenant_id: str,
+        top_k: int,
+        *,
+        fleet_ids: list[str] | None = None,
+        caller_agent_id: str | None = None,
+        filter_agent_id: str | None = None,
+        memory_type_filter: str | None = None,
+        status_filter: str | None = None,
+    ) -> list[types.SimpleNamespace]:
+        """Load memories linked to graph-expanded entities, scored by hop distance."""
+        all_entity_ids = list(entity_hops.keys())
+
+        # Cap entity count to bound the query size.
+        if len(all_entity_ids) > GRAPH_MAX_EXPANDED_ENTITIES:
+            all_entity_ids = sorted(
+                all_entity_ids,
+                key=lambda eid: (entity_hops[eid][0], -entity_hops[eid][1]),
+            )[:GRAPH_MAX_EXPANDED_ENTITIES]
+
+        # Get memory-entity links from storage client.
+        # Returns list of {"memory_id", "entity_id", "role"} dicts.
+        raw_links = await sc.get_memory_ids_by_entity_ids(
+            [str(eid) for eid in all_entity_ids],
+        )
+
+        # Sort by hop distance so closest entities are processed first.
+        all_links = sorted(
+            raw_links,
+            key=lambda r: entity_hops.get(UUID(r["entity_id"]), (999, 0.0))[0],
+        )
+
+        # Best (lowest hop → highest boost) per memory + collect entity links.
+        memory_boost: dict[str, float] = {}
+        memory_entity_links: dict[str, list[EntityLinkOut]] = {}
+        for link in all_links:
+            mem_id, ent_id_str, role = link["memory_id"], link["entity_id"], link.get("role")
+            ent_id = UUID(ent_id_str)
+            if ent_id not in entity_hops:
+                continue
+            hop_dist, rel_weight = entity_hops[ent_id]
+            boost = GRAPH_HOP_BOOST.get(hop_dist, _GRAPH_HOP_BOOST_FALLBACK) * rel_weight
+            if mem_id not in memory_boost or boost > memory_boost[mem_id]:
+                memory_boost[mem_id] = boost
+            memory_entity_links.setdefault(mem_id, []).append(EntityLinkOut(entity_id=ent_id, role=role))
+
+        if not memory_boost:
+            return []
+
+        # Cap to prevent popular-entity fan-out.
+        if len(memory_boost) > GRAPH_MAX_BOOSTED_MEMORIES:
+            memory_ids_sorted = sorted(memory_boost, key=memory_boost.__getitem__, reverse=True)[
+                :GRAPH_MAX_BOOSTED_MEMORIES
+            ]
+            memory_boost = {mid: memory_boost[mid] for mid in memory_ids_sorted}
+
+        # Use scored_search with entity-lookup mode to load and filter memories.
+        # We pass memory_ids as a filter to get only the linked memories,
+        # with visibility/fleet/agent filters applied server-side.
+        search_data = {
+            "tenant_id": tenant_id,
+            "memory_ids": list(memory_boost.keys()),
+            "fleet_ids": fleet_ids,
+            "caller_agent_id": caller_agent_id,
+            "filter_agent_id": filter_agent_id,
+            "memory_type_filter": memory_type_filter,
+            "status_filter": status_filter,
+            "top_k": top_k,
+            "entity_lookup": True,
+        }
+        memories = await sc.scored_search(search_data)
+
+        # Build result rows with boost scores.
+        memories_by_id = {m["id"]: m for m in memories}
+
+        rows = [
+            types.SimpleNamespace(
+                Memory=types.SimpleNamespace(**memories_by_id[mid]),
+                score=boost,
+                vec_sim=None,
+                entity_links=memory_entity_links.get(mid, []),
+            )
+            for mid, boost in memory_boost.items()
+            if mid in memories_by_id
+        ]
+        rows.sort(key=lambda r: r.score, reverse=True)
+        return rows[:top_k]

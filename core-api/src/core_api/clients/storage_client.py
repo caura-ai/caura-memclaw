@@ -1,0 +1,892 @@
+"""HTTP client for the core-storage-api service."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+import httpx
+
+from core_api.clients.identity_token import evict as _evict_id_token
+from core_api.clients.identity_token import fetch_auth_header
+from core_api.config import settings
+
+logger = logging.getLogger(__name__)
+
+_client: CoreStorageClient | None = None
+
+
+def get_storage_client() -> CoreStorageClient:
+    """Return the singleton storage client."""
+    global _client
+    if _client is None:
+        _client = CoreStorageClient()
+    return _client
+
+
+class CoreStorageClient:
+    """Async HTTP client for core-storage-api CRUD operations."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str | None = None,
+        read_url: str | None = None,
+        http: httpx.AsyncClient | None = None,
+        read_http: httpx.AsyncClient | None = None,
+    ) -> None:
+        """Construct a client. All arguments are optional and default to
+        what ``settings`` and ``_make_pool()`` provide; tests use the
+        overrides to inject an ASGI-bridged httpx pool instead of the
+        real HTTP one. A unified constructor (rather than a separate
+        ``__new__``-based test builder) means any new attribute added
+        here is automatically populated in both prod and test paths.
+        """
+        self._base_url = (base_url or settings.core_storage_api_url).rstrip("/")
+        self._prefix = f"{self._base_url}/api/v1/storage"
+        self._http = http or self._make_pool()
+
+        # CAURA-591 Part B: optional separate endpoint for reads so the
+        # enterprise deploy can point them at a reader-role core-storage
+        # Cloud Run service (smaller writer fleet = less connection-pool
+        # contention on the primary AlloyDB). Empty = no split; reads and
+        # writes share ``_http`` and behaviour is unchanged.
+        configured_read_url = read_url if read_url is not None else settings.core_storage_read_url
+        self._read_base_url = (configured_read_url or self._base_url).rstrip("/")
+        self._read_prefix = f"{self._read_base_url}/api/v1/storage"
+        if read_http is not None:
+            self._read_http: httpx.AsyncClient = read_http
+        elif configured_read_url and self._read_base_url != self._base_url:
+            self._read_http = self._make_pool()
+        else:
+            # Share one pool when the split isn't configured — or when an
+            # operator accidentally points both URLs at the same upstream.
+            # Otherwise we'd double the connection budget (200 vs 100 max)
+            # against a single service for no benefit.
+            self._read_http = self._http
+
+    @staticmethod
+    def _make_pool() -> httpx.AsyncClient:
+        """Construct an httpx pool with the tuned timeouts + limits.
+
+        Per-phase timeouts: connect/pool are short (5s) to fail fast on
+        network issues; read/write are generous (90s) for heavy bulk
+        writes where storage-side commits can be slow under load. The
+        previous scalar 10s caused the silent-create class: storage
+        committed rows in ~12s, core-api timed out reading the response
+        at 10s, so the client saw 5xx and retried → duplicate rows
+        classified as "duplicate" on retry → acked counter undercounts
+        persisted.
+        """
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=90.0, write=90.0, pool=5.0),
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
+            follow_redirects=True,
+        )
+
+    @classmethod
+    def for_testing(cls, base_url: str, http: httpx.AsyncClient) -> CoreStorageClient:
+        """Test-only constructor: bind an already-built httpx client
+        (usually an ASGI bridge) as both writer and reader pools. Just
+        forwards to ``__init__`` so both construction paths share code.
+
+        ``read_url=""`` is passed explicitly so tests never pick up a
+        stale ``CORE_STORAGE_READ_URL`` from the surrounding environment —
+        otherwise ``_read_prefix`` would point at a staging / prod reader
+        while the httpx client is the in-process ASGI bridge.
+        """
+        return cls(base_url=base_url, read_url="", http=http, read_http=http)
+
+    async def close(self) -> None:
+        # try/finally: if the writer pool raises on close, still release
+        # the reader pool (otherwise it leaks across test sessions and on
+        # crashed-then-restarted app instances).
+        try:
+            await self._http.aclose()
+        finally:
+            if self._read_http is not self._http:
+                await self._read_http.aclose()
+
+    # -- internal helpers ------------------------------------------------
+
+    async def _auth_headers(self, *, read: bool) -> dict[str, str]:
+        """Identity-token Authorization header for Cloud Run
+        ``--no-allow-unauthenticated`` targets (CAURA-591 Part B Y3).
+        Empty when no credentials available (tests / local / legacy
+        allUsers services). The dict is cached and shared per audience
+        — httpx merges headers without mutation, so this is safe."""
+        audience = self._read_base_url if read else self._base_url
+        return await fetch_auth_header(audience)
+
+    def _maybe_evict_on_auth_error(self, resp: httpx.Response, *, read: bool) -> None:
+        """If the target rejected our token, drop it from the cache so
+        the next request forces a fresh fetch. Self-heals after a
+        mid-TTL credential rotation or SA/binding fix instead of
+        making the operator wait out the 50 min cache."""
+        if resp.status_code == 401:
+            audience = self._read_base_url if read else self._base_url
+            _evict_id_token(audience)
+
+    async def _get(self, path: str, *, read: bool = True, **params: Any) -> dict | None:
+        http = self._read_http if read else self._http
+        prefix = self._read_prefix if read else self._prefix
+        headers = await self._auth_headers(read=read)
+        resp = await http.get(f"{prefix}{path}", params=params, headers=headers)
+        if resp.status_code == 404:
+            return None
+        self._maybe_evict_on_auth_error(resp, read=read)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def _get_list(self, path: str, **params: Any) -> list[dict]:
+        # All current _get_list callers are pure list/stats endpoints; none
+        # sit on the write path, so no per-call opt-out is needed yet.
+        headers = await self._auth_headers(read=True)
+        resp = await self._read_http.get(f"{self._read_prefix}{path}", params=params, headers=headers)
+        self._maybe_evict_on_auth_error(resp, read=True)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def _post(self, path: str, data: Any = None, *, read: bool = False) -> dict | list:
+        http = self._read_http if read else self._http
+        prefix = self._read_prefix if read else self._prefix
+        headers = await self._auth_headers(read=read)
+        resp = await http.post(
+            f"{prefix}{path}",
+            json=data if data is not None else {},
+            headers=headers,
+        )
+        self._maybe_evict_on_auth_error(resp, read=read)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def _patch(self, path: str, data: dict) -> dict | None:
+        headers = await self._auth_headers(read=False)
+        resp = await self._http.patch(f"{self._prefix}{path}", json=data, headers=headers)
+        if resp.status_code == 404:
+            return None
+        self._maybe_evict_on_auth_error(resp, read=False)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def _delete(self, path: str, **params: Any) -> bool:
+        headers = await self._auth_headers(read=False)
+        resp = await self._http.delete(f"{self._prefix}{path}", params=params, headers=headers)
+        if resp.status_code == 404:
+            return False
+        self._maybe_evict_on_auth_error(resp, read=False)
+        resp.raise_for_status()
+        return True
+
+    async def _post_optional(self, path: str, data: Any = None, *, read: bool = False) -> dict | None:
+        http = self._read_http if read else self._http
+        prefix = self._read_prefix if read else self._prefix
+        headers = await self._auth_headers(read=read)
+        resp = await http.post(
+            f"{prefix}{path}",
+            json=data if data is not None else {},
+            headers=headers,
+        )
+        if resp.status_code == 404:
+            return None
+        self._maybe_evict_on_auth_error(resp, read=read)
+        resp.raise_for_status()
+        return resp.json()
+
+    # =====================================================================
+    # Memories
+    # =====================================================================
+
+    async def create_memory(self, data: dict) -> dict:
+        return await self._post("/memories", data)
+
+    async def create_memories(self, data: list[dict]) -> list[dict]:
+        return await self._post("/memories/bulk", data)
+
+    async def get_memory(self, memory_id: str) -> dict | None:
+        return await self._get(f"/memories/{memory_id}")
+
+    async def get_memory_for_tenant(self, tenant_id: str, memory_id: str) -> dict | None:
+        return await self._get(f"/memories/{memory_id}", tenant_id=tenant_id)
+
+    async def update_memory(self, memory_id: str, data: dict) -> dict | None:
+        return await self._patch(f"/memories/{memory_id}", data)
+
+    async def soft_delete_memory(self, memory_id: str) -> bool:
+        return await self._delete(f"/memories/{memory_id}")
+
+    async def update_memory_status(
+        self,
+        memory_id: str,
+        status: str,
+        supersedes_id: str | None = None,
+    ) -> dict | None:
+        payload: dict[str, Any] = {"status": status}
+        if supersedes_id is not None:
+            payload["supersedes_id"] = supersedes_id
+        return await self._patch(f"/memories/{memory_id}/status", payload)
+
+    async def find_by_content_hash(
+        self,
+        tenant_id: str,
+        content_hash: str,
+        fleet_id: str | None = None,
+    ) -> dict | None:
+        params: dict[str, Any] = {"tenant_id": tenant_id, "content_hash": content_hash}
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        # Write-path exact-hash dedup gate — stale replica data here would
+        # let a just-written duplicate slip through. Pair with
+        # bulk_find_by_content_hashes and find_semantic_duplicate.
+        return await self._get("/memories/by-content-hash", read=False, **params)
+
+    async def find_embedding_by_content_hash(
+        self,
+        tenant_id: str,
+        content_hash: str,
+    ) -> list[float] | None:
+        # Write-path embedding-cache lookup: skips re-embedding identical
+        # content. Stale replica would cause a miss and trigger an
+        # unnecessary (and expensive) re-embed.
+        return await self._get(
+            "/memories/embedding-by-content-hash",
+            read=False,
+            tenant_id=tenant_id,
+            content_hash=content_hash,
+        )
+
+    async def find_duplicate_hash(
+        self,
+        tenant_id: str,
+        content_hash: str,
+        exclude_id: str | None = None,
+    ) -> dict | None:
+        params: dict[str, Any] = {"tenant_id": tenant_id, "content_hash": content_hash}
+        if exclude_id is not None:
+            params["exclude_id"] = exclude_id
+        # Write-path: called during memory-update dedup. Reader would
+        # miss a just-updated row and fail to detect the duplicate.
+        return await self._get("/memories/duplicate-hash", read=False, **params)
+
+    async def bulk_find_by_content_hashes(
+        self,
+        tenant_id: str,
+        hashes: list[str],
+    ) -> dict[str, str]:
+        # Explicit ``read=False``: this is the dedup lookup called inline
+        # during bulk writes. Routing to a read replica risks missing a
+        # just-written row and re-creating a duplicate. Matches
+        # postgres_service's get_session() choice for dedup (CAURA-591 A).
+        # Not relying on the default so a future flip of _post's default
+        # can't silently re-route it.
+        result = await self._post(
+            "/memories/bulk-by-content-hashes",
+            {"tenant_id": tenant_id, "hashes": hashes},
+            read=False,
+        )
+        return result  # type: ignore[return-value]
+
+    async def find_semantic_duplicate(self, data: dict) -> dict | None:
+        # Explicit ``read=False``: runs inline during writes as a dedup
+        # gate. Stale replica data would let a just-written near-dup slip
+        # through. See bulk_find_by_content_hashes for the same reasoning.
+        return await self._post_optional("/memories/semantic-duplicate", data, read=False)
+
+    async def find_entity_overlap_candidates(self, data: dict) -> list[dict]:
+        # Called from contradiction_detector.py as a *post-commit* async
+        # background task. Replica lag here only risks missing a
+        # contradiction in the current batch — the write has already
+        # committed, so there's no duplicate-row race. A missed detection
+        # is picked up by a later crystallizer pass.
+        return await self._post("/memories/entity-overlap-candidates", data, read=True)  # type: ignore[return-value]
+
+    async def find_successors(self, data: dict) -> list[dict]:
+        return await self._post("/memories/find-successors", data, read=True)  # type: ignore[return-value]
+
+    async def find_similar_candidates(self, data: dict) -> list[dict]:
+        # Same reasoning as find_entity_overlap_candidates: contradiction
+        # detection runs post-commit and async. Stale replica data means
+        # at most a missed contradiction, never a data-integrity issue.
+        return await self._post("/memories/similar-candidates", data, read=True)  # type: ignore[return-value]
+
+    async def find_rdf_conflicts(
+        self,
+        tenant_id: str,
+        subject_entity_id: str,
+        predicate: str,
+        exclude_id: str | None = None,
+    ) -> list[dict]:
+        params: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "subject_entity_id": subject_entity_id,
+            "predicate": predicate,
+        }
+        if exclude_id is not None:
+            params["exclude_id"] = exclude_id
+        return await self._get_list("/memories/rdf-conflicts", **params)
+
+    async def scored_search(self, data: dict) -> list[dict]:
+        return await self._post("/memories/scored-search", data, read=True)  # type: ignore[return-value]
+
+    async def archive_expired(self, tenant_id: str, fleet_id: str | None = None) -> int:
+        data: dict[str, Any] = {"tenant_id": tenant_id}
+        if fleet_id is not None:
+            data["fleet_id"] = fleet_id
+        result = await self._post("/memories/archive-expired", data)
+        return result.get("count", 0)  # type: ignore[union-attr]
+
+    async def archive_stale(
+        self,
+        tenant_id: str,
+        fleet_id: str | None = None,
+        max_weight: float = 0.3,
+    ) -> int:
+        data: dict[str, Any] = {"tenant_id": tenant_id, "max_weight": max_weight}
+        if fleet_id is not None:
+            data["fleet_id"] = fleet_id
+        result = await self._post("/memories/archive-stale", data)
+        return result.get("count", 0)  # type: ignore[union-attr]
+
+    async def count_active(self, tenant_id: str, fleet_id: str | None = None) -> int:
+        params: dict[str, Any] = {"tenant_id": tenant_id}
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        result = await self._get("/memories/count-active", **params)
+        return (result or {}).get("count", 0)
+
+    async def count_all(self, tenant_id: str, fleet_id: str | None = None) -> int:
+        params: dict[str, Any] = {"tenant_id": tenant_id}
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        result = await self._get("/memories/count", **params)
+        return (result or {}).get("count", 0)
+
+    async def count_distinct_agents(self) -> int:
+        """Global count of distinct agent identities across all memories."""
+        result = await self._get("/memories/distinct-agents")
+        return (result or {}).get("count", 0)
+
+    async def update_embedding(
+        self,
+        memory_id: str,
+        embedding: list[float],
+    ) -> dict | None:
+        return await self._patch(
+            f"/memories/{memory_id}/embedding",
+            {"embedding": embedding},
+        )
+
+    async def update_memory_entities(
+        self,
+        memory_id: str,
+        entity_links: list[dict],
+    ) -> dict | None:
+        return await self._patch(
+            f"/memories/{memory_id}/entities",
+            {"entity_links": entity_links},
+        )
+
+    async def get_entity_links_for_memories(
+        self,
+        memory_ids: list[str],
+    ) -> dict:
+        return await self._post("/memories/entity-links", {"memory_ids": memory_ids}, read=True)  # type: ignore[return-value]
+
+    async def get_memory_stats(
+        self,
+        tenant_id: str,
+        fleet_id: str | None = None,
+    ) -> dict:
+        params: dict[str, Any] = {"tenant_id": tenant_id}
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        return await self._get("/memories/stats", **params) or {}
+
+    async def get_embedding_coverage(
+        self,
+        tenant_id: str,
+        fleet_id: str | None = None,
+    ) -> dict:
+        params: dict[str, Any] = {"tenant_id": tenant_id}
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        return await self._get("/memories/embedding-coverage", **params) or {}
+
+    async def get_type_distribution(
+        self,
+        tenant_id: str,
+        fleet_id: str | None = None,
+    ) -> dict:
+        params: dict[str, Any] = {"tenant_id": tenant_id}
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        return await self._get("/memories/type-distribution", **params) or {}
+
+    async def get_recent_memories(
+        self,
+        tenant_id: str,
+        fleet_id: str | None = None,
+        limit: int = 10,
+    ) -> list[dict]:
+        params: dict[str, Any] = {"tenant_id": tenant_id, "limit": limit}
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        return await self._get_list("/memories/recent", **params)
+
+    async def get_lifecycle_candidates(self, tenant_id: str) -> dict:
+        return await self._get("/memories/lifecycle-candidates", tenant_id=tenant_id) or {}
+
+    async def check_near_duplicates(self, data: dict) -> dict:
+        return await self._post("/memories/near-duplicates", data)  # type: ignore[return-value]
+
+    async def find_neighbors_by_embedding(self, data: dict) -> list[dict]:
+        return await self._post("/memories/neighbors-by-embedding", data) or []  # type: ignore[return-value]
+
+    async def mark_dedup_checked(self, memory_ids: list[str]) -> dict:
+        return await self._post("/memories/mark-dedup-checked", {"memory_ids": memory_ids})  # type: ignore[return-value]
+
+    async def batch_update_status(self, data: dict) -> dict:
+        return await self._post("/memories/batch-update-status", data)  # type: ignore[return-value]
+
+    # =====================================================================
+    # Entities
+    # =====================================================================
+
+    async def create_entity(self, data: dict) -> dict:
+        return await self._post("/entities", data)  # type: ignore[return-value]
+
+    async def get_entity(self, entity_id: str) -> dict | None:
+        return await self._get(f"/entities/{entity_id}")
+
+    async def update_entity(self, entity_id: str, data: dict) -> dict | None:
+        return await self._patch(f"/entities/{entity_id}", data)
+
+    async def find_exact_entity(
+        self,
+        tenant_id: str,
+        name: str,
+        fleet_id: str | None = None,
+        entity_type: str | None = None,
+    ) -> dict | None:
+        params: dict[str, Any] = {"tenant_id": tenant_id, "name": name}
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        if entity_type is not None:
+            params["entity_type"] = entity_type
+        return await self._get("/entities/exact", **params)
+
+    async def find_by_embedding_similarity(
+        self,
+        tenant_id: str,
+        embedding: list[float],
+        limit: int = 3,
+        entity_type: str | None = None,
+        fleet_id: str | None = None,
+    ) -> list[dict]:
+        payload: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "name_embedding": embedding,
+            "limit": limit,
+        }
+        if entity_type is not None:
+            payload["entity_type"] = entity_type
+        if fleet_id is not None:
+            payload["fleet_id"] = fleet_id
+        return await self._post(  # type: ignore[return-value]
+            "/entities/embedding-similarity",
+            payload,
+        )
+
+    async def fts_search_entities(self, data: dict) -> list[str]:
+        return await self._post("/entities/fts-search", data, read=True)  # type: ignore[return-value]
+
+    async def expand_graph(self, data: dict) -> dict:
+        return await self._post("/entities/expand-graph", data, read=True)  # type: ignore[return-value]
+
+    async def get_full_graph(
+        self,
+        tenant_id: str,
+        fleet_id: str | None = None,
+    ) -> dict:
+        params: dict[str, Any] = {"tenant_id": tenant_id}
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        return await self._get("/entities/full-graph", **params) or {}
+
+    async def list_entities(
+        self,
+        tenant_id: str,
+        fleet_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        params: dict[str, Any] = {"tenant_id": tenant_id, "limit": limit, "offset": offset}
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        return await self._get_list("/entities", **params)
+
+    async def count_memories_per_entity(
+        self,
+        tenant_id: str,
+        entity_ids: list[str],
+    ) -> dict:
+        return await self._post(  # type: ignore[return-value]
+            "/entities/count-memories",
+            {"tenant_id": tenant_id, "entity_ids": entity_ids},
+            read=True,
+        )
+
+    async def get_entity_with_linked_memories(self, entity_id: str) -> dict | None:
+        return await self._get(f"/entities/{entity_id}/with-memories")
+
+    async def get_outgoing_relations(self, entity_id: str) -> list[dict]:
+        return await self._get_list(f"/entities/{entity_id}/relations")
+
+    async def find_relation(
+        self,
+        source_id: str,
+        target_id: str,
+        relation_type: str,
+    ) -> dict | None:
+        return await self._get(
+            "/entities/relations/find",
+            source_id=source_id,
+            target_id=target_id,
+            relation_type=relation_type,
+        )
+
+    async def create_relation(self, data: dict) -> dict:
+        return await self._post("/entities/relations", data)  # type: ignore[return-value]
+
+    async def find_entity_link(self, memory_id: str, entity_id: str) -> dict | None:
+        return await self._get(
+            "/entities/links/find",
+            memory_id=memory_id,
+            entity_id=entity_id,
+        )
+
+    async def create_entity_link(self, data: dict) -> dict:
+        return await self._post("/entities/links", data)  # type: ignore[return-value]
+
+    async def get_memory_ids_by_entity_ids(
+        self,
+        entity_ids: list[str],
+    ) -> list[tuple]:
+        result = await self._post(
+            "/entities/memory-ids-by-entity-ids",
+            {"entity_ids": entity_ids},
+        )
+        return result  # type: ignore[return-value]
+
+    async def find_orphaned_entities(self, tenant_id: str) -> list[dict]:
+        return await self._get_list("/entities/orphaned", tenant_id=tenant_id)
+
+    async def find_broken_entity_links(self, tenant_id: str) -> list[dict]:
+        return await self._get_list("/entities/broken-links", tenant_id=tenant_id)
+
+    # =====================================================================
+    # Agents
+    # =====================================================================
+
+    async def create_or_update_agent(self, data: dict) -> dict:
+        return await self._post("/agents", data)  # type: ignore[return-value]
+
+    async def get_agent(self, agent_id: str, tenant_id: str) -> dict | None:
+        return await self._get(f"/agents/{agent_id}", tenant_id=tenant_id)
+
+    async def list_agents(
+        self,
+        tenant_id: str,
+        fleet_id: str | None = None,
+    ) -> list[dict]:
+        params: dict[str, Any] = {"tenant_id": tenant_id}
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        return await self._get_list("/agents", **params)
+
+    async def update_trust_level(self, agent_id: str, data: dict) -> dict | None:
+        return await self._patch(f"/agents/{agent_id}/trust-level", data)
+
+    async def update_search_profile(self, agent_id: str, data: dict) -> dict | None:
+        return await self._patch(f"/agents/{agent_id}/search-profile", data)
+
+    async def reset_search_profile(
+        self,
+        agent_id: str,
+        tenant_id: str,
+    ) -> dict | None:
+        return await self._post_optional(
+            f"/agents/{agent_id}/search-profile/reset",
+            {"tenant_id": tenant_id},
+        )
+
+    async def get_search_profile(
+        self,
+        agent_id: str,
+        tenant_id: str,
+    ) -> dict | None:
+        return await self._get(
+            f"/agents/{agent_id}/search-profile",
+            tenant_id=tenant_id,
+        )
+
+    async def backfill_from_memories(self, tenant_id: str) -> dict:
+        return await self._post(  # type: ignore[return-value]
+            "/agents/backfill-from-memories",
+            {"tenant_id": tenant_id},
+        )
+
+    async def update_agent_fleet(self, agent_id: str, data: dict) -> dict | None:
+        return await self._patch(f"/agents/{agent_id}/fleet", data)
+
+    async def delete_agent(self, agent_id: str, tenant_id: str) -> bool:
+        return await self._delete(f"/agents/{agent_id}", tenant_id=tenant_id)
+
+    # =====================================================================
+    # Documents
+    # =====================================================================
+
+    async def upsert_document(self, data: dict) -> dict:
+        return await self._post("/documents", data)  # type: ignore[return-value]
+
+    async def get_document(
+        self,
+        tenant_id: str,
+        collection: str,
+        doc_id: str,
+    ) -> dict | None:
+        return await self._get(
+            f"/documents/{collection}/{doc_id}",
+            tenant_id=tenant_id,
+        )
+
+    async def query_documents(self, data: dict) -> list[dict]:
+        return await self._post("/documents/query", data, read=True)  # type: ignore[return-value]
+
+    async def list_documents(
+        self,
+        tenant_id: str,
+        collection: str,
+        fleet_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        params: dict[str, Any] = {"tenant_id": tenant_id, "limit": limit, "offset": offset}
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        return await self._get_list(f"/documents/{collection}", **params)
+
+    async def delete_document(
+        self,
+        tenant_id: str,
+        collection: str,
+        doc_id: str,
+    ) -> bool:
+        return await self._delete(
+            f"/documents/{collection}/{doc_id}",
+            tenant_id=tenant_id,
+        )
+
+    # =====================================================================
+    # Fleet
+    # =====================================================================
+
+    async def upsert_node(self, data: dict) -> dict:
+        return await self._post("/fleet/nodes", data)  # type: ignore[return-value]
+
+    async def list_nodes(self, tenant_id: str, fleet_id: str | None = None) -> list[dict]:
+        params: dict[str, Any] = {"tenant_id": tenant_id}
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        return await self._get_list("/fleet/nodes", **params)
+
+    async def fleet_stats(self, tenant_id: str, fleet_id: str | None = None) -> dict:
+        params: dict[str, Any] = {"tenant_id": tenant_id}
+        if fleet_id:
+            params["fleet_id"] = fleet_id
+        return await self._get("/fleet/stats", **params) or {}
+
+    async def get_node(self, tenant_id: str, node_name: str) -> dict | None:
+        return await self._get(f"/fleet/nodes/{node_name}", tenant_id=tenant_id)
+
+    async def delete_node(self, tenant_id: str, node_name: str) -> bool:
+        return await self._delete(f"/fleet/nodes/{node_name}", tenant_id=tenant_id)
+
+    async def create_command(self, data: dict) -> dict:
+        return await self._post("/fleet/commands", data)  # type: ignore[return-value]
+
+    async def list_commands(
+        self,
+        tenant_id: str,
+        node_name: str | None = None,
+        status: str | None = None,
+    ) -> list[dict]:
+        params: dict[str, Any] = {"tenant_id": tenant_id}
+        if node_name is not None:
+            params["node_name"] = node_name
+        if status is not None:
+            params["status"] = status
+        return await self._get_list("/fleet/commands", **params)
+
+    async def update_command_status(
+        self,
+        command_id: str,
+        data: dict,
+    ) -> dict | None:
+        return await self._patch(f"/fleet/commands/{command_id}/status", data)
+
+    async def get_pending_commands(
+        self,
+        tenant_id: str,
+        node_name: str,
+    ) -> list[dict]:
+        return await self._get_list(
+            "/fleet/commands/pending",
+            tenant_id=tenant_id,
+            node_name=node_name,
+        )
+
+    async def ack_commands(self, command_ids: list[str]) -> dict:
+        return await self._post("/fleet/commands/ack", {"command_ids": command_ids})  # type: ignore[return-value]
+
+    async def fleet_exists(self, tenant_id: str, fleet_id: str) -> bool:
+        result = await self._get(
+            "/fleet/exists",
+            tenant_id=tenant_id,
+            fleet_id=fleet_id,
+        )
+        return bool(result and result.get("exists"))
+
+    async def list_fleets(self, tenant_id: str) -> list[dict]:
+        return await self._get_list("/fleet", tenant_id=tenant_id)
+
+    async def count_nodes(
+        self,
+        tenant_id: str,
+        fleet_id: str | None = None,
+    ) -> int:
+        params: dict[str, Any] = {"tenant_id": tenant_id}
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        result = await self._get("/fleet/nodes/count", **params)
+        return (result or {}).get("count", 0)
+
+    async def delete_fleet(self, tenant_id: str, fleet_id: str) -> bool:
+        return await self._delete(f"/fleet/{fleet_id}", tenant_id=tenant_id)
+
+    # =====================================================================
+    # Idempotency inbox
+    # =====================================================================
+
+    async def get_idempotency(
+        self,
+        tenant_id: str,
+        idempotency_key: str,
+    ) -> dict | None:
+        # Read-before-write guard: if the replica lags, a retry that
+        # should replay the cached response would instead re-run the
+        # operation. Must hit the writer so we see the row the previous
+        # attempt committed.
+        return await self._get(
+            "/idempotency",
+            read=False,
+            tenant_id=tenant_id,
+            idempotency_key=idempotency_key,
+        )
+
+    async def upsert_idempotency(
+        self,
+        *,
+        tenant_id: str,
+        idempotency_key: str,
+        request_hash: str,
+        response_body: dict,
+        status_code: int,
+        expires_at: str,
+    ) -> dict:
+        return await self._post(  # type: ignore[return-value]
+            "/idempotency",
+            {
+                "tenant_id": tenant_id,
+                "idempotency_key": idempotency_key,
+                "request_hash": request_hash,
+                "response_body": response_body,
+                "status_code": status_code,
+                "expires_at": expires_at,
+            },
+        )
+
+    # =====================================================================
+    # Audit
+    # =====================================================================
+
+    async def create_audit_log(self, data: dict) -> dict:
+        return await self._post("/audit-logs", data)  # type: ignore[return-value]
+
+    async def list_audit_logs(
+        self,
+        tenant_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        action: str | None = None,
+        resource_type: str | None = None,
+    ) -> list[dict]:
+        params: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "limit": limit,
+            "offset": offset,
+        }
+        if action is not None:
+            params["action"] = action
+        if resource_type is not None:
+            params["resource_type"] = resource_type
+        return await self._get_list("/audit-logs", **params)
+
+    # =====================================================================
+    # Reports
+    # =====================================================================
+
+    async def create_report(self, data: dict) -> dict:
+        return await self._post("/reports", data)  # type: ignore[return-value]
+
+    async def get_report(self, report_id: str) -> dict | None:
+        return await self._get(f"/reports/{report_id}")
+
+    async def update_report(self, report_id: str, data: dict) -> dict | None:
+        return await self._patch(f"/reports/{report_id}", data)
+
+    async def find_running_report(
+        self,
+        tenant_id: str,
+        fleet_id: str | None = None,
+        report_type: str | None = None,
+    ) -> dict | None:
+        params: dict[str, Any] = {"tenant_id": tenant_id}
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        if report_type is not None:
+            params["report_type"] = report_type
+        return await self._get("/reports/running", **params)
+
+    async def get_latest_report(
+        self,
+        tenant_id: str,
+        fleet_id: str | None = None,
+        report_type: str | None = None,
+    ) -> dict | None:
+        params: dict[str, Any] = {"tenant_id": tenant_id}
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        if report_type is not None:
+            params["report_type"] = report_type
+        return await self._get("/reports/latest", **params)
+
+    async def list_reports(self, tenant_id: str) -> list[dict]:
+        return await self._get_list("/reports", tenant_id=tenant_id)
+
+    # =====================================================================
+    # Tasks
+    # =====================================================================
+
+    async def add_task_failure(self, data: dict) -> dict:
+        return await self._post("/tasks/failures", data)  # type: ignore[return-value]

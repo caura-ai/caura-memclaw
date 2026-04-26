@@ -1,0 +1,507 @@
+"""Integration tests: pipeline path vs legacy path produce equivalent output.
+
+These tests require a running PostgreSQL instance (same as other integration tests).
+They exercise both paths with identical inputs and compare the MemoryOut results.
+"""
+
+import uuid
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from sqlalchemy import select
+
+from common.models.memory import Memory
+from core_api.schemas import MemoryCreate, MemoryOut
+
+# Ensure pipeline flag is off for legacy path tests
+# (individual tests toggle it as needed)
+
+TENANT_ID = f"test-pipeline-{uuid.uuid4().hex[:8]}"
+FLEET_ID = "test-fleet"
+AGENT_ID = "test-agent"
+
+
+def _make_input(
+    content: str = "This is a test memory with enough content to pass the quality gate for the pipeline test suite.",
+    persist: bool = True,
+    **kwargs,
+) -> MemoryCreate:
+    return MemoryCreate(
+        tenant_id=TENANT_ID,
+        fleet_id=FLEET_ID,
+        agent_id=AGENT_ID,
+        content=content,
+        persist=persist,
+        entity_links=[],
+        **kwargs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Unit tests (no DB required)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_validate_step_rejects_short_content():
+    """CheckContentLength raises 422 for content below minimum length."""
+    from unittest.mock import AsyncMock
+    from fastapi import HTTPException
+    from core_api.pipeline.context import PipelineContext
+    from core_api.pipeline.steps.write.check_content_length import CheckContentLength
+
+    ctx = PipelineContext(
+        db=AsyncMock(),
+        data={"input": _make_input(content="hi")},
+    )
+    step = CheckContentLength()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await step.execute(ctx)
+    assert exc_info.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_apply_enrichment_step_defaults():
+    """MergeEnrichmentFields applies correct defaults when no enrichment."""
+    from unittest.mock import AsyncMock
+    from core_api.pipeline.context import PipelineContext
+    from core_api.pipeline.steps.write.merge_enrichment_fields import (
+        MergeEnrichmentFields,
+    )
+
+    ctx = PipelineContext(
+        db=AsyncMock(),
+        data={
+            "input": _make_input(),
+            "enrichment": None,
+        },
+    )
+    step = MergeEnrichmentFields()
+    await step.execute(ctx)
+
+    fields = ctx.data["memory_fields"]
+    assert fields["memory_type"] == "fact"
+    assert fields["weight"] == 0.5  # DEFAULT_MEMORY_WEIGHT
+    assert fields["status"] == "active"
+    assert fields["title"] is None
+
+
+# ---------------------------------------------------------------------------
+# Integration tests (require PostgreSQL)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pipeline_path_creates_memory(db):
+    """Pipeline path creates a memory and returns valid MemoryOut."""
+    from core_api.services import memory_service
+
+    # Temporarily enable pipeline
+    original = memory_service._USE_PIPELINE_WRITE
+    memory_service._USE_PIPELINE_WRITE = True
+    try:
+        from core_api.services.memory_service import create_memory
+
+        data = _make_input()
+        result = await create_memory(db, data)
+
+        assert isinstance(result, MemoryOut)
+        assert result.tenant_id == TENANT_ID
+        assert result.content == data.content
+        assert result.memory_type is not None
+        assert result.status is not None
+    finally:
+        memory_service._USE_PIPELINE_WRITE = original
+
+
+@pytest.mark.asyncio
+async def test_legacy_path_creates_memory(db):
+    """Legacy path creates a memory and returns valid MemoryOut (baseline)."""
+    from core_api.services import memory_service
+
+    original = memory_service._USE_PIPELINE_WRITE
+    memory_service._USE_PIPELINE_WRITE = False
+    try:
+        from core_api.services.memory_service import create_memory
+
+        data = _make_input(content="Legacy path baseline test memory — unique content to avoid hash collision with pipeline path test.")
+        result = await create_memory(db, data)
+
+        assert isinstance(result, MemoryOut)
+        assert result.tenant_id == TENANT_ID
+        assert result.content == data.content
+    finally:
+        memory_service._USE_PIPELINE_WRITE = original
+
+
+@pytest.mark.asyncio
+async def test_pipeline_extract_only(db):
+    """Pipeline path returns preview MemoryOut when persist=False."""
+    from core_api.services import memory_service
+
+    original = memory_service._USE_PIPELINE_WRITE
+    memory_service._USE_PIPELINE_WRITE = True
+    try:
+        from core_api.services.memory_service import create_memory
+
+        extract_content = f"Pipeline extract-only test memory — unique {uuid.uuid4().hex[:8]} — should NOT be persisted."
+        data = _make_input(content=extract_content, persist=False)
+        result = await create_memory(db, data)
+
+        assert isinstance(result, MemoryOut)
+        assert result.content == data.content
+        # Extract-only should not persist — verify no row in DB
+        stmt = select(Memory).where(
+            Memory.tenant_id == TENANT_ID,
+            Memory.content == extract_content,
+        )
+        rows = (await db.execute(stmt)).scalars().all()
+        assert len(rows) == 0
+    finally:
+        memory_service._USE_PIPELINE_WRITE = original
+
+
+@pytest.mark.asyncio
+async def test_pipeline_hash_dedup(db):
+    """Pipeline path raises 409 on duplicate content_hash."""
+    from fastapi import HTTPException
+    from core_api.services import memory_service
+
+    original = memory_service._USE_PIPELINE_WRITE
+    memory_service._USE_PIPELINE_WRITE = True
+    try:
+        from core_api.services.memory_service import create_memory
+
+        data = _make_input(
+            content="Unique content for hash dedup test in pipeline write refactor."
+        )
+        await create_memory(db, data)
+
+        # Second write with same content should 409
+        with pytest.raises(HTTPException) as exc_info:
+            await create_memory(db, data)
+        assert exc_info.value.status_code == 409
+    finally:
+        memory_service._USE_PIPELINE_WRITE = original
+
+
+@pytest.mark.asyncio
+async def test_pipeline_quality_gate(db):
+    """Pipeline path rejects short content with 422."""
+    from fastapi import HTTPException
+    from core_api.services import memory_service
+
+    original = memory_service._USE_PIPELINE_WRITE
+    memory_service._USE_PIPELINE_WRITE = True
+    try:
+        from core_api.services.memory_service import create_memory
+
+        data = _make_input(content="hi")
+        with pytest.raises(HTTPException) as exc_info:
+            await create_memory(db, data)
+        assert exc_info.value.status_code == 422
+    finally:
+        memory_service._USE_PIPELINE_WRITE = original
+
+
+@pytest.mark.asyncio
+async def test_pipeline_equivalence(db):
+    """Pipeline and legacy paths produce equivalent MemoryOut fields."""
+    from core_api.services import memory_service
+    from core_api.services.memory_service import (
+        _create_memory_legacy,
+        _create_memory_pipeline,
+    )
+
+    content_a = "Pipeline equivalence test memory content A — testing that both paths produce the same output fields."
+    content_b = "Pipeline equivalence test memory content B — testing that both paths produce the same output fields."
+
+    # Legacy path
+    memory_service._USE_PIPELINE_WRITE = False
+    data_legacy = _make_input(content=content_a)
+    result_legacy = await _create_memory_legacy(db, data_legacy)
+
+    # Pipeline path
+    memory_service._USE_PIPELINE_WRITE = True
+    data_pipeline = _make_input(content=content_b)
+    result_pipeline = await _create_memory_pipeline(db, data_pipeline)
+
+    # Reset
+    memory_service._USE_PIPELINE_WRITE = False
+
+    # Compare key fields (IDs and timestamps will differ)
+    assert result_legacy.tenant_id == result_pipeline.tenant_id
+    assert result_legacy.fleet_id == result_pipeline.fleet_id
+    assert result_legacy.agent_id == result_pipeline.agent_id
+    assert result_legacy.memory_type == result_pipeline.memory_type
+    assert result_legacy.weight == result_pipeline.weight
+    assert result_legacy.status == result_pipeline.status
+    assert result_legacy.visibility == result_pipeline.visibility
+
+
+# ---------------------------------------------------------------------------
+# Write-mode dial unit tests (no DB required)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveWriteMode:
+    """Unit tests for _resolve_write_mode pure function."""
+
+    def _make_config(self, default_write_mode: str = "fast"):
+        """Create a minimal mock tenant config."""
+        cfg = type("Cfg", (), {"default_write_mode": default_write_mode})()
+        return cfg
+
+    def test_explicit_fast(self):
+        from core_api.services.memory_service import _resolve_write_mode
+
+        data = _make_input(write_mode="fast")
+        assert _resolve_write_mode(data, self._make_config("strong")) == "fast"
+
+    def test_explicit_strong(self):
+        from core_api.services.memory_service import _resolve_write_mode
+
+        data = _make_input(write_mode="strong")
+        assert _resolve_write_mode(data, self._make_config("fast")) == "strong"
+
+    def test_auto_generic_type_uses_tenant_default(self):
+        from core_api.services.memory_service import _resolve_write_mode
+
+        data = _make_input(write_mode="auto", memory_type="fact")
+        assert _resolve_write_mode(data, self._make_config("fast")) == "fast"
+
+    def test_auto_decision_forces_strong(self):
+        from core_api.services.memory_service import _resolve_write_mode
+
+        data = _make_input(write_mode="auto", memory_type="decision")
+        assert _resolve_write_mode(data, self._make_config("fast")) == "strong"
+
+    def test_auto_commitment_forces_strong(self):
+        from core_api.services.memory_service import _resolve_write_mode
+
+        data = _make_input(write_mode="auto", memory_type="commitment")
+        assert _resolve_write_mode(data, self._make_config("fast")) == "strong"
+
+    def test_auto_cancellation_forces_strong(self):
+        from core_api.services.memory_service import _resolve_write_mode
+
+        data = _make_input(write_mode="auto", memory_type="cancellation")
+        assert _resolve_write_mode(data, self._make_config("fast")) == "strong"
+
+    def test_none_mode_uses_tenant_default(self):
+        from core_api.services.memory_service import _resolve_write_mode
+
+        data = _make_input()  # write_mode=None
+        assert _resolve_write_mode(data, self._make_config("strong")) == "strong"
+
+    def test_none_mode_none_type_uses_tenant_default(self):
+        from core_api.services.memory_service import _resolve_write_mode
+
+        data = _make_input()  # write_mode=None, memory_type=None
+        assert _resolve_write_mode(data, self._make_config("fast")) == "fast"
+
+
+@pytest.mark.asyncio
+async def test_merge_enrichment_sets_pending_in_fast_mode():
+    """MergeEnrichmentFields sets enrichment_pending=True in fast mode with no enrichment."""
+    from core_api.pipeline.context import PipelineContext
+    from core_api.pipeline.steps.write.merge_enrichment_fields import (
+        MergeEnrichmentFields,
+    )
+
+    ctx = PipelineContext(
+        db=AsyncMock(),
+        data={
+            "input": _make_input(),
+            "enrichment": None,
+            "resolved_write_mode": "fast",
+        },
+    )
+    step = MergeEnrichmentFields()
+    await step.execute(ctx)
+
+    fields = ctx.data["memory_fields"]
+    assert fields["metadata"]["enrichment_pending"] is True
+    assert fields["metadata"]["write_mode"] == "fast"
+
+
+@pytest.mark.asyncio
+async def test_merge_enrichment_no_pending_in_strong_mode():
+    """MergeEnrichmentFields does NOT set enrichment_pending in strong mode."""
+    from core_api.pipeline.context import PipelineContext
+    from core_api.pipeline.steps.write.merge_enrichment_fields import (
+        MergeEnrichmentFields,
+    )
+
+    ctx = PipelineContext(
+        db=AsyncMock(),
+        data={
+            "input": _make_input(),
+            "enrichment": None,
+            "resolved_write_mode": "strong",
+        },
+    )
+    step = MergeEnrichmentFields()
+    await step.execute(ctx)
+
+    fields = ctx.data["memory_fields"]
+    assert "enrichment_pending" not in fields["metadata"]
+    assert fields["metadata"]["write_mode"] == "strong"
+
+
+@pytest.mark.asyncio
+async def test_schedule_background_tasks_fast_mode_fires_background_enrichment():
+    """ScheduleBackgroundTasks fires _enrich_memory_background in fast mode."""
+    from core_api.pipeline.context import PipelineContext
+    from core_api.pipeline.steps.write.schedule_background_tasks import (
+        ScheduleBackgroundTasks,
+    )
+
+    mock_memory = type("M", (), {"id": uuid.uuid4()})()
+    mock_config = type(
+        "C",
+        (),
+        {
+            "enrichment_enabled": True,
+            "entity_extraction_enabled": True,
+        },
+    )()
+
+    ctx = PipelineContext(
+        db=AsyncMock(),
+        data={
+            "input": _make_input(),
+            "memory": mock_memory,
+            "embedding": [0.1] * 768,
+            "resolved_write_mode": "fast",
+        },
+        tenant_config=mock_config,
+    )
+
+    with patch(
+        "core_api.pipeline.steps.write.schedule_background_tasks.track_task"
+    ) as mock_track:
+        step = ScheduleBackgroundTasks()
+        await step.execute(ctx)
+
+    # Should fire background_enrichment, NOT entity_extraction or contradiction directly
+    assert mock_track.call_count == 1  # only background_enrichment
+
+
+@pytest.mark.asyncio
+async def test_schedule_background_tasks_strong_mode_fires_entity_and_contradiction():
+    """ScheduleBackgroundTasks fires entity extraction + contradiction in strong mode."""
+    from core_api.pipeline.context import PipelineContext
+    from core_api.pipeline.steps.write.schedule_background_tasks import (
+        ScheduleBackgroundTasks,
+    )
+
+    mock_memory = type("M", (), {"id": uuid.uuid4()})()
+    mock_config = type(
+        "C",
+        (),
+        {
+            "enrichment_enabled": True,
+            "entity_extraction_enabled": True,
+        },
+    )()
+
+    ctx = PipelineContext(
+        db=AsyncMock(),
+        data={
+            "input": _make_input(),
+            "memory": mock_memory,
+            "embedding": [0.1] * 768,
+            "resolved_write_mode": "strong",
+        },
+        tenant_config=mock_config,
+    )
+
+    with patch(
+        "core_api.pipeline.steps.write.schedule_background_tasks.track_task"
+    ) as mock_track:
+        step = ScheduleBackgroundTasks()
+        await step.execute(ctx)
+
+    # Should fire entity_extraction + contradiction_detection
+    assert mock_track.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Write-mode dial integration tests (require PostgreSQL)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fast_mode_creates_memory_with_pending_enrichment(db):
+    """Fast mode creates memory with enrichment_pending=True and write_mode=fast."""
+    from core_api.services import memory_service
+
+    original = memory_service._USE_PIPELINE_WRITE
+    memory_service._USE_PIPELINE_WRITE = True
+    try:
+        from core_api.services.memory_service import create_memory
+
+        data = _make_input(
+            content="Fast mode test memory — should store quickly with deferred enrichment for the write mode dial.",
+            write_mode="fast",
+        )
+        result = await create_memory(db, data)
+
+        assert isinstance(result, MemoryOut)
+        assert result.tenant_id == TENANT_ID
+        assert result.metadata is not None
+        assert result.metadata.get("enrichment_pending") is True
+        assert result.metadata.get("write_mode") == "fast"
+    finally:
+        memory_service._USE_PIPELINE_WRITE = original
+
+
+@pytest.mark.asyncio
+async def test_strong_mode_creates_memory_same_as_today(db):
+    """Strong mode produces same result as today's pipeline (full enrichment inline)."""
+    from core_api.services import memory_service
+
+    original = memory_service._USE_PIPELINE_WRITE
+    memory_service._USE_PIPELINE_WRITE = True
+    try:
+        from core_api.services.memory_service import create_memory
+
+        data = _make_input(
+            content="Strong mode test memory — should run full enrichment inline for the write mode dial test.",
+            write_mode="strong",
+        )
+        result = await create_memory(db, data)
+
+        assert isinstance(result, MemoryOut)
+        assert result.metadata is not None
+        assert result.metadata.get("write_mode") == "strong"
+        # Strong mode should NOT have enrichment_pending
+        assert result.metadata.get("enrichment_pending") is None
+    finally:
+        memory_service._USE_PIPELINE_WRITE = original
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_decision_type_routes_to_strong(db):
+    """Auto mode with memory_type=decision routes to strong path."""
+    from core_api.services import memory_service
+
+    original = memory_service._USE_PIPELINE_WRITE
+    memory_service._USE_PIPELINE_WRITE = True
+    try:
+        from core_api.services.memory_service import create_memory
+
+        data = _make_input(
+            content="We decided to use PostgreSQL for the primary database — auto mode should route this to strong path.",
+            write_mode="auto",
+            memory_type="decision",
+        )
+        result = await create_memory(db, data)
+
+        assert isinstance(result, MemoryOut)
+        assert result.metadata is not None
+        assert result.metadata.get("write_mode") == "strong"
+    finally:
+        memory_service._USE_PIPELINE_WRITE = original

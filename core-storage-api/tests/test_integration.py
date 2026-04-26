@@ -1,0 +1,1114 @@
+"""Integration tests for core-storage-api HTTP endpoints.
+
+Each test exercises a real FastAPI endpoint via httpx against a live PostgreSQL
+database.  Run with:
+
+    cd core-storage-api && pytest -m integration tests/test_integration.py -v
+"""
+
+from __future__ import annotations
+
+import hashlib
+import struct
+import uuid
+
+import pytest
+from httpx import AsyncClient
+
+pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
+
+PREFIX = "/api/v1/storage"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _uid() -> str:
+    """Short unique suffix to avoid collisions across test runs."""
+    return uuid.uuid4().hex[:8]
+
+
+def fake_embedding(seed: str, dim: int = 768) -> list[float]:
+    """Deterministic unit-length embedding from a seed string."""
+    h = hashlib.sha256(seed.encode()).digest()
+    raw = h * (dim // len(h) + 1)
+    values = [struct.unpack_from("b", raw, i)[0] / 128.0 for i in range(dim)]
+    norm = sum(v * v for v in values) ** 0.5
+    return [v / norm for v in values]
+
+
+def _memory_payload(
+    tenant_id: str,
+    fleet_id: str,
+    *,
+    content: str | None = None,
+    content_hash: str | None = None,
+) -> dict:
+    """Build a minimal valid memory creation payload."""
+    suffix = _uid()
+    content = content or f"integration test memory {suffix}"
+    return {
+        "tenant_id": tenant_id,
+        "fleet_id": fleet_id,
+        "agent_id": f"test-agent-{suffix}",
+        "memory_type": "fact",
+        "content": content,
+        "embedding": fake_embedding(content),
+        "content_hash": content_hash or hashlib.sha256(content.encode()).hexdigest(),
+        "weight": 0.7,
+        "visibility": "scope_team",
+    }
+
+
+# =====================================================================
+# Health
+# =====================================================================
+
+
+class TestHealth:
+    async def test_healthz(self, client: AsyncClient) -> None:
+        resp = await client.get("/healthz")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ok"
+
+    async def test_readyz(self, client: AsyncClient) -> None:
+        resp = await client.get("/readyz")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ok"
+
+    async def test_healthz_under_prefix(self, client: AsyncClient) -> None:
+        resp = await client.get(f"{PREFIX}/healthz")
+        assert resp.status_code == 200
+
+
+# =====================================================================
+# Memories
+# =====================================================================
+
+
+class TestMemories:
+    async def test_create_and_get_memory(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        payload = _memory_payload(tenant_id, fleet_id)
+        resp = await client.post(f"{PREFIX}/memories", json=payload)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        memory_id = body["id"]
+        assert body["content"] == payload["content"]
+        assert body["tenant_id"] == tenant_id
+
+        # GET by id
+        resp2 = await client.get(f"{PREFIX}/memories/{memory_id}")
+        assert resp2.status_code == 200
+        assert resp2.json()["id"] == memory_id
+
+    async def test_update_status_via_patch(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        payload = _memory_payload(tenant_id, fleet_id)
+        mem = (await client.post(f"{PREFIX}/memories", json=payload)).json()
+        memory_id = mem["id"]
+
+        resp = await client.patch(
+            f"{PREFIX}/memories/{memory_id}",
+            json={"status": "archived"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+        # Verify via GET
+        updated = (await client.get(f"{PREFIX}/memories/{memory_id}")).json()
+        assert updated["status"] == "archived"
+
+    async def test_metadata_patch_jsonb_merge(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        """``metadata_patch`` synthetic key triggers a JSONB ``||``
+        merge that overwrites individual keys without clobbering peers.
+
+        Two production drift hazards locked here:
+
+        1. Pre-CAURA-595, the merge SQL was ``COALESCE(metadata, '{}'::jsonb)
+           || (:patch)::jsonb``. On installations where the legacy
+           ``metadata`` column is typed ``json`` (lowercase) rather than
+           ``jsonb`` (the ORM declaration), Postgres raised
+           ``CannotCoerceError: COALESCE could not convert type jsonb
+           to json``. The cast on the column (``metadata::jsonb``)
+           normalises both shapes — this test only exercises ``jsonb``
+           since SQLAlchemy creates the column from the ORM model, but
+           the cast is a no-op on already-jsonb columns so the test
+           still validates the corrected SQL shape.
+        2. ``metadata_patch`` is a SYNTHETIC key — the body's other
+           top-level fields hit ``hasattr(Memory, key)`` and become
+           ``UPDATE ... SET <col>``. Locks that the worker's PATCH
+           shape ``{"embedding": ..., "metadata_patch": {...}}``
+           applies BOTH branches in the same transaction.
+        """
+        payload = _memory_payload(tenant_id, fleet_id)
+        # Seed a row with the hot-path's ``embedding_pending=true`` flag
+        # and a sibling key that must survive the merge.
+        payload["metadata_"] = {"embedding_pending": True, "trace_id": "abc"}
+        mem = (await client.post(f"{PREFIX}/memories", json=payload)).json()
+        memory_id = mem["id"]
+
+        resp = await client.patch(
+            f"{PREFIX}/memories/{memory_id}",
+            json={"metadata_patch": {"embedding_pending": False, "summary": "done"}},
+        )
+        assert resp.status_code == 200, resp.text
+
+        updated = (await client.get(f"{PREFIX}/memories/{memory_id}")).json()
+        md = updated["metadata"]
+        # Patched keys reflect the new values.
+        assert md["embedding_pending"] is False
+        assert md["summary"] == "done"
+        # Sibling key untouched by the merge.
+        assert md["trace_id"] == "abc"
+
+    async def test_patch_coerces_iso_datetime_strings(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        """PATCH /memories/{id} must coerce ISO ``ts_valid_*`` strings
+        to ``datetime`` instances before SQLAlchemy issues the UPDATE.
+
+        Pre-fix, asyncpg rejected ISO strings on ``DateTime(timezone=True)``
+        columns with ``CannotCoerceError: invalid input for query
+        argument $N: '<iso>' (expected a datetime.date or datetime.datetime
+        instance, got 'str')``. Surfaced live on staging at 2026-04-26
+        when the CAURA-595 async-enrich worker started PATCHing
+        ``ts_valid_*`` for any memory whose LLM extraction populated
+        temporal bounds. The POST route always parsed via
+        ``_parse_datetimes(body)``; the PATCH route silently passed
+        the strings to SQLAlchemy → asyncpg → 500. Fixed by adding
+        the same parse step at the PATCH route ingress.
+        """
+        payload = _memory_payload(tenant_id, fleet_id)
+        mem = (await client.post(f"{PREFIX}/memories", json=payload)).json()
+        memory_id = mem["id"]
+
+        # Same shape the async-enrich worker emits via
+        # ``model_dump(mode="json")`` — bare ISO strings, including
+        # the timezone-aware ``+00:00`` suffix.
+        resp = await client.patch(
+            f"{PREFIX}/memories/{memory_id}",
+            json={
+                "ts_valid_start": "2026-09-14T00:00:00+00:00",
+                "ts_valid_end": "2026-10-15T23:59:59+00:00",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["ok"] is True
+
+        updated = (await client.get(f"{PREFIX}/memories/{memory_id}")).json()
+        # Round-trips back as ISO strings on read; confirm the values
+        # we sent landed at the right ORM columns.
+        assert updated["ts_valid_start"].startswith("2026-09-14T00:00:00")
+        assert updated["ts_valid_end"].startswith("2026-10-15T23:59:59")
+
+    async def test_patch_invalid_iso_datetime_returns_422(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        """A malformed ISO string in any datetime field returns 422
+        (client validation), not 500 (server fault). Pre-fix, the
+        ``ValueError`` from ``datetime.fromisoformat`` propagated as
+        an unhandled exception → 500 → DLQ for any client (including
+        the async-enrich worker if an LLM ever emits a malformed
+        date). The handler now wraps the parse and surfaces a clean
+        422 with the offending field + value echoed back so operators
+        can grep logs."""
+        payload = _memory_payload(tenant_id, fleet_id)
+        mem = (await client.post(f"{PREFIX}/memories", json=payload)).json()
+        memory_id = mem["id"]
+
+        resp = await client.patch(
+            f"{PREFIX}/memories/{memory_id}",
+            json={"ts_valid_start": "tomorrow"},  # not a valid ISO string
+        )
+        assert resp.status_code == 422, resp.text
+        body = resp.json()
+        assert "ts_valid_start" in body["detail"]
+        assert "tomorrow" in body["detail"]
+
+    async def test_batch_update_status(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        p1 = _memory_payload(tenant_id, fleet_id)
+        p2 = _memory_payload(tenant_id, fleet_id)
+        m1 = (await client.post(f"{PREFIX}/memories", json=p1)).json()
+        m2 = (await client.post(f"{PREFIX}/memories", json=p2)).json()
+
+        resp = await client.patch(
+            f"{PREFIX}/memories/batch-status",
+            json={
+                "updates": [
+                    {"memory_id": m1["id"], "status": "archived"},
+                    {"memory_id": m2["id"], "status": "archived"},
+                ],
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+    async def test_soft_delete(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        payload = _memory_payload(tenant_id, fleet_id)
+        mem = (await client.post(f"{PREFIX}/memories", json=payload)).json()
+        memory_id = mem["id"]
+
+        resp = await client.delete(f"{PREFIX}/memories/{memory_id}")
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+        # Verify deleted_at is set
+        fetched = (await client.get(f"{PREFIX}/memories/{memory_id}")).json()
+        assert fetched["deleted_at"] is not None
+        assert fetched["status"] == "deleted"
+
+    async def test_find_by_content_hash(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        content = f"unique hash content {_uid()}"
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        payload = _memory_payload(
+            tenant_id,
+            fleet_id,
+            content=content,
+            content_hash=content_hash,
+        )
+        await client.post(f"{PREFIX}/memories", json=payload)
+
+        resp = await client.get(
+            f"{PREFIX}/memories/by-content-hash",
+            params={
+                "tenant_id": tenant_id,
+                "content_hash": content_hash,
+                "fleet_id": fleet_id,
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["memory"] is not None
+        assert body["memory"]["content_hash"] == content_hash
+
+    async def test_find_by_content_hash_not_found(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+    ) -> None:
+        resp = await client.get(
+            f"{PREFIX}/memories/by-content-hash",
+            params={"tenant_id": tenant_id, "content_hash": "nonexistent"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["memory"] is None
+
+    async def test_get_stats(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        # Create at least one memory so stats are non-empty
+        payload = _memory_payload(tenant_id, fleet_id)
+        await client.post(f"{PREFIX}/memories", json=payload)
+
+        resp = await client.get(
+            f"{PREFIX}/memories/stats",
+            params={"tenant_id": tenant_id, "fleet_id": fleet_id},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        # Stats should be a dict (exact keys depend on implementation)
+        assert isinstance(body, dict)
+
+    async def test_get_nonexistent_memory_returns_404(
+        self,
+        client: AsyncClient,
+    ) -> None:
+        fake_id = str(uuid.uuid4())
+        resp = await client.get(f"{PREFIX}/memories/{fake_id}")
+        assert resp.status_code == 404
+
+    async def test_scored_search_surfaces_null_embedding_via_fts(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        """CAURA-594: memories inserted with ``embedding=NULL`` (async-embed
+        workflow, row persisted before the worker backfills) must remain
+        discoverable via FTS. The scored-search CTE coalesces ``vec_sim``
+        to 0.0 for NULL rows so they survive the pgvector operator and
+        rank by text score alone until the backfill lands.
+
+        Also asserts:
+          * NULL-embedding rows with no FTS match are excluded from the
+            CTE (they can't rank on ``Memory.weight`` alone and displace
+            real matches).
+          * ``has_embedding`` is the authoritative NULL-vs-orthogonal
+            signal — ``vec_sim == 0.0`` is ambiguous with a genuinely
+            orthogonal embedding.
+          * An embedded row with an aligned vector still outranks a
+            NULL-embedding row on the blended score.
+        """
+        keyword = f"caura594_{_uid()}"
+        query_embedding = fake_embedding(f"query {keyword}")
+
+        # Row A: normal memory, no keyword match and unrelated vector.
+        payload_a = _memory_payload(
+            tenant_id, fleet_id, content=f"standard memory about unrelated topic {_uid()}"
+        )
+        resp_a = await client.post(f"{PREFIX}/memories", json=payload_a)
+        assert resp_a.status_code == 200, resp_a.text
+
+        # Row B: embedding=None, keyword matches → should surface via FTS.
+        payload_b = _memory_payload(tenant_id, fleet_id, content=f"urgent alert {keyword} body")
+        payload_b["embedding"] = None
+        resp_b = await client.post(f"{PREFIX}/memories", json=payload_b)
+        assert resp_b.status_code == 200, resp_b.text
+        memory_b_id = resp_b.json()["id"]
+
+        # Row C: same keyword as B with an aligned vector → guards
+        # against CASE leaking 0.0 into the embedded branch (C must
+        # still outrank B).
+        payload_c = _memory_payload(tenant_id, fleet_id, content=f"critical notice {keyword} body")
+        payload_c["embedding"] = query_embedding
+        resp_c = await client.post(f"{PREFIX}/memories", json=payload_c)
+        assert resp_c.status_code == 200, resp_c.text
+        memory_c_id = resp_c.json()["id"]
+
+        # Row D: embedding=None AND no keyword match — the FTS guard on
+        # the CTE must exclude this row so it can't displace real matches
+        # on `weight` alone during a backfill window.
+        payload_d = _memory_payload(tenant_id, fleet_id, content=f"completely unrelated pending row {_uid()}")
+        payload_d["embedding"] = None
+        payload_d["weight"] = 0.95  # intentionally high — must still be excluded
+        resp_d = await client.post(f"{PREFIX}/memories", json=payload_d)
+        assert resp_d.status_code == 200, resp_d.text
+        memory_d_id = resp_d.json()["id"]
+
+        search_body = {
+            "tenant_id": tenant_id,
+            "embedding": query_embedding,
+            "query": keyword,
+            "fleet_ids": [fleet_id],
+            "top_k": 10,
+            "search_params": {
+                "fts_weight": 0.5,
+                "freshness_floor": 0.5,
+                "freshness_decay_days": 30.0,
+                "recall_boost_cap": 2.0,
+                "recall_decay_window_days": 7.0,
+                "similarity_blend": 0.7,
+            },
+        }
+        resp = await client.post(f"{PREFIX}/memories/scored-search", json=search_body)
+        assert resp.status_code == 200, resp.text
+
+        ids_found = {row["id"] for row in resp.json()}
+        assert memory_b_id in ids_found, (
+            f"NULL-embedding memory matching the FTS query should surface; found ids={ids_found!r}"
+        )
+        assert memory_c_id in ids_found, "embedded memory with matching content should also be returned"
+        assert memory_d_id not in ids_found, (
+            "NULL-embedding memory with no FTS match must NOT be returned "
+            "— ranking on Memory.weight alone would displace real matches"
+        )
+
+        row_b = next(r for r in resp.json() if r["id"] == memory_b_id)
+        row_c = next(r for r in resp.json() if r["id"] == memory_c_id)
+        # `has_embedding` is the authoritative NULL signal.
+        assert row_b["has_embedding"] is False, (
+            f"expected has_embedding=False for NULL row, got {row_b['has_embedding']}"
+        )
+        assert row_c["has_embedding"] is True, (
+            f"expected has_embedding=True for embedded row, got {row_c['has_embedding']}"
+        )
+        # vec_sim CASE coalesces NULL rows to the 0.0 literal.
+        assert row_b["vec_sim"] == 0.0, f"expected vec_sim=0.0 for NULL-embedding row, got {row_b['vec_sim']}"
+        # Embedded row with an aligned vector still outranks the NULL
+        # row on the blended score — the CASE hasn't leaked into the
+        # embedded branch.
+        assert row_c["score"] > row_b["score"], (
+            "embedded row must outrank NULL-embedding row on equal FTS; "
+            f"got C.score={row_c['score']} vs B.score={row_b['score']}"
+        )
+
+        # `plainto_tsquery('english', X)` matches every non-NULL tsvector
+        # whenever X normalises down to the empty tsquery — empty string,
+        # whitespace-only, or stop-word-only input. Without the Python-
+        # side truthiness gate the FTS guard would silently admit every
+        # NULL-embedding row in those cases (vector-only / entity-lookup
+        # modes), reintroducing the backfill displacement bug.
+        for blank_query in ("", "   "):
+            blank_resp = await client.post(
+                f"{PREFIX}/memories/scored-search",
+                json={**search_body, "query": blank_query},
+            )
+            assert blank_resp.status_code == 200, blank_resp.text
+            blank_ids = {row["id"] for row in blank_resp.json()}
+            assert memory_b_id not in blank_ids, (
+                f"query={blank_query!r} must not admit NULL-embedding rows "
+                "via the empty tsquery match-everything quirk"
+            )
+            assert memory_d_id not in blank_ids, (
+                f"query={blank_query!r} must not admit any NULL-embedding rows"
+            )
+
+
+# =====================================================================
+# Entities
+# =====================================================================
+
+
+class TestEntities:
+    async def test_create_and_get_entity(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        name = f"TestEntity-{_uid()}"
+        payload = {
+            "tenant_id": tenant_id,
+            "fleet_id": fleet_id,
+            "entity_type": "person",
+            "canonical_name": name,
+            "attributes": {"role": "engineer"},
+        }
+        resp = await client.post(f"{PREFIX}/entities", json=payload)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        entity_id = body["id"]
+        assert body["canonical_name"] == name
+
+        # GET by id
+        resp2 = await client.get(f"{PREFIX}/entities/{entity_id}")
+        assert resp2.status_code == 200
+        assert resp2.json()["canonical_name"] == name
+
+    async def test_find_exact_entity_by_name(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        name = f"ExactMatch-{_uid()}"
+        payload = {
+            "tenant_id": tenant_id,
+            "fleet_id": fleet_id,
+            "entity_type": "person",
+            "canonical_name": name,
+        }
+        await client.post(f"{PREFIX}/entities", json=payload)
+
+        resp = await client.get(
+            f"{PREFIX}/entities/by-name",
+            params={
+                "tenant_id": tenant_id,
+                "name": name,
+                "entity_type": "person",
+                "fleet_id": fleet_id,
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["entity"] is not None
+        assert body["entity"]["canonical_name"] == name
+
+    async def test_find_exact_entity_not_found(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+    ) -> None:
+        resp = await client.get(
+            f"{PREFIX}/entities/by-name",
+            params={
+                "tenant_id": tenant_id,
+                "name": "NoSuchEntity",
+                "entity_type": "person",
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["entity"] is None
+
+    async def test_create_relation(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        # Create two entities
+        e1 = (
+            await client.post(
+                f"{PREFIX}/entities",
+                json={
+                    "tenant_id": tenant_id,
+                    "fleet_id": fleet_id,
+                    "entity_type": "person",
+                    "canonical_name": f"Alice-{_uid()}",
+                },
+            )
+        ).json()
+        e2 = (
+            await client.post(
+                f"{PREFIX}/entities",
+                json={
+                    "tenant_id": tenant_id,
+                    "fleet_id": fleet_id,
+                    "entity_type": "person",
+                    "canonical_name": f"Bob-{_uid()}",
+                },
+            )
+        ).json()
+
+        resp = await client.post(
+            f"{PREFIX}/entities/relations",
+            json={
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "from_entity_id": e1["id"],
+                "relation_type": "works_with",
+                "to_entity_id": e2["id"],
+                "weight": 0.9,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["relation_type"] == "works_with"
+        assert body["from_entity_id"] == e1["id"]
+        assert body["to_entity_id"] == e2["id"]
+
+    async def test_create_relation_duplicate_upserts(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        """A second POST with the same natural key
+        ``(tenant_id, from_entity_id, relation_type, to_entity_id)``
+        upserts in place rather than 500'ing on the unique constraint.
+        Pre-fix this raised ``IntegrityError: duplicate key value
+        violates unique constraint "uq_relations_natural_key"`` and
+        cascaded into bulk_write 5xx + silent-create-bulk during the
+        2026-04-26 load test."""
+        e1 = (
+            await client.post(
+                f"{PREFIX}/entities",
+                json={
+                    "tenant_id": tenant_id,
+                    "fleet_id": fleet_id,
+                    "entity_type": "person",
+                    "canonical_name": f"Carol-{_uid()}",
+                },
+            )
+        ).json()
+        e2 = (
+            await client.post(
+                f"{PREFIX}/entities",
+                json={
+                    "tenant_id": tenant_id,
+                    "fleet_id": fleet_id,
+                    "entity_type": "person",
+                    "canonical_name": f"Dan-{_uid()}",
+                },
+            )
+        ).json()
+
+        first = await client.post(
+            f"{PREFIX}/entities/relations",
+            json={
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "from_entity_id": e1["id"],
+                "relation_type": "manages",
+                "to_entity_id": e2["id"],
+                "weight": 0.5,
+            },
+        )
+        assert first.status_code == 200, first.text
+        first_id = first.json()["id"]
+
+        # Second POST with the same natural key but a different weight +
+        # evidence: must succeed (upsert), preserve the row id, and pick
+        # up the new weight.
+        second = await client.post(
+            f"{PREFIX}/entities/relations",
+            json={
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "from_entity_id": e1["id"],
+                "relation_type": "manages",
+                "to_entity_id": e2["id"],
+                "weight": 0.9,
+            },
+        )
+        assert second.status_code == 200, second.text
+        body = second.json()
+        assert body["id"] == first_id, "upsert must preserve the existing row id"
+        assert body["weight"] == 0.9, "upsert must refresh weight on conflict"
+
+    async def test_entity_with_linked_memories(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        # Create entity
+        entity = (
+            await client.post(
+                f"{PREFIX}/entities",
+                json={
+                    "tenant_id": tenant_id,
+                    "fleet_id": fleet_id,
+                    "entity_type": "concept",
+                    "canonical_name": f"LinkedConcept-{_uid()}",
+                },
+            )
+        ).json()
+        entity_id = entity["id"]
+
+        # Create memory and link it
+        mem_payload = _memory_payload(tenant_id, fleet_id)
+        mem = (await client.post(f"{PREFIX}/memories", json=mem_payload)).json()
+        memory_id = mem["id"]
+
+        link_resp = await client.post(
+            f"{PREFIX}/entities/memory-links/create",
+            json={
+                "memory_id": memory_id,
+                "entity_id": entity_id,
+                "role": "subject",
+            },
+        )
+        assert link_resp.status_code == 200
+
+        # Get entity with linked memories
+        resp = await client.get(
+            f"{PREFIX}/entities/linked-memories/{entity_id}",
+            params={"tenant_id": tenant_id},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["entity"]["id"] == entity_id
+        assert len(body["linked_memories"]) >= 1
+
+    async def test_get_nonexistent_entity_returns_404(
+        self,
+        client: AsyncClient,
+    ) -> None:
+        fake_id = str(uuid.uuid4())
+        resp = await client.get(f"{PREFIX}/entities/{fake_id}")
+        assert resp.status_code == 404
+
+
+# =====================================================================
+# Agents
+# =====================================================================
+
+
+class TestAgents:
+    async def test_create_and_get_agent(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        agent_id = f"agent-{_uid()}"
+        payload = {
+            "tenant_id": tenant_id,
+            "fleet_id": fleet_id,
+            "agent_id": agent_id,
+            "trust_level": 2,
+        }
+        resp = await client.post(f"{PREFIX}/agents", json=payload)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["agent_id"] == agent_id
+        assert body["trust_level"] == 2
+
+        # GET
+        resp2 = await client.get(
+            f"{PREFIX}/agents/{agent_id}",
+            params={"tenant_id": tenant_id},
+        )
+        assert resp2.status_code == 200
+        assert resp2.json()["agent_id"] == agent_id
+
+    async def test_list_agents(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        agent_id = f"agent-list-{_uid()}"
+        await client.post(
+            f"{PREFIX}/agents",
+            json={
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "agent_id": agent_id,
+            },
+        )
+
+        resp = await client.get(
+            f"{PREFIX}/agents",
+            params={"tenant_id": tenant_id},
+        )
+        assert resp.status_code == 200
+        agents = resp.json()
+        assert isinstance(agents, list)
+        assert any(a["agent_id"] == agent_id for a in agents)
+
+    async def test_update_trust_level(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        agent_id = f"agent-trust-{_uid()}"
+        await client.post(
+            f"{PREFIX}/agents",
+            json={
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "agent_id": agent_id,
+                "trust_level": 1,
+            },
+        )
+
+        resp = await client.patch(
+            f"{PREFIX}/agents/{agent_id}/trust",
+            json={
+                "tenant_id": tenant_id,
+                "trust_level": 3,
+                "fleet_id": fleet_id,
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+        # Verify
+        agent = (
+            await client.get(
+                f"{PREFIX}/agents/{agent_id}",
+                params={"tenant_id": tenant_id},
+            )
+        ).json()
+        assert agent["trust_level"] == 3
+
+    async def test_get_nonexistent_agent_returns_404(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+    ) -> None:
+        resp = await client.get(
+            f"{PREFIX}/agents/nonexistent-agent",
+            params={"tenant_id": tenant_id},
+        )
+        assert resp.status_code == 404
+
+
+# =====================================================================
+# Documents
+# =====================================================================
+
+
+class TestDocuments:
+    async def test_upsert_and_get_document(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        doc_id = f"doc-{_uid()}"
+        collection = "test-collection"
+        payload = {
+            "tenant_id": tenant_id,
+            "fleet_id": fleet_id,
+            "collection": collection,
+            "doc_id": doc_id,
+            "data": {"title": "Test Document", "body": "Hello world"},
+        }
+        resp = await client.post(f"{PREFIX}/documents", json=payload)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["doc_id"] == doc_id
+        assert body["data"]["title"] == "Test Document"
+
+        # GET by doc_id
+        resp2 = await client.get(
+            f"{PREFIX}/documents/{doc_id}",
+            params={"tenant_id": tenant_id, "collection": collection},
+        )
+        assert resp2.status_code == 200
+        assert resp2.json()["doc_id"] == doc_id
+
+    async def test_upsert_updates_existing(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        doc_id = f"doc-upsert-{_uid()}"
+        collection = "test-collection"
+        base = {
+            "tenant_id": tenant_id,
+            "fleet_id": fleet_id,
+            "collection": collection,
+            "doc_id": doc_id,
+        }
+        # Create
+        await client.post(
+            f"{PREFIX}/documents",
+            json={**base, "data": {"v": 1}},
+        )
+        # Upsert with new data
+        resp = await client.post(
+            f"{PREFIX}/documents",
+            json={**base, "data": {"v": 2}},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["data"]["v"] == 2
+
+    async def test_query_documents(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        collection = f"query-coll-{_uid()}"
+        for i in range(3):
+            await client.post(
+                f"{PREFIX}/documents",
+                json={
+                    "tenant_id": tenant_id,
+                    "fleet_id": fleet_id,
+                    "collection": collection,
+                    "doc_id": f"qdoc-{i}",
+                    "data": {"index": i},
+                },
+            )
+
+        resp = await client.post(
+            f"{PREFIX}/documents/query",
+            json={
+                "tenant_id": tenant_id,
+                "collection": collection,
+                "fleet_id": fleet_id,
+            },
+        )
+        assert resp.status_code == 200
+        docs = resp.json()
+        assert isinstance(docs, list)
+        assert len(docs) >= 3
+
+    async def test_delete_document(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        doc_id = f"doc-del-{_uid()}"
+        collection = "test-collection"
+        await client.post(
+            f"{PREFIX}/documents",
+            json={
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "collection": collection,
+                "doc_id": doc_id,
+                "data": {"temp": True},
+            },
+        )
+
+        resp = await client.delete(
+            f"{PREFIX}/documents/{doc_id}",
+            params={"tenant_id": tenant_id, "collection": collection},
+        )
+        assert resp.status_code == 200
+        assert "deleted_id" in resp.json()
+
+        # Verify deleted
+        resp2 = await client.get(
+            f"{PREFIX}/documents/{doc_id}",
+            params={"tenant_id": tenant_id, "collection": collection},
+        )
+        assert resp2.status_code == 404
+
+    async def test_get_nonexistent_document_returns_404(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+    ) -> None:
+        resp = await client.get(
+            f"{PREFIX}/documents/nonexistent-doc",
+            params={"tenant_id": tenant_id, "collection": "nope"},
+        )
+        assert resp.status_code == 404
+
+
+# =====================================================================
+# Fleet
+# =====================================================================
+
+
+class TestFleet:
+    async def test_upsert_and_list_nodes(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        node_name = f"node-{_uid()}"
+        payload = {
+            "tenant_id": tenant_id,
+            "fleet_id": fleet_id,
+            "node_name": node_name,
+            "hostname": "test-host",
+            "ip": "127.0.0.1",
+            "openclaw_version": "0.1.0",
+        }
+        resp = await client.post(f"{PREFIX}/fleet/nodes", json=payload)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        node_id = body["id"]
+        assert node_id is not None
+
+        # List nodes
+        resp2 = await client.get(
+            f"{PREFIX}/fleet/nodes",
+            params={"tenant_id": tenant_id, "fleet_id": fleet_id},
+        )
+        assert resp2.status_code == 200
+        nodes = resp2.json()
+        assert isinstance(nodes, list)
+        assert any(n["node_name"] == node_name for n in nodes)
+
+    async def test_upsert_node_is_idempotent(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        node_name = f"node-idem-{_uid()}"
+        payload = {
+            "tenant_id": tenant_id,
+            "fleet_id": fleet_id,
+            "node_name": node_name,
+            "hostname": "host-v1",
+        }
+        r1 = (await client.post(f"{PREFIX}/fleet/nodes", json=payload)).json()
+
+        # Upsert again with updated hostname
+        payload["hostname"] = "host-v2"
+        r2 = (await client.post(f"{PREFIX}/fleet/nodes", json=payload)).json()
+
+        # Same node id
+        assert r1["id"] == r2["id"]
+
+    async def test_create_and_list_commands(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        # Create a node first
+        node_name = f"cmd-node-{_uid()}"
+        node_resp = await client.post(
+            f"{PREFIX}/fleet/nodes",
+            json={
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "node_name": node_name,
+            },
+        )
+        node_id = node_resp.json()["id"]
+
+        # Create a command
+        cmd_payload = {
+            "tenant_id": tenant_id,
+            "node_id": node_id,
+            "command": "sync_memories",
+            "payload": {"batch_size": 100},
+        }
+        resp = await client.post(f"{PREFIX}/fleet/commands", json=cmd_payload)
+        assert resp.status_code == 200, resp.text
+        cmd = resp.json()
+        assert cmd["command"] == "sync_memories"
+        assert cmd["status"] == "pending"
+
+        # List commands
+        resp2 = await client.get(
+            f"{PREFIX}/fleet/commands",
+            params={"tenant_id": tenant_id},
+        )
+        assert resp2.status_code == 200
+        commands = resp2.json()
+        assert isinstance(commands, list)
+        assert any(c["id"] == cmd["id"] for c in commands)
+
+    async def test_get_pending_commands(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        node_name = f"pending-node-{_uid()}"
+        node_resp = await client.post(
+            f"{PREFIX}/fleet/nodes",
+            json={
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "node_name": node_name,
+            },
+        )
+        node_id = node_resp.json()["id"]
+
+        # Create two commands
+        for i in range(2):
+            await client.post(
+                f"{PREFIX}/fleet/commands",
+                json={
+                    "tenant_id": tenant_id,
+                    "node_id": node_id,
+                    "command": f"cmd-{i}",
+                },
+            )
+
+        resp = await client.get(
+            f"{PREFIX}/fleet/commands/pending/{node_name}",
+            params={"tenant_id": tenant_id},
+        )
+        assert resp.status_code == 200
+        pending = resp.json()
+        assert isinstance(pending, list)
+        assert len(pending) >= 2

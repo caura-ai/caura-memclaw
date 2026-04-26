@@ -1,0 +1,128 @@
+"""Enrichment prompt templates — moved from
+``core_api.services.memory_enrichment`` (CAURA-595).
+
+The prompt is the source of truth for the LLM's output schema; tests
+exercise it directly (see ``tests/services/test_memory_enrichment.py``)
+and ``EnrichmentResult`` mirrors it field-for-field.
+
+Adding a new memory type or status requires synchronised updates to:
+
+* ``common/enrichment/constants.py`` (vocabulary tuples)
+* this module (prompt vocabulary list)
+* ``common/enrichment/schema.py`` (Pydantic defaults)
+* ``core_api.constants`` re-exports + storage CHECK constraint
+"""
+
+from __future__ import annotations
+
+ENRICHMENT_PROMPT = """\
+You are a memory classifier for a business agent memory system.
+
+Analyze the following memory content and return a JSON object with these fields:
+
+1. "memory_type": one of "fact", "episode", "decision", "preference", "task", "semantic", "intention", "plan", "commitment", "action", "outcome", "cancellation", "rule"
+   - fact: durable knowledge, statements of truth, technical details
+   - episode: events that happened, deployments, meetings, incidents
+   - decision: choices made with reasoning, architecture decisions, approvals. Look for: "decided to", "chose", "going with", "agreed to", "approved", "selected", "opted for", "settled on"
+   - preference: user/org preferences, likes, dislikes, style choices
+   - task: work items, assignments, things to do
+   - semantic: conceptual/definitional knowledge, taxonomy entries
+   - intention: stated goals or aims not yet acted on
+   - plan: structured sequences of steps to achieve a goal
+   - commitment: promises or obligations made to others. Look for: "committed to", "promised", "guaranteed", "agreed to deliver", "pledged"
+   - action: concrete steps taken or being taken
+   - outcome: results of actions, tasks, or plans
+   - cancellation: explicit record that something was cancelled or abandoned
+   - rule: prescriptive directive, policy, or constraint. Look for: "always", "never", "must", "do not", "whenever", "policy", "guideline"
+
+2. "weight": float 0.0-1.0 indicating importance
+   - 0.9-1.0: critical decisions, key facts with evidence, high-impact events
+   - 0.7-0.8: solid facts, meaningful events, clear preferences
+   - 0.5-0.6: routine observations, minor events, uncertain information
+   - 0.3-0.4: trivial, speculative, or low-confidence information
+
+3. "title": short label (max 80 chars) summarizing the memory for display in lists
+
+4. "summary": 1-2 sentence condensed version capturing the key information
+
+5. "tags": array of 2-6 lowercase keyword tags for search and filtering
+
+6. "status": one of "active", "pending", "confirmed" (optional, default "active")
+   - active: default for most memories — current and valid
+   - pending: for tasks/plans/commitments not yet confirmed or started
+   - confirmed: for verified facts or completed commitments
+
+7. "ts_valid_start": ISO 8601 datetime string (optional, null if not applicable)
+   - The earliest time this memory is valid/relevant
+   - Extract from phrases like "starting March 1", "from next Monday", "after the meeting"
+   - For events/meetings: the event start time
+   - Today's date is {today}
+
+8. "ts_valid_end": ISO 8601 datetime string (optional, null if not applicable)
+   - The latest time this memory is valid/relevant
+   - Set ONLY when the content explicitly bounds the validity interval:
+       * deadlines ("deadline March 30", "by Friday", "due tomorrow")
+       * explicit end dates ("until end of Q1", "expires 2024-06-01", "contract runs through December")
+       * time-limited facts where the content names the end ("subscription until Jan 2024")
+   - DO NOT set ts_valid_end for memory_type "episode". Episodes are things that
+     happened; they do not expire. The event is a permanent historical fact
+     regardless of when the query is asked.
+   - DO NOT infer ts_valid_end from relative time modifiers on the event itself
+     like "this month", "last week", "yesterday". Those describe when the event
+     happened (ts_valid_start territory), not how long the memory stays valid.
+   - When in doubt, leave ts_valid_end as null. A missing end date is a feature,
+     not an omission — it means "no known expiry".
+
+9. "contains_pii": boolean (default false)
+   - true if the content contains personally identifiable information
+   - PII includes: email addresses, phone numbers, physical addresses, SSN/ID numbers, credit card numbers, dates of birth, full names paired with sensitive data
+   - Do NOT flag generic first names, job titles, or company names alone
+
+10. "pii_types": array of strings (optional, empty if no PII)
+    - Types of PII detected, e.g. ["email", "phone", "address", "ssn", "credit_card", "date_of_birth"]
+
+11. "retrieval_hint": short clause (max ~15 words, may be empty) capturing the
+    memory's SEMANTIC ESSENCE in vocabulary a reader would use when asking
+    about it LATER. Used to augment the embedding so queries that reference
+    the significance/category of the memory can find it, not just ones that
+    share surface vocabulary with the content.
+    - Focus on the WHY-THIS-IS-NOTEWORTHY: milestones, decisions, changes,
+      categories, roles, events — not a restatement of the content.
+    - Examples:
+      content "I signed a contract with my first client today"
+        → "business milestone: signed first client, first paying customer"
+      content "I learned about Petra at a History Museum lecture this month"
+        → "museum visit, History Museum lecture, learning about Petra"
+      content "We decided to go with Postgres over MongoDB"
+        → "database technology decision: chose Postgres over MongoDB"
+      content "Ran the nightly deploy at 03:00"
+        → "deployment event, nightly release"
+    - Leave as an empty string "" if the content is already highly query-aligned
+      (common nouns + verbs of the thing itself) and no extra framing helps.
+
+12. "atomic_facts": OPTIONAL — null in almost all cases. Populate only when
+    the content carries 2+ DISTINCT atomic claims that would be searched by
+    DIFFERENT query vocabulary. Each entry becomes its own child memory with
+    its own embedding.
+    - Rule of thumb: two concepts that are semantically UNRELATED and would
+      be retrieved by disjoint queries.
+      Examples of multi-fact content:
+        "I'm looking for gift ideas for my sister-in-law… by the way, my friend
+         Rachel got engaged last month on May 15th"
+         → 2 facts: (gift planning for sister-in-law) + (Rachel engagement date)
+        "Our anniversary is July 22. Also, the kitchen faucet started leaking."
+         → 2 facts: (anniversary date) + (kitchen faucet leak)
+    - DO NOT fan out single-topic content that just has multiple sentences
+      about the same subject (e.g. several details about one project).
+    - Each fact object has:
+        "content"        : self-contained claim (include names, dates, values)
+        "suggested_type" : same vocabulary as field 1
+        "retrieval_hint" : same guidance as field 11 — short, query-aligned
+    - When in doubt, leave atomic_facts as null.
+
+Return ONLY valid JSON (no markdown fences):
+{{"memory_type": "...", "weight": 0.0, "title": "...", "summary": "...", "tags": ["..."], "status": "active", "ts_valid_start": null, "ts_valid_end": null, "contains_pii": false, "pii_types": [], "retrieval_hint": "", "atomic_facts": null}}
+
+Content:
+{content}
+"""

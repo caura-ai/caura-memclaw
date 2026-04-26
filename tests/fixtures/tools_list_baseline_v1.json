@@ -1,0 +1,1117 @@
+[
+  {
+    "annotations": null,
+    "description": "Structured-document CRUD in named collections. op: write|read|query|delete|list_collections|search. write upserts by collection+doc_id (pass embed_field to index a text field for semantic search); query filters by where dict; list_collections enumerates every collection this tenant has (with counts); search runs semantic retrieval over docs indexed via embed_field on write \u2014 pass collection to scope to one (narrow strategy), or omit collection to span every collection in the tenant (broad strategy). Use for structured records (customers, config). For memories use memclaw_write.",
+    "execution": null,
+    "icons": null,
+    "inputSchema": {
+      "properties": {
+        "agent_id": {
+          "default": "mcp-agent",
+          "description": "Caller agent.",
+          "title": "Agent Id",
+          "type": "string"
+        },
+        "collection": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Collection. Required for write|read|query|delete|search; omitted for list_collections.",
+          "title": "Collection"
+        },
+        "data": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "op=write.",
+          "title": "Data"
+        },
+        "doc_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "op=write|read|delete.",
+          "title": "Doc Id"
+        },
+        "embed_field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "op=write: JSON field in `data` whose text value should be embedded for semantic search. Omit to skip indexing (doc won't appear in op=search).",
+          "title": "Embed Field"
+        },
+        "fleet_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "op=write; optional scoping filter for op=list_collections|search.",
+          "title": "Fleet Id"
+        },
+        "limit": {
+          "default": 20,
+          "description": "op=query.",
+          "title": "Limit",
+          "type": "integer"
+        },
+        "offset": {
+          "default": 0,
+          "description": "op=query.",
+          "title": "Offset",
+          "type": "integer"
+        },
+        "op": {
+          "description": "write|read|query|delete|list_collections|search.",
+          "title": "Op",
+          "type": "string"
+        },
+        "order": {
+          "default": "asc",
+          "description": "op=query: asc|desc.",
+          "title": "Order",
+          "type": "string"
+        },
+        "order_by": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "op=query.",
+          "title": "Order By"
+        },
+        "query": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "op=search: natural-language query.",
+          "title": "Query"
+        },
+        "top_k": {
+          "default": 5,
+          "description": "op=search: max results (1-50).",
+          "title": "Top K",
+          "type": "integer"
+        },
+        "where": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "op=query.",
+          "title": "Where"
+        }
+      },
+      "required": [
+        "op"
+      ],
+      "title": "memclaw_docArguments",
+      "type": "object"
+    },
+    "meta": null,
+    "name": "memclaw_doc",
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "title": "Result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "memclaw_docOutput",
+      "type": "object"
+    },
+    "title": null
+  },
+  {
+    "annotations": null,
+    "description": "Look up an entity by UUID. Use only when you have an entity_id from a prior search.",
+    "execution": null,
+    "icons": null,
+    "inputSchema": {
+      "properties": {
+        "entity_id": {
+          "description": "The UUID of the entity to look up.",
+          "title": "Entity Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entity_id"
+      ],
+      "title": "memclaw_entity_getArguments",
+      "type": "object"
+    },
+    "meta": null,
+    "name": "memclaw_entity_get",
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "title": "Result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "memclaw_entity_getOutput",
+      "type": "object"
+    },
+    "title": null
+  },
+  {
+    "annotations": null,
+    "description": "Report what happened after acting on memories. outcome_type: success|failure|partial. related_ids = the memory UUIDs that influenced the action (use IDs from your most recent memclaw_recall). scope: agent (default, trust \u2265 1)|fleet|all (trust \u2265 2; fleet_id required when scope='fleet'). Weight adjustments and rule generation are scoped \u2014 agents can only evolve memories they own (scope=agent), their fleet (scope=fleet), or any (scope=all).",
+    "execution": null,
+    "icons": null,
+    "inputSchema": {
+      "properties": {
+        "agent_id": {
+          "default": "mcp-agent",
+          "description": "Caller agent.",
+          "title": "Agent Id",
+          "type": "string"
+        },
+        "fleet_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Required when scope='fleet'.",
+          "title": "Fleet Id"
+        },
+        "outcome": {
+          "description": "Natural-language description of what happened.",
+          "title": "Outcome",
+          "type": "string"
+        },
+        "outcome_type": {
+          "description": "success|failure|partial.",
+          "title": "Outcome Type",
+          "type": "string"
+        },
+        "related_ids": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Memory UUIDs that influenced the action.",
+          "title": "Related Ids"
+        },
+        "scope": {
+          "default": "agent",
+          "description": "agent|fleet|all.",
+          "title": "Scope",
+          "type": "string"
+        }
+      },
+      "required": [
+        "outcome",
+        "outcome_type"
+      ],
+      "title": "memclaw_evolveArguments",
+      "type": "object"
+    },
+    "meta": null,
+    "name": "memclaw_evolve",
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "title": "Result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "memclaw_evolveOutput",
+      "type": "object"
+    },
+    "title": null
+  },
+  {
+    "annotations": null,
+    "description": "Reflect over your memory store. focus: contradictions|failures|stale|divergence|patterns|discover. scope: agent (default, trust \u2265 1)|fleet|all (trust \u2265 2; divergence requires fleet/all). Findings are saved as insight-type memories for future runs to build on.",
+    "execution": null,
+    "icons": null,
+    "inputSchema": {
+      "properties": {
+        "agent_id": {
+          "default": "mcp-agent",
+          "description": "Caller agent.",
+          "title": "Agent Id",
+          "type": "string"
+        },
+        "fleet_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Required when scope='fleet'.",
+          "title": "Fleet Id"
+        },
+        "focus": {
+          "description": "contradictions|failures|stale|divergence|patterns|discover.",
+          "title": "Focus",
+          "type": "string"
+        },
+        "scope": {
+          "default": "agent",
+          "description": "agent|fleet|all.",
+          "title": "Scope",
+          "type": "string"
+        }
+      },
+      "required": [
+        "focus"
+      ],
+      "title": "memclaw_insightsArguments",
+      "type": "object"
+    },
+    "meta": null,
+    "name": "memclaw_insights",
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "title": "Result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "memclaw_insightsOutput",
+      "type": "object"
+    },
+    "title": null
+  },
+  {
+    "annotations": null,
+    "description": "Browse memories by metadata (non-semantic). Filter+sort+paginate by fleet, author, type, status, weight, created-at. scope='agent' (default) lists your memories at trust \u2265 1; scope='fleet'/'all' requires trust \u2265 2. Trust 3 unlocks include_deleted. Cursor pagination requires sort=created_at order=desc. For semantic search use memclaw_recall.",
+    "execution": null,
+    "icons": null,
+    "inputSchema": {
+      "properties": {
+        "agent_id": {
+          "default": "mcp-agent",
+          "description": "Caller agent.",
+          "title": "Agent Id",
+          "type": "string"
+        },
+        "created_after": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "ISO8601.",
+          "title": "Created After"
+        },
+        "created_before": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "ISO8601.",
+          "title": "Created Before"
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Pagination cursor.",
+          "title": "Cursor"
+        },
+        "fleet_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Fleet.",
+          "title": "Fleet Id"
+        },
+        "include_deleted": {
+          "default": false,
+          "description": "Trust-3 only.",
+          "title": "Include Deleted",
+          "type": "boolean"
+        },
+        "limit": {
+          "default": 25,
+          "description": "1-50.",
+          "title": "Limit",
+          "type": "integer"
+        },
+        "memory_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Type.",
+          "title": "Memory Type"
+        },
+        "order": {
+          "default": "desc",
+          "description": "asc|desc.",
+          "title": "Order",
+          "type": "string"
+        },
+        "scope": {
+          "default": "agent",
+          "description": "agent|fleet|all. 'agent' (default) = your memories only (trust \u2265 1). 'fleet'/'all' = cross-agent (trust \u2265 2).",
+          "title": "Scope",
+          "type": "string"
+        },
+        "sort": {
+          "default": "created_at",
+          "description": "created_at|weight|recall_count.",
+          "title": "Sort",
+          "type": "string"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Status.",
+          "title": "Status"
+        },
+        "weight_max": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Max weight 0-1.",
+          "title": "Weight Max"
+        },
+        "weight_min": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Min weight 0-1.",
+          "title": "Weight Min"
+        },
+        "written_by": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Author.",
+          "title": "Written By"
+        }
+      },
+      "title": "memclaw_listArguments",
+      "type": "object"
+    },
+    "meta": null,
+    "name": "memclaw_list",
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "title": "Result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "memclaw_listOutput",
+      "type": "object"
+    },
+    "title": null
+  },
+  {
+    "annotations": null,
+    "description": "Per-memory lifecycle. op: read|update|transition|delete. update patches fields and re-embeds if content changes. transition sets status (active|pending|confirmed|cancelled|outdated|conflicted|archived|deleted). delete is soft (prefer transition to outdated/archived).",
+    "execution": null,
+    "icons": null,
+    "inputSchema": {
+      "properties": {
+        "agent_id": {
+          "default": "mcp-agent",
+          "description": "Caller agent.",
+          "title": "Agent Id",
+          "type": "string"
+        },
+        "content": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "op=update.",
+          "title": "Content"
+        },
+        "memory_id": {
+          "description": "UUID.",
+          "title": "Memory Id",
+          "type": "string"
+        },
+        "memory_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "op=update.",
+          "title": "Memory Type"
+        },
+        "metadata": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "op=update.",
+          "title": "Metadata"
+        },
+        "op": {
+          "description": "read|update|transition|delete.",
+          "title": "Op",
+          "type": "string"
+        },
+        "source_uri": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "op=update.",
+          "title": "Source Uri"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "op=transition.",
+          "title": "Status"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "op=update.",
+          "title": "Title"
+        },
+        "weight": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "op=update; 0-1.",
+          "title": "Weight"
+        }
+      },
+      "required": [
+        "op",
+        "memory_id"
+      ],
+      "title": "memclaw_manageArguments",
+      "type": "object"
+    },
+    "meta": null,
+    "name": "memclaw_manage",
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "title": "Result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "memclaw_manageOutput",
+      "type": "object"
+    },
+    "title": null
+  },
+  {
+    "annotations": null,
+    "description": "Find memories by meaning (hybrid semantic+keyword). Set include_brief=true for an LLM summary paragraph. For non-semantic browse use memclaw_list; for read-by-id use memclaw_manage op=read.",
+    "execution": null,
+    "icons": null,
+    "inputSchema": {
+      "properties": {
+        "agent_id": {
+          "default": "mcp-agent",
+          "description": "Caller agent.",
+          "title": "Agent Id",
+          "type": "string"
+        },
+        "filter_agent_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Filter by author.",
+          "title": "Filter Agent Id"
+        },
+        "fleet_ids": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Restrict fleets.",
+          "title": "Fleet Ids"
+        },
+        "include_brief": {
+          "default": false,
+          "description": "Add LLM summary.",
+          "title": "Include Brief",
+          "type": "boolean"
+        },
+        "memory_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Filter by type.",
+          "title": "Memory Type"
+        },
+        "query": {
+          "description": "NL query.",
+          "title": "Query",
+          "type": "string"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Filter by status.",
+          "title": "Status"
+        },
+        "top_k": {
+          "default": 5,
+          "description": "1-20.",
+          "title": "Top K",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "title": "memclaw_recallArguments",
+      "type": "object"
+    },
+    "meta": null,
+    "name": "memclaw_recall",
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "title": "Result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "memclaw_recallOutput",
+      "type": "object"
+    },
+    "title": null
+  },
+  {
+    "annotations": null,
+    "description": "Tune YOUR retrieval parameters for memclaw_recall (top_k, min_similarity, fts_weight, graph_max_hops, freshness, recall_boost). Only provide fields to change; no fields \u2192 returns current profile.",
+    "execution": null,
+    "icons": null,
+    "inputSchema": {
+      "properties": {
+        "agent_id": {
+          "default": "mcp-agent",
+          "description": "Caller agent.",
+          "title": "Agent Id",
+          "type": "string"
+        },
+        "freshness_decay_days": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "7-730.",
+          "title": "Freshness Decay Days"
+        },
+        "freshness_floor": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "0-1.",
+          "title": "Freshness Floor"
+        },
+        "fts_weight": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "0=semantic, 1=keyword.",
+          "title": "Fts Weight"
+        },
+        "graph_max_hops": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "0-3.",
+          "title": "Graph Max Hops"
+        },
+        "min_similarity": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "0.1-0.9.",
+          "title": "Min Similarity"
+        },
+        "recall_boost_cap": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "1-3.",
+          "title": "Recall Boost Cap"
+        },
+        "recall_decay_window_days": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "7-365.",
+          "title": "Recall Decay Window Days"
+        },
+        "similarity_blend": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "0-1.",
+          "title": "Similarity Blend"
+        },
+        "top_k": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "1-20.",
+          "title": "Top K"
+        }
+      },
+      "title": "memclaw_tuneArguments",
+      "type": "object"
+    },
+    "meta": null,
+    "name": "memclaw_tune",
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "title": "Result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "memclaw_tuneOutput",
+      "type": "object"
+    },
+    "title": null
+  },
+  {
+    "annotations": null,
+    "description": "Store NEW memories. Provide exactly one of {content, items} (batch \u2264100). System auto-classifies type, importance, title, tags, dates. visibility: scope_team (default) / scope_org / scope_agent. Prefer team/org for sharing.",
+    "execution": null,
+    "icons": null,
+    "inputSchema": {
+      "properties": {
+        "agent_id": {
+          "default": "mcp-agent",
+          "description": "Caller agent.",
+          "title": "Agent Id",
+          "type": "string"
+        },
+        "content": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Single-write text.",
+          "title": "Content"
+        },
+        "fleet_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Fleet scope.",
+          "title": "Fleet Id"
+        },
+        "items": {
+          "anyOf": [
+            {
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Batch of objects, \u2264100; each needs 'content'.",
+          "title": "Items"
+        },
+        "memory_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Type (single only).",
+          "title": "Memory Type"
+        },
+        "metadata": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Metadata (single only).",
+          "title": "Metadata"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Run id (single only).",
+          "title": "Run Id"
+        },
+        "source_uri": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Source URI (single only).",
+          "title": "Source Uri"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Status (single only).",
+          "title": "Status"
+        },
+        "visibility": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "scope_team|scope_org|scope_agent.",
+          "title": "Visibility"
+        },
+        "weight": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "0-1 (single only).",
+          "title": "Weight"
+        },
+        "write_mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "fast|strong|auto (single only).",
+          "title": "Write Mode"
+        }
+      },
+      "title": "memclaw_writeArguments",
+      "type": "object"
+    },
+    "meta": null,
+    "name": "memclaw_write",
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "title": "Result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "memclaw_writeOutput",
+      "type": "object"
+    },
+    "title": null
+  }
+]

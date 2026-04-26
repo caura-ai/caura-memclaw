@@ -1,0 +1,411 @@
+"""Detect and resolve contradictions between memories on write.
+
+P1 fixes:
+- Post-commit async detection (sees all committed data, no concurrency blind spot)
+- Correct supersession semantics (new_memory.supersedes_id -> old memory)
+- Broader candidate search (threshold 0.70, limit 8)
+
+Multi-provider support:
+- Vertex AI, OpenAI, Anthropic, OpenRouter via provider layer
+- Automatic fallback chain: configured provider -> fallback -> heuristic
+"""
+
+import asyncio
+import logging
+from uuid import UUID
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from core_api.clients.storage_client import get_storage_client
+from core_api.config import settings
+from core_api.constants import SINGLE_VALUE_PREDICATES
+from core_api.providers._retry import call_with_fallback
+from core_api.schemas import ContradictionInfo
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Public API: async post-commit entry point (P1-1)
+# ---------------------------------------------------------------------------
+
+
+async def detect_contradictions_async(
+    memory_id: UUID,
+    tenant_id: str,
+    fleet_id: str | None,
+    content: str,
+    embedding: list[float],
+    *,
+    new_memory: dict | None = None,
+) -> None:
+    """Post-commit contradiction detection — runs independently.
+
+    Follows the same fire-and-forget pattern as entity extraction:
+    uses the storage client so it can see all committed data (including
+    concurrent writes that were invisible in the caller's transaction).
+
+    ``new_memory`` is an optional pass-through for callers that already
+    fetched the row (e.g. the CAURA-595 ``handle_memory_enriched``
+    consumer). Passing it skips one HTTP GET per call to core-storage-
+    api on the async write path. We still re-check ``deleted_at`` here
+    so a soft-delete that landed AFTER the caller's fetch but BEFORE
+    detection runs cleanly aborts.
+    """
+    from core_api.services.tenant_settings import resolve_config
+
+    try:
+        if new_memory is None:
+            sc = get_storage_client()
+            new_memory = await sc.get_memory(str(memory_id))
+        if not new_memory or new_memory.get("deleted_at") is not None:
+            return
+
+        tenant_config = await resolve_config(None, tenant_id)
+        contradictions = await _detect(new_memory, embedding, tenant_config)
+
+        if contradictions:
+            logger.info(
+                "Async contradiction detection found %d conflict(s) for memory %s",
+                len(contradictions),
+                memory_id,
+            )
+    except Exception:
+        logger.exception("Async contradiction detection failed for memory %s", memory_id)
+
+
+# ---------------------------------------------------------------------------
+# Synchronous API (kept for direct-call use cases, e.g. tests)
+# ---------------------------------------------------------------------------
+
+
+async def detect_contradictions(
+    db: AsyncSession,
+    new_memory,
+    embedding: list[float],
+    tenant_config=None,
+) -> list[ContradictionInfo]:
+    """In-session contradiction detection (caller manages commit).
+
+    Kept for backward compatibility and testing. For production writes,
+    prefer detect_contradictions_async which runs post-commit.
+
+    new_memory can be an ORM Memory object or a dict from the storage client.
+    """
+    # Normalize to dict if ORM object
+    if not isinstance(new_memory, dict):
+        new_memory = {
+            "id": str(new_memory.id),
+            "tenant_id": new_memory.tenant_id,
+            "fleet_id": new_memory.fleet_id,
+            "content": new_memory.content,
+            "subject_entity_id": str(new_memory.subject_entity_id) if new_memory.subject_entity_id else None,
+            "predicate": new_memory.predicate,
+            "object_value": new_memory.object_value,
+            "supersedes_id": str(new_memory.supersedes_id) if new_memory.supersedes_id else None,
+            "status": new_memory.status,
+        }
+    return await _detect(new_memory, embedding, tenant_config)
+
+
+# ---------------------------------------------------------------------------
+# Core detection logic (shared by sync and async paths)
+# ---------------------------------------------------------------------------
+
+
+async def _detect(
+    new_memory: dict,
+    embedding: list[float],
+    tenant_config=None,
+) -> list[ContradictionInfo]:
+    """Find active memories that contradict the new one.
+
+    Two detection paths:
+    1. RDF conflict (single-value predicates only): same subject_entity_id +
+       single-value predicate + different object_value -> old memory outdated.
+       Multi-value predicates skip this path (additive, not contradictory).
+    2. Semantic conflict: high vector similarity, LLM confirms contradiction
+
+    Returns list of contradictions found (may be empty).
+    Side-effect: marks contradicted memories as outdated/conflicted and
+    sets supersession chain (new_memory.supersedes_id -> old memory).
+    """
+    sc = get_storage_client()
+    contradictions: list[ContradictionInfo] = []
+
+    memory_id = new_memory.get("id")
+    subject_entity_id = new_memory.get("subject_entity_id")
+    predicate = new_memory.get("predicate")
+    object_value = new_memory.get("object_value")
+    tenant_id = new_memory.get("tenant_id")
+    content = new_memory.get("content", "")
+    supersedes_id = new_memory.get("supersedes_id")
+
+    # --- Path 1: RDF triple contradiction (single-value predicates only) ---
+    if subject_entity_id and predicate and object_value and predicate.lower() in SINGLE_VALUE_PREDICATES:
+        rdf_conflicts = await sc.find_rdf_conflicts(
+            tenant_id,
+            subject_entity_id,
+            predicate,
+            exclude_id=str(memory_id),
+        )
+        for old in rdf_conflicts:
+            old_id = old.get("id")
+            # Mark old memory as outdated via storage client
+            await sc.update_memory_status(str(old_id), "outdated")
+            # P1-2: correct supersession -- NEW supersedes OLD
+            if not supersedes_id:
+                supersedes_id = old_id
+                await sc.update_memory_status(
+                    str(memory_id),
+                    new_memory.get("status", "active"),
+                    supersedes_id=str(old_id),
+                )
+            contradictions.append(
+                ContradictionInfo(
+                    old_memory_id=old_id,
+                    old_status="outdated",
+                    reason="rdf_conflict",
+                    old_content_preview=old.get("content", "")[:200],
+                )
+            )
+            logger.info(
+                "RDF contradiction: memory %s outdated by %s "
+                "(subject=%s predicate=%s old_value=%s new_value=%s)",
+                old_id,
+                memory_id,
+                subject_entity_id,
+                predicate,
+                old.get("object_value"),
+                object_value,
+            )
+
+    # --- Path 2: Semantic contradiction (vector similarity + batch LLM check) ---
+    if not contradictions:
+        candidates = await sc.find_similar_candidates(
+            {
+                "memory_id": str(memory_id),
+                "tenant_id": tenant_id,
+                "fleet_id": new_memory.get("fleet_id"),
+                "embedding": embedding,
+            }
+        )
+        if candidates:
+            # Fire all LLM checks concurrently instead of serially
+            tasks = [
+                asyncio.wait_for(
+                    _llm_contradiction_check(content, c.get("content", ""), tenant_config),
+                    timeout=10.0,
+                )
+                for c in candidates
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for candidate, result in zip(candidates, results):
+                if isinstance(result, Exception):
+                    logger.warning(
+                        "Contradiction check failed for candidate %s: %s",
+                        candidate.get("id"),
+                        result,
+                    )
+                    continue
+                if result:
+                    cand_id = candidate.get("id")
+                    # Mark candidate as conflicted via storage client
+                    await sc.update_memory_status(str(cand_id), "conflicted")
+                    # P1-2: correct supersession -- NEW supersedes OLD
+                    if not supersedes_id:
+                        supersedes_id = cand_id
+                        await sc.update_memory_status(
+                            str(memory_id),
+                            new_memory.get("status", "active"),
+                            supersedes_id=str(cand_id),
+                        )
+                    contradictions.append(
+                        ContradictionInfo(
+                            old_memory_id=cand_id,
+                            old_status="conflicted",
+                            reason="semantic_conflict",
+                            old_content_preview=candidate.get("content", "")[:200],
+                        )
+                    )
+                    logger.info(
+                        "Semantic contradiction: memory %s conflicted by %s",
+                        cand_id,
+                        memory_id,
+                    )
+
+    return contradictions
+
+
+CONTRADICTION_PROMPT = """\
+You are a contradiction detector for a business memory system.
+
+Given two memory statements, determine if they CONTRADICT each other.
+Contradiction means they cannot both be true at the same time.
+
+Statement A (NEW): {new_content}
+
+Statement B (EXISTING): {old_content}
+
+Rules:
+- Updates/corrections ARE contradictions (e.g., "X lives in Tel Aviv" vs "X lives in Haifa")
+- More specific versions of the same fact are NOT contradictions
+- Complementary information is NOT a contradiction
+- Different topics are NOT contradictions
+
+Reply with ONLY a JSON object:
+{{"contradicts": true/false, "reason": "brief explanation"}}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Multi-provider LLM contradiction check with fallback chain
+# ---------------------------------------------------------------------------
+
+
+async def _llm_contradiction_check(
+    new_content: str,
+    old_content: str,
+    tenant_config=None,
+) -> bool:
+    """Ask the LLM whether two texts contradict each other.
+
+    Uses the standard 3-tier fallback chain:
+    1. Try the configured provider (with retry)
+    2. Try the configured fallback provider (via resolve_fallback)
+    3. Fall back to negation-word heuristic
+
+    Note: the previous implementation tried ALL providers with valid
+    credentials before falling back to the heuristic. This was replaced
+    with the standard single-fallback pattern for consistency across
+    services. The heuristic fallback (step 3) is now reachable, which
+    it previously was not due to the FakeLLMProvider short-circuit bug.
+    """
+    provider_name = (
+        tenant_config.entity_extraction_provider if tenant_config else settings.entity_extraction_provider
+    )
+
+    prompt = CONTRADICTION_PROMPT.format(new_content=new_content[:500], old_content=old_content[:500])
+
+    async def _do_check(llm) -> bool:
+        raw = await llm.complete_json(prompt)
+        return bool(raw.get("contradicts", False))
+
+    return await call_with_fallback(
+        primary_provider_name=provider_name,
+        call_fn=_do_check,
+        fake_fn=lambda: _fake_contradiction_check(new_content, old_content),
+        tenant_config=tenant_config,
+        service_label="contradiction",
+        model_attr="entity_extraction_model",
+        timeout=10.0,
+    )
+
+
+def _fake_contradiction_check(new_content: str, old_content: str) -> bool:
+    """Simple heuristic for testing: flag if negation words differ."""
+    negations = {
+        "not",
+        "no",
+        "never",
+        "none",
+        "isn't",
+        "wasn't",
+        "doesn't",
+        "can't",
+        "won't",
+    }
+    new_words = set(new_content.lower().split())
+    old_words = set(old_content.lower().split())
+    new_has_neg = bool(new_words & negations)
+    old_has_neg = bool(old_words & negations)
+    # If one has negation and the other doesn't, and they share significant overlap
+    if new_has_neg != old_has_neg:
+        shared = new_words & old_words - negations
+        if len(shared) >= 3:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Entity-based contradiction detection (post entity extraction)
+# ---------------------------------------------------------------------------
+
+
+async def detect_contradictions_by_entities_async(
+    memory_id: UUID,
+    tenant_id: str,
+    fleet_id: str | None,
+) -> None:
+    """Post-entity-extraction contradiction detection using shared entities.
+
+    Runs after entity extraction completes, so MemoryEntityLink rows exist.
+    Finds memories that share entities with the new memory and checks for
+    contradictions via LLM -- catches by-the-way updates that embedding
+    similarity misses.
+    """
+    from core_api.services.tenant_settings import resolve_config
+
+    try:
+        sc = get_storage_client()
+        new_memory = await sc.get_memory(str(memory_id))
+        if not new_memory or new_memory.get("deleted_at") is not None:
+            return
+
+        tenant_config = await resolve_config(None, tenant_id)
+        candidates = await sc.find_entity_overlap_candidates(
+            {
+                "memory_id": str(memory_id),
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+            }
+        )
+        if not candidates:
+            return
+
+        new_content = new_memory.get("content", "")
+        tasks = [
+            asyncio.wait_for(
+                _llm_contradiction_check(new_content, c.get("content", ""), tenant_config),
+                timeout=10.0,
+            )
+            for c in candidates
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        found = False
+        for candidate, result in zip(candidates, results):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "Entity contradiction check failed for candidate %s: %s",
+                    candidate.get("id"),
+                    result,
+                )
+                continue
+            if result:
+                cand_id = candidate.get("id")
+                await sc.update_memory_status(str(cand_id), "conflicted")
+                if not found:
+                    # First match is most relevant (ordered by shared entity
+                    # count DESC). Entity-based detection is more precise than
+                    # embedding-based, so overwrite supersedes_id.
+                    await sc.update_memory_status(
+                        str(memory_id),
+                        new_memory.get("status", "active"),
+                        supersedes_id=str(cand_id),
+                    )
+                found = True
+                logger.info(
+                    "Entity-based contradiction: %s conflicted by %s",
+                    cand_id,
+                    memory_id,
+                )
+    except Exception:
+        logger.exception("Entity-based contradiction detection failed for %s", memory_id)
+
+
+# Backward-compat re-exports for tests
+from core_api.providers._credentials import has_credentials as _has_api_key  # noqa: F401
+from core_api.providers._credentials import (
+    resolve_openai_compatible as _resolve_openai_compatible,  # noqa: F401
+)

@@ -1,0 +1,99 @@
+# MemClaw Local Development Stack
+# Usage: docker compose up -d
+services:
+
+  # ── Infrastructure ──────────────────────────────────────────────
+
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: memclaw
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: memclaw
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U memclaw"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Core Storage API (PostgreSQL CRUD) ──────────────────────────
+
+  core-storage-api:
+    build:
+      context: .
+      dockerfile: core-storage-api/Dockerfile
+    ports:
+      - "${STORAGE_API_PORT:-8002}:8002"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://memclaw:changeme@db:5432/memclaw
+      ALLOYDB_HOST: db
+      ALLOYDB_PORT: 5432
+      ALLOYDB_USER: memclaw
+      ALLOYDB_PASSWORD: changeme
+      ALLOYDB_DATABASE: memclaw
+      ALLOYDB_REQUIRE_SSL: "false"
+      ENVIRONMENT: development
+      LOG_FORMAT_JSON: "false"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Core API (main application) ─────────────────────────────────
+
+  core-api:
+    build:
+      context: .
+      dockerfile: core-api/Dockerfile
+    ports:
+      - "${API_PORT:-8000}:8000"
+    env_file:
+      - env.dev
+      - path: .env
+        required: false
+    environment:
+      # Override DB host for Docker network
+      ALLOYDB_HOST: db
+      CORE_STORAGE_API_URL: http://core-storage-api:8002
+      REDIS_URL: redis://redis:6379/0
+      # Pass through provider keys from host (set in .env or shell)
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+    depends_on:
+      core-storage-api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  pgdata:
+  redis_data:

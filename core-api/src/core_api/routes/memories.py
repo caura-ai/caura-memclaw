@@ -1,0 +1,1116 @@
+import logging
+import time
+from datetime import UTC, datetime
+from uuid import UUID
+
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
+from sqlalchemy import func, select, tuple_
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from common.models.memory import Memory
+from core_api.auth import AuthContext, get_auth_context
+from core_api.constants import DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT
+from core_api.db.session import get_db
+from core_api.middleware.idempotency import (
+    IDEMPOTENCY_HEADER,
+    idempotency_for,
+    idempotency_key_from_metadata,
+)
+from core_api.middleware.rate_limit import search_limit, write_bulk_limit, write_limit
+from core_api.pagination import decode_cursor, encode_cursor, paginated_order_by
+from core_api.schemas import (
+    BulkMemoryCreate,
+    BulkMemoryResponse,
+    IngestCommitRequest,
+    IngestRequest,
+    MemoryCreate,
+    MemoryOut,
+    MemoryUpdate,
+    PaginatedMemoryResponse,
+    RedistributeRequest,
+    RedistributeResponse,
+    SearchRequest,
+    SearchResponse,
+    STMWriteResponse,
+    UsageSummary,
+)
+from core_api.services.agent_service import (
+    enforce_delete,
+    enforce_fleet_read,
+    enforce_fleet_write,
+    get_or_create_agent,
+    lookup_agent,
+)
+from core_api.services.audit_service import log_action
+from core_api.services.memory_service import (
+    _memory_to_out,
+    create_memories_bulk,
+    create_memory,
+    search_memories,
+    soft_delete_memory,
+    update_memory,
+)
+from core_api.services.usage_service import bulk_check_and_increment, check_and_increment
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["Memory"])
+
+
+@router.get("/tenants")
+async def list_tenants(
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return distinct tenant IDs that have memories."""
+    auth.enforce_admin()
+    result = await db.execute(select(Memory.tenant_id).where(Memory.deleted_at.is_(None)).distinct())
+    return sorted([row[0] for row in result.all()])
+
+
+@router.get("/fleets")
+async def list_fleets(
+    tenant_id: str | None = Query(default=None),
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return distinct fleet_ids with memory counts."""
+    if tenant_id:
+        auth.enforce_tenant(tenant_id)
+    elif not auth.is_admin:
+        # Non-admin must specify a tenant_id
+        if not auth.tenant_id:
+            raise HTTPException(status_code=400, detail="tenant_id is required")
+        tenant_id = auth.tenant_id
+    filters = [Memory.deleted_at.is_(None), Memory.fleet_id.isnot(None)]
+    if tenant_id:
+        filters.append(Memory.tenant_id == tenant_id)
+    rows = (
+        await db.execute(
+            select(
+                Memory.fleet_id,
+                func.count(),
+                func.count(func.distinct(Memory.agent_id)),
+            )
+            .where(*filters)
+            .group_by(Memory.fleet_id)
+            .order_by(func.count().desc())
+        )
+    ).all()
+    return [{"fleet_id": r[0], "memory_count": r[1], "agent_count": r[2]} for r in rows]
+
+
+@router.get("/memories", response_model=PaginatedMemoryResponse)
+async def list_memories(
+    tenant_id: str | None = Query(default=None),
+    fleet_id: str | None = Query(default=None),
+    agent_id: str | None = Query(default=None),
+    memory_type: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    visibility: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+    sort: str = Query(
+        default="created_at",
+        pattern=r"^(created_at|weight|memory_type|agent_id|status|recall_count|fleet_id|tenant_id|expires_at|deleted_at)$",
+    ),
+    order: str = Query(default="desc", pattern=r"^(asc|desc)$"),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=DEFAULT_LIST_LIMIT, ge=1, le=MAX_LIST_LIMIT),
+    include_deleted: bool = Query(default=False),
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """List memories with filtering, sorting, and pagination.
+
+    **Visibility scoping:** When ``agent_id`` is provided, the caller can see
+    their own ``scope_agent`` memories plus all ``scope_team``/``scope_org``
+    memories. When ``agent_id`` is omitted, ``scope_agent`` memories are hidden
+    (safe default). This means memory types like ``insight`` that are typically
+    created with agent-scoped visibility will only appear when ``agent_id`` is
+    passed.
+
+    **Pagination:** Both cursor-based and offset-based pagination are supported.
+    Cursor pagination (via ``cursor``) is recommended for large datasets and only
+    works with ``sort=created_at&order=desc``. Offset pagination works with any
+    sort order.
+    """
+    if tenant_id:
+        auth.enforce_tenant(tenant_id)
+    elif not auth.is_admin:
+        if not auth.tenant_id:
+            raise HTTPException(status_code=400, detail="tenant_id is required")
+        tenant_id = auth.tenant_id
+    if auth.tenant_id and tenant_id and agent_id and fleet_id:
+        await enforce_fleet_read(db, tenant_id, agent_id, fleet_id)
+
+    # Cursor-based pagination (only applies to created_at descending sort)
+    if cursor and (sort != "created_at" or order != "desc"):
+        raise HTTPException(
+            status_code=400,
+            detail="Cursor pagination is only supported with sort=created_at and order=desc",
+        )
+    c_ts = c_id = None
+    if cursor:
+        try:
+            c_ts, c_id = decode_cursor(cursor)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid cursor")
+
+    from core_api.repositories import memory_repo as _repo
+
+    # `agent_id` in the REST route is both the author filter AND the
+    # visibility-scoping identity. When present, the caller can see their
+    # own scope_agent memories. When absent, scope_agent memories are
+    # hidden (safe default — fixes the scope_agent visibility gap).
+    rows = await _repo.list_by_filters(
+        db,
+        tenant_id=tenant_id or "",
+        caller_agent_id=agent_id,  # visibility scoping
+        fleet_id=fleet_id,
+        written_by=agent_id,  # author filter (same param)
+        memory_type=memory_type,
+        status=status,
+        include_deleted=include_deleted,
+        sort=sort,
+        order=order,
+        limit=limit,
+        offset=offset,
+        cursor_ts=c_ts,
+        cursor_id=c_id,
+    )
+
+    has_more = len(rows) > limit
+    items = [_memory_to_out(m) for m in rows[:limit]]
+
+    next_cursor = None
+    if has_more and items:
+        last = rows[limit - 1]
+        next_cursor = encode_cursor(last.created_at, last.id)
+
+    return PaginatedMemoryResponse(items=items, next_cursor=next_cursor)
+
+
+@router.get("/memories/stats")
+async def memory_stats(
+    tenant_id: str | None = Query(default=None),
+    fleet_id: str | None = Query(default=None),
+    agent_id: str | None = Query(default=None),
+    memory_type: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    if tenant_id:
+        auth.enforce_tenant(tenant_id)
+    elif not auth.is_admin:
+        if not auth.tenant_id:
+            raise HTTPException(status_code=400, detail="tenant_id is required")
+        tenant_id = auth.tenant_id
+    filters = [Memory.deleted_at.is_(None)]
+    if tenant_id:
+        filters.append(Memory.tenant_id == tenant_id)
+    if fleet_id:
+        filters.append(Memory.fleet_id == fleet_id)
+    if agent_id:
+        filters.append(Memory.agent_id == agent_id)
+    if memory_type:
+        filters.append(Memory.memory_type == memory_type)
+    if status:
+        filters.append(Memory.status == status)
+    base = select(Memory).where(*filters)
+
+    total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar()
+    by_type = dict(
+        (
+            await db.execute(
+                select(Memory.memory_type, func.count()).where(*filters).group_by(Memory.memory_type)
+            )
+        ).all()
+    )
+    by_agent = dict(
+        (
+            await db.execute(select(Memory.agent_id, func.count()).where(*filters).group_by(Memory.agent_id))
+        ).all()
+    )
+    by_status = dict(
+        (await db.execute(select(Memory.status, func.count()).where(*filters).group_by(Memory.status))).all()
+    )
+    return {
+        "total": total,
+        "by_type": by_type,
+        "by_agent": by_agent,
+        "by_status": by_status,
+    }
+
+
+@router.delete("/memories", status_code=204)
+async def delete_all_memories(
+    tenant_id: str = Query(...),
+    fleet_id: str | None = Query(default=None),
+    agent_id: str | None = Query(default=None),
+    memory_type: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+    body: dict | None = Body(default=None),
+):
+    """Soft-delete all matching memories for a tenant."""
+    auth.enforce_read_only()
+    auth.enforce_tenant(tenant_id)
+    from sqlalchemy import update
+
+    stmt = update(Memory).where(Memory.tenant_id == tenant_id, Memory.deleted_at.is_(None))
+    if fleet_id:
+        stmt = stmt.where(Memory.fleet_id == fleet_id)
+    if agent_id:
+        stmt = stmt.where(Memory.agent_id == agent_id)
+    if memory_type:
+        stmt = stmt.where(Memory.memory_type == memory_type)
+    if status:
+        stmt = stmt.where(Memory.status == status)
+    exclude_ids = (body or {}).get("exclude_ids", [])
+    if exclude_ids:
+        stmt = stmt.where(Memory.id.notin_([UUID(i) for i in exclude_ids]))
+    stmt = stmt.values(deleted_at=datetime.now(UTC), status="deleted")
+    result = await db.execute(stmt)
+    deleted_count = result.rowcount
+    await log_action(
+        db,
+        tenant_id=tenant_id,
+        action="bulk_delete",
+        resource_type="memory",
+        detail={
+            "count": deleted_count,
+            "fleet_id": fleet_id,
+            "agent_id": agent_id,
+            "memory_type": memory_type,
+            "status_filter": status,
+        },
+    )
+    await db.commit()
+
+
+@router.post("/memories/bulk-delete")
+async def bulk_delete_by_ids(
+    body: dict = Body(...),
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """Soft-delete memories by a list of IDs."""
+    from sqlalchemy import update
+
+    tenant_id = body.get("tenant_id")
+    ids = body.get("ids", [])
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="tenant_id required")
+    auth.enforce_read_only()
+    auth.enforce_tenant(tenant_id)
+    if not ids or len(ids) > 1000:
+        raise HTTPException(status_code=400, detail="ids must be 1-1000 items")
+
+    stmt = (
+        update(Memory)
+        .where(
+            Memory.tenant_id == tenant_id,
+            Memory.id.in_([UUID(i) for i in ids]),
+            Memory.deleted_at.is_(None),
+        )
+        .values(deleted_at=datetime.now(UTC), status="deleted")
+    )
+    result = await db.execute(stmt)
+    await log_action(
+        db,
+        tenant_id=tenant_id,
+        action="bulk_delete",
+        resource_type="memory",
+        detail={"count": result.rowcount, "method": "by_ids"},
+    )
+    await db.commit()
+    return {"deleted": result.rowcount}
+
+
+@router.get("/memories/{memory_id}")
+async def get_memory(
+    memory_id: UUID,
+    tenant_id: str = Query(...),
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get a single memory with full details including embedding and entity links."""
+    from fastapi.responses import JSONResponse
+
+    from common.models.entity import Entity, MemoryEntityLink
+
+    auth.enforce_tenant(tenant_id)
+
+    t_start = time.perf_counter()
+    hit = False
+    error = False
+    try:
+        memory = await db.get(Memory, memory_id)
+        if not memory or memory.tenant_id != tenant_id or memory.deleted_at is not None:
+            raise HTTPException(status_code=404, detail="Memory not found")
+
+        # Get entity links with entity details
+        entity_links = []
+        try:
+            links_result = await db.execute(
+                select(MemoryEntityLink, Entity)
+                .outerjoin(Entity, MemoryEntityLink.entity_id == Entity.id)
+                .where(MemoryEntityLink.memory_id == memory_id)
+            )
+            for row in links_result.all():
+                link, entity = row
+                entry = {"entity_id": str(link.entity_id), "role": link.role}
+                if entity:
+                    entry["entity_type"] = entity.entity_type
+                    entry["canonical_name"] = entity.canonical_name
+                    entry["attributes"] = entity.attributes
+                entity_links.append(entry)
+        except (SQLAlchemyError, ValueError) as e:
+            logger.warning("Failed to fetch entity links for memory %s: %s", memory_id, e)
+
+        # Embedding stats
+        embedding_preview = None
+        embedding_stats = None
+        try:
+            if memory.embedding is not None:
+                vec = [float(v) for v in memory.embedding]
+                embedding_preview = vec[:20]
+                embedding_stats = {
+                    "dimensions": len(vec),
+                    "min": round(min(vec), 6),
+                    "max": round(max(vec), 6),
+                    "mean": round(sum(vec) / len(vec), 6),
+                    "non_zero": sum(1 for v in vec if abs(v) > 1e-8),
+                }
+        except (ValueError, TypeError) as e:
+            logger.warning("Failed to compute embedding stats for memory %s: %s", memory_id, e)
+
+        hit = True
+    except HTTPException:
+        # 404 (and any other HTTPException) is an expected outcome — not an
+        # observability-level error. `hit=False` already signals the miss.
+        raise
+    except Exception:
+        error = True
+        raise
+    finally:
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "memory-get request completed",
+                extra={
+                    "path": "memory-get",
+                    "tenant_id": tenant_id,
+                    "total_ms": (time.perf_counter() - t_start) * 1000,
+                    "hit": hit,
+                    "error": error,
+                },
+            )
+
+    return JSONResponse(
+        {
+            "id": str(memory.id),
+            "tenant_id": memory.tenant_id,
+            "fleet_id": memory.fleet_id,
+            "agent_id": memory.agent_id,
+            "memory_type": memory.memory_type,
+            "title": memory.title,
+            "content": memory.content,
+            "weight": float(memory.weight),
+            "source_uri": memory.source_uri,
+            "run_id": memory.run_id,
+            "metadata": memory.metadata_,
+            "content_hash": memory.content_hash,
+            "created_at": memory.created_at.isoformat() if memory.created_at else None,
+            "expires_at": memory.expires_at.isoformat() if memory.expires_at else None,
+            "deleted_at": memory.deleted_at.isoformat() if memory.deleted_at else None,
+            "subject_entity_id": str(memory.subject_entity_id) if memory.subject_entity_id else None,
+            "predicate": memory.predicate,
+            "object_value": memory.object_value,
+            "ts_valid_start": memory.ts_valid_start.isoformat() if memory.ts_valid_start else None,
+            "ts_valid_end": memory.ts_valid_end.isoformat() if memory.ts_valid_end else None,
+            "status": memory.status,
+            "recall_count": memory.recall_count,
+            "last_recalled_at": memory.last_recalled_at.isoformat() if memory.last_recalled_at else None,
+            "supersedes_id": str(memory.supersedes_id) if memory.supersedes_id else None,
+            "entity_links": entity_links,
+            "embedding_preview": embedding_preview,
+            "embedding_stats": embedding_stats,
+        }
+    )
+
+
+@router.get("/memories/{memory_id}/contradictions")
+async def get_contradictions(
+    memory_id: UUID,
+    tenant_id: str = Query(...),
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return memories that this memory superseded (marked outdated/conflicted)."""
+    auth.enforce_tenant(tenant_id)
+
+    memory = await db.get(Memory, memory_id)
+    if not memory or memory.tenant_id != tenant_id or memory.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Memory not found")
+
+    # Find memories whose supersedes_id points to this memory
+    stmt = (
+        select(Memory)
+        .where(
+            Memory.supersedes_id == memory_id,
+            Memory.tenant_id == tenant_id,
+            Memory.deleted_at.is_(None),
+        )
+        .order_by(Memory.created_at.desc())
+    )
+    result = await db.execute(stmt)
+    superseded = result.scalars().all()
+
+    # Also check if this memory itself was superseded by another
+    superseded_by = None
+    if memory.supersedes_id:
+        newer = await db.get(Memory, memory.supersedes_id)
+        if newer and newer.deleted_at is None:
+            superseded_by = {
+                "id": str(newer.id),
+                "content_preview": newer.content[:200],
+                "status": newer.status,
+                "created_at": newer.created_at.isoformat() if newer.created_at else None,
+            }
+
+    return {
+        "memory_id": str(memory_id),
+        "status": memory.status,
+        "superseded_by": superseded_by,
+        "superseded_memories": [
+            {
+                "id": str(m.id),
+                "content_preview": m.content[:200],
+                "status": m.status,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
+            for m in superseded
+        ],
+    }
+
+
+@router.post("/memories", response_model=MemoryOut, status_code=201)
+@write_limit
+async def write_memory(
+    request: Request,
+    body: MemoryCreate,
+    response: Response,
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+    idempotency_key: str | None = Header(None, alias=IDEMPOTENCY_HEADER),
+):
+    auth.enforce_read_only()
+    auth.enforce_usage_limits()
+    auth.enforce_tenant(body.tenant_id)
+    from core_api.services.tenant_settings import resolve_config
+
+    write_config = await resolve_config(db, body.tenant_id)
+    agent = await get_or_create_agent(
+        db,
+        body.tenant_id,
+        body.agent_id,
+        body.fleet_id,
+        require_approval=write_config.require_agent_approval,
+    )
+    if agent.get("trust_level", 0) == 0:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Agent '{body.agent_id}' is not approved. Contact tenant admin to set trust_level >= 1.",
+        )
+    # Resolve fleet_id from agent's home fleet if not provided
+    if not body.fleet_id and agent.get("fleet_id"):
+        body.fleet_id = agent["fleet_id"]
+    usage = None
+    if auth.tenant_id:  # skip enforcement + metering for admin
+        await enforce_fleet_write(db, body.tenant_id, body.agent_id, body.fleet_id)
+        usage = await check_and_increment(db, body.tenant_id, "write")
+    if usage:
+        response.headers["X-RateLimit-Limit"] = str(usage.get("limit", "unlimited"))
+        response.headers["X-RateLimit-Remaining"] = str(usage.get("remaining", "unlimited"))
+    # Idempotency check sits AFTER the usage/headers block so a replay
+    # carries the same X-RateLimit-* headers the live path sets via
+    # `response`. Pass them explicitly to JSONResponse because FastAPI
+    # only merges the injected `response` into returned models, not into
+    # directly-returned Response objects.
+    #
+    # Header takes precedence; ``body.metadata.idempotency_key`` (or the
+    # legacy ``client_idempotency_key`` alias) is a body-fallback for
+    # clients that can't easily set per-request headers.
+    # ``idempotency_for`` handles transport-prefixing (``header:`` /
+    # ``body:``) and length validation internally, so each transport
+    # gets a disjoint cache namespace and the limit applies to the raw
+    # user-supplied value regardless of which transport it arrived on.
+    if idempotency_key:
+        _idem = await idempotency_for(request, body.tenant_id, idempotency_key, source="header")
+    else:
+        _idem = await idempotency_for(
+            request,
+            body.tenant_id,
+            idempotency_key_from_metadata(body.metadata),
+            source="body",
+        )
+    if _idem and (_replay := _idem.cached_replay):
+        _body, _status = _replay
+        return JSONResponse(content=_body, status_code=_status, headers=dict(response.headers))
+    result = await create_memory(db, body)
+    # STM writes return STMWriteResponse (different shape from MemoryOut)
+    if isinstance(result, STMWriteResponse):
+        stm_body = result.model_dump(mode="json")
+        if _idem:
+            await _idem.record(stm_body, 201)
+        return JSONResponse(content=stm_body, status_code=201)
+    if usage:
+        result.usage = UsageSummary(
+            writes_remaining=usage.get("remaining"),
+            memories_limit=usage.get("limit"),
+        )
+    # Cache AFTER attaching usage so replays return a structurally
+    # identical response. The usage snapshot is stale in the replay
+    # (bounded by idempotency_ttl_seconds, default 24h) — callers who
+    # need live quota should consult a fresh endpoint, not a replay.
+    if _idem:
+        await _idem.record(result.model_dump(mode="json"), 201)
+    return result
+
+
+@router.post("/memories/bulk", response_model=BulkMemoryResponse, status_code=200)
+@write_bulk_limit
+async def write_memories_bulk(
+    request: Request,
+    body: BulkMemoryCreate,
+    response: Response,
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+    idempotency_key: str | None = Header(None, alias=IDEMPOTENCY_HEADER),
+):
+    """Write up to 100 memories in a single request.
+
+    Batches embeddings and enrichment for throughput. Returns per-item
+    results (created/duplicate/error).
+    """
+    auth.enforce_read_only()
+    auth.enforce_usage_limits()
+    auth.enforce_tenant(body.tenant_id)
+    agent = await get_or_create_agent(db, body.tenant_id, body.agent_id, body.fleet_id)
+    if not body.fleet_id and agent.get("fleet_id"):
+        body.fleet_id = agent["fleet_id"]
+    usage = None
+    if auth.tenant_id:  # skip enforcement + metering for admin
+        await enforce_fleet_write(db, body.tenant_id, body.agent_id, body.fleet_id)
+        usage = await bulk_check_and_increment(db, body.tenant_id, len(body.items))
+    if usage:
+        response.headers["X-RateLimit-Limit"] = str(usage.get("limit", "unlimited"))
+        response.headers["X-RateLimit-Remaining"] = str(usage.get("remaining", "unlimited"))
+    # Idempotency check sits AFTER the usage/headers block so a replay
+    # carries the same X-RateLimit-* headers the live path sets. Pass
+    # them explicitly to JSONResponse because FastAPI only merges the
+    # injected `response` into returned models, not into directly-
+    # returned Response objects.
+    _idem = await idempotency_for(request, body.tenant_id, idempotency_key)
+    if _idem and (_replay := _idem.cached_replay):
+        _body, _status = _replay
+        return JSONResponse(content=_body, status_code=_status, headers=dict(response.headers))
+    result = await create_memories_bulk(db, body)
+    if _idem:
+        await _idem.record(result.model_dump(mode="json"), 200)
+    return result
+
+
+@router.delete("/memories/{memory_id}", status_code=204)
+async def delete_memory(
+    memory_id: UUID,
+    tenant_id: str = Query(...),
+    agent_id: str | None = Query(default=None),
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    auth.enforce_read_only()
+    auth.enforce_tenant(tenant_id)
+    if auth.tenant_id and agent_id:
+        await enforce_delete(db, tenant_id, agent_id)
+    await soft_delete_memory(db, memory_id, tenant_id)
+    await log_action(
+        db,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        action="delete",
+        resource_type="memory",
+        resource_id=memory_id,
+    )
+    await db.commit()
+
+
+@router.patch("/memories/{memory_id}/status")
+async def update_memory_status(
+    memory_id: UUID,
+    body: dict,
+    tenant_id: str = Query(...),
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update memory status (e.g., active → confirmed)."""
+    auth.enforce_read_only()
+    auth.enforce_usage_limits()
+    auth.enforce_tenant(tenant_id)
+    from core_api.constants import MEMORY_STATUSES
+
+    status = body.get("status")
+    if status not in MEMORY_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status. Must be one of: {', '.join(MEMORY_STATUSES)}",
+        )
+    memory = await db.get(Memory, memory_id)
+    if not memory or memory.tenant_id != tenant_id or memory.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Memory not found")
+    old_status = memory.status
+    memory.status = status
+
+    await log_action(
+        db,
+        tenant_id=tenant_id,
+        agent_id=memory.agent_id,
+        action="status_update",
+        resource_type="memory",
+        resource_id=memory_id,
+        detail={"old_status": old_status, "new_status": status},
+    )
+    await db.commit()
+    return {"memory_id": str(memory_id), "old_status": old_status, "new_status": status}
+
+
+@router.patch("/memories/{memory_id}", response_model=MemoryOut)
+async def update_memory_endpoint(
+    memory_id: UUID,
+    body: MemoryUpdate,
+    tenant_id: str = Query(...),
+    agent_id: str | None = Query(default=None),
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update a memory. Only provide fields you want to change.
+    If content changes, embedding and entity extraction are re-run automatically."""
+    auth.enforce_tenant(tenant_id)
+    if auth.tenant_id:  # skip usage metering for admin
+        await check_and_increment(db, tenant_id, "write")
+    return await update_memory(
+        db,
+        memory_id,
+        tenant_id,
+        body,
+        agent_id=agent_id if auth.tenant_id else None,
+    )
+
+
+@router.post("/search", response_model=SearchResponse)
+@search_limit
+async def search(
+    request: Request,
+    body: SearchRequest,
+    response: Response,
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    auth.enforce_tenant(body.tenant_id)
+    usage = None
+    _agent = None
+    if auth.tenant_id:  # skip for admin
+        if body.filter_agent_id:
+            fleet_id_hint = body.fleet_ids[0] if body.fleet_ids and len(body.fleet_ids) == 1 else None
+            _agent = await get_or_create_agent(db, body.tenant_id, body.filter_agent_id, fleet_id_hint)
+            if not body.fleet_ids and _agent.get("fleet_id") and _agent.get("trust_level", 0) < 2:
+                body.fleet_ids = [_agent["fleet_id"]]  # Force fleet scoping for trust < 2
+            if body.fleet_ids and len(body.fleet_ids) == 1:
+                await enforce_fleet_read(db, body.tenant_id, body.filter_agent_id, body.fleet_ids[0])
+        usage = await check_and_increment(db, body.tenant_id, "search")
+    if usage:
+        response.headers["X-RateLimit-Limit"] = str(usage.get("limit", "unlimited"))
+        response.headers["X-RateLimit-Remaining"] = str(usage.get("remaining", "unlimited"))
+    from core_api.services.tenant_settings import resolve_config
+
+    t_start = time.perf_counter()
+    success = True
+    results: list = []
+    try:
+        config = await resolve_config(db, body.tenant_id)
+        results = await search_memories(
+            db,
+            tenant_id=body.tenant_id,
+            query=body.query,
+            fleet_ids=body.fleet_ids,
+            filter_agent_id=body.filter_agent_id,
+            caller_agent_id=body.filter_agent_id,
+            memory_type_filter=body.memory_type_filter,
+            status_filter=body.status_filter,
+            valid_at=body.valid_at,
+            top_k=body.top_k,
+            recall_boost=config.recall_boost,
+            graph_expand=config.graph_expand,
+            tenant_config=config,
+            search_profile=_agent.get("search_profile") if _agent else None,
+        )
+    except HTTPException:
+        # Auth / tenant errors raised downstream are expected outcomes,
+        # not DB/network failures — don't flag them as ``error=True``.
+        raise
+    except Exception:
+        success = False
+        raise
+    finally:
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "search request completed",
+                extra={
+                    "path": "memory-search",
+                    "tenant_id": body.tenant_id,
+                    "top_k": body.top_k,
+                    "row_count": len(results),
+                    "total_ms": (time.perf_counter() - t_start) * 1000,
+                    "error": not success,
+                },
+            )
+    return SearchResponse(items=results)
+
+
+@router.post("/ingest/preview")
+async def ingest_preview_endpoint(
+    body: IngestRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """Extract facts from a URL or text for preview (no writes)."""
+    auth.enforce_read_only()
+    auth.enforce_usage_limits()
+    auth.enforce_tenant(body.tenant_id)
+    from core_api.services.ingest_service import ingest_preview
+
+    return await ingest_preview(db, body)
+
+
+@router.post("/ingest/commit")
+@write_limit
+async def ingest_commit_endpoint(
+    request: Request,
+    body: IngestCommitRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """Write previewed facts as memories."""
+    auth.enforce_read_only()
+    auth.enforce_usage_limits()
+    auth.enforce_tenant(body.tenant_id)
+    if auth.tenant_id:  # skip for admin
+        await check_and_increment(db, body.tenant_id, "write")
+    from core_api.services.ingest_service import ingest_commit
+
+    return await ingest_commit(db, body)
+
+
+@router.post("/recall")
+@search_limit
+async def recall_endpoint(
+    request: Request,
+    body: SearchRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """Search memories and return an LLM-synthesized context summary."""
+    auth.enforce_tenant(body.tenant_id)
+    if auth.tenant_id:
+        if body.filter_agent_id:
+            fleet_id_hint = body.fleet_ids[0] if body.fleet_ids and len(body.fleet_ids) == 1 else None
+            _agent = await get_or_create_agent(db, body.tenant_id, body.filter_agent_id, fleet_id_hint)
+            if not body.fleet_ids and _agent.get("fleet_id") and _agent.get("trust_level", 0) < 2:
+                body.fleet_ids = [_agent["fleet_id"]]
+            if body.fleet_ids and len(body.fleet_ids) == 1:
+                await enforce_fleet_read(db, body.tenant_id, body.filter_agent_id, body.fleet_ids[0])
+        await check_and_increment(db, body.tenant_id, "search")
+    from core_api.services.recall_service import recall
+
+    return await recall(
+        db,
+        tenant_id=body.tenant_id,
+        query=body.query,
+        fleet_ids=body.fleet_ids,
+        filter_agent_id=body.filter_agent_id,
+        memory_type_filter=body.memory_type_filter,
+        status_filter=body.status_filter,
+        top_k=body.top_k,
+        valid_at=body.valid_at,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Redistribute
+# ---------------------------------------------------------------------------
+
+
+@router.post("/memories/redistribute", response_model=RedistributeResponse)
+async def redistribute_memories(
+    body: RedistributeRequest,
+    tenant_id: str = Query(...),
+    agent_id: str = Query(..., description="Requesting agent (must be trust_level >= 3)"),
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """Bulk-reassign memories to a different agent.
+
+    Admin-only (trust_level >= 3).  Moves memories to ``target_agent_id``,
+    auto-promoting ``scope_agent`` → ``scope_team`` to prevent data loss.
+
+    Cross-fleet moves are intentionally allowed — a primary use case is
+    reassigning memories from a central orchestrator to domain specialists
+    that may reside in different fleets.  The admin trust-level requirement
+    (>= 3) is the authorization gate instead of fleet scoping.
+    """
+    t0 = time.perf_counter()
+
+    auth.enforce_read_only()
+    auth.enforce_usage_limits()
+    auth.enforce_tenant(tenant_id)
+
+    # Verify requesting agent is admin
+    caller = await lookup_agent(db, tenant_id, agent_id)
+    if caller is None or caller.get("trust_level", 0) < 3:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Agent '{agent_id}' requires trust_level >= 3 for redistribute.",
+        )
+
+    # Verify target agent exists and is not restricted
+    target = await lookup_agent(db, tenant_id, body.target_agent_id)
+    if target is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Target agent '{body.target_agent_id}' not found in tenant '{tenant_id}'.",
+        )
+    if target.get("trust_level", 0) < 1:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Target agent '{body.target_agent_id}' is restricted (trust_level=0). "
+            "Cannot assign memories to a restricted agent.",
+        )
+
+    # Usage quota
+    if auth.tenant_id:  # skip usage metering for admin tokens
+        await bulk_check_and_increment(db, tenant_id, len(body.memory_ids))
+
+    # Fetch matching memories (tenant-scoped, not deleted)
+    stmt = select(Memory).where(
+        Memory.id.in_(body.memory_ids),
+        Memory.tenant_id == tenant_id,
+        Memory.deleted_at.is_(None),
+    )
+    result = await db.execute(stmt)
+    memories = result.scalars().all()
+
+    # Track IDs not found (deleted, wrong tenant, or non-existent)
+    found_ids = {mem.id for mem in memories}
+    not_found = [str(mid) for mid in body.memory_ids if mid not in found_ids]
+
+    moved = 0
+    promoted = 0
+    skipped = 0
+    from_agents: set[str] = set()
+
+    for mem in memories:
+        if mem.agent_id == body.target_agent_id:
+            skipped += 1
+            continue
+
+        from_agents.add(mem.agent_id)
+        mem.agent_id = body.target_agent_id
+
+        # Auto-promote scope_agent to scope_team to prevent data loss
+        if mem.visibility == "scope_agent":
+            mem.visibility = "scope_team"
+            promoted += 1
+
+        moved += 1
+
+    # Audit log (same transaction as memory mutations — single atomic commit)
+    await log_action(
+        db,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        action="redistribute",
+        resource_type="memory",
+        detail={
+            "target_agent_id": body.target_agent_id,
+            "from_agents": sorted(from_agents),
+            "moved": moved,
+            "promoted": promoted,
+            "skipped": skipped,
+            "requested": len(body.memory_ids),
+        },
+    )
+    await db.commit()
+
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    return RedistributeResponse(
+        moved=moved,
+        promoted=promoted,
+        skipped=skipped,
+        errors=not_found,
+        redistribute_ms=elapsed_ms,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Admin global-view endpoints (requires enforce_admin)
+# ---------------------------------------------------------------------------
+
+admin_memories_router = APIRouter(tags=["Admin"])
+
+
+@admin_memories_router.get("/admin/tenants")
+async def admin_list_tenants(
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin: list all tenant IDs that have memories."""
+    auth.enforce_admin()
+    result = await db.execute(select(Memory.tenant_id).where(Memory.deleted_at.is_(None)).distinct())
+    return sorted([row[0] for row in result.all()])
+
+
+@admin_memories_router.get("/admin/fleets")
+async def admin_list_fleets(
+    tenant_id: str | None = Query(default=None),
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin: list distinct fleet_ids with memory counts."""
+    auth.enforce_admin()
+    filters = [Memory.deleted_at.is_(None), Memory.fleet_id.isnot(None)]
+    if tenant_id:
+        filters.append(Memory.tenant_id == tenant_id)
+    rows = (
+        await db.execute(
+            select(
+                Memory.fleet_id,
+                func.count(),
+                func.count(func.distinct(Memory.agent_id)),
+            )
+            .where(*filters)
+            .group_by(Memory.fleet_id)
+            .order_by(func.count().desc())
+        )
+    ).all()
+    return [{"fleet_id": r[0], "memory_count": r[1], "agent_count": r[2]} for r in rows]
+
+
+@admin_memories_router.get("/admin/memories", response_model=PaginatedMemoryResponse)
+async def admin_list_memories(
+    tenant_id: str | None = Query(default=None),
+    fleet_id: str | None = Query(default=None),
+    agent_id: str | None = Query(default=None),
+    memory_type: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+    sort: str = Query(
+        default="created_at",
+        pattern=r"^(created_at|weight|memory_type|agent_id|status|recall_count|fleet_id|tenant_id|expires_at|deleted_at)$",
+    ),
+    order: str = Query(default="desc", pattern=r"^(asc|desc)$"),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=DEFAULT_LIST_LIMIT, ge=1, le=MAX_LIST_LIMIT),
+    include_deleted: bool = Query(default=False),
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin: list memories across all tenants with full pagination."""
+    auth.enforce_admin()
+    stmt = select(Memory)
+    if tenant_id:
+        stmt = stmt.where(Memory.tenant_id == tenant_id)
+    if fleet_id:
+        stmt = stmt.where(Memory.fleet_id == fleet_id)
+    if not include_deleted:
+        stmt = stmt.where(Memory.deleted_at.is_(None))
+    if agent_id:
+        stmt = stmt.where(Memory.agent_id == agent_id)
+    if memory_type:
+        stmt = stmt.where(Memory.memory_type == memory_type)
+    if status:
+        stmt = stmt.where(Memory.status == status)
+
+    if cursor and (sort != "created_at" or order != "desc"):
+        raise HTTPException(
+            status_code=400,
+            detail="Cursor pagination is only supported with sort=created_at and order=desc",
+        )
+    if cursor:
+        try:
+            cursor_ts, cursor_id = decode_cursor(cursor)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid cursor")
+        stmt = stmt.where(tuple_(Memory.created_at, Memory.id) < tuple_(cursor_ts, cursor_id))
+
+    col = getattr(Memory, sort)
+    stmt = stmt.order_by(*paginated_order_by(col, Memory.id, order))
+    if not cursor:
+        stmt = stmt.offset(offset)
+    stmt = stmt.limit(limit + 1)
+
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+
+    has_more = len(rows) > limit
+    items = [_memory_to_out(m) for m in rows[:limit]]
+
+    next_cursor = None
+    if has_more and items:
+        last = rows[limit - 1]
+        next_cursor = encode_cursor(last.created_at, last.id)
+
+    return PaginatedMemoryResponse(items=items, next_cursor=next_cursor)
+
+
+@admin_memories_router.get("/admin/memories/stats")
+async def admin_memory_stats(
+    tenant_id: str | None = Query(default=None),
+    fleet_id: str | None = Query(default=None),
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin: memory stats across all tenants (or filtered by tenant_id)."""
+    auth.enforce_admin()
+    filters = [Memory.deleted_at.is_(None)]
+    if tenant_id:
+        filters.append(Memory.tenant_id == tenant_id)
+    if fleet_id:
+        filters.append(Memory.fleet_id == fleet_id)
+    base = select(Memory).where(*filters)
+
+    total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar()
+    by_type = dict(
+        (
+            await db.execute(
+                select(Memory.memory_type, func.count()).where(*filters).group_by(Memory.memory_type)
+            )
+        ).all()
+    )
+    by_agent = dict(
+        (
+            await db.execute(select(Memory.agent_id, func.count()).where(*filters).group_by(Memory.agent_id))
+        ).all()
+    )
+    by_status = dict(
+        (await db.execute(select(Memory.status, func.count()).where(*filters).group_by(Memory.status))).all()
+    )
+    return {
+        "total": total,
+        "by_type": by_type,
+        "by_agent": by_agent,
+        "by_status": by_status,
+    }

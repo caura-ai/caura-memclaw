@@ -1,0 +1,110 @@
+"""Shared helpers for unit-testing MCP tool handlers in isolation.
+
+The handlers in ``core_api.mcp_server`` depend on:
+  - ``_check_auth()`` — returns ``None`` on pass
+  - ``_get_tenant()`` — returns the current tenant_id
+  - ``_mcp_session()`` — async context manager yielding a SQLAlchemy session
+  - service-layer calls (e.g., ``create_memory``, ``search_memories``)
+
+These helpers patch those out so tests can exercise validation, op
+dispatch, error-envelope construction, and trust gating without a DB.
+"""
+from __future__ import annotations
+
+import contextlib
+import json
+import re
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+
+_LATENCY_SUFFIX_RE = re.compile(r"\n\n_latency_ms:\s*\d+\s*$")
+
+
+def strip_latency(result: str) -> str:
+    """Drop the ``_latency_ms`` trailer from a non-JSON handler response."""
+    return _LATENCY_SUFFIX_RE.sub("", result)
+
+
+def parse_envelope(result: str) -> dict[str, Any]:
+    """Parse a JSON response (error envelope or payload) from a handler.
+
+    Handlers that wrap JSON get a top-level ``_latency_ms`` key merged in;
+    we strip it so tests can assert on the semantic payload.
+    """
+    data = json.loads(result)
+    if isinstance(data, dict):
+        data.pop("_latency_ms", None)
+    return data
+
+
+@pytest.fixture
+def mcp_env(monkeypatch):
+    """Patch the common MCP handler dependencies and yield a control dict.
+
+    Usage::
+
+        async def test_something(mcp_env):
+            mcp_env["service"]("create_memory").return_value = ...
+            out = await mcp_server.memclaw_write(content="hello", ...)
+            assert ...
+
+    The control object exposes:
+      - ``service(name)`` → AsyncMock you can configure per-service-call.
+        Looked up as ``core_api.services.{module}.{name}`` by matching one
+        of the known import paths used by handlers.
+      - ``db`` → the MagicMock stand-in for the DB session.
+      - ``tenant`` → the fake tenant_id (override before patching if needed).
+    """
+    from core_api import mcp_server
+
+    tenant = "test-tenant"
+    db = MagicMock(name="db")
+
+    # Make db.commit/execute awaitable (they're called via `await`).
+    db.commit = AsyncMock()
+    db.execute = AsyncMock()
+
+    @contextlib.asynccontextmanager
+    async def fake_session():
+        yield db
+
+    monkeypatch.setattr(mcp_server, "_check_auth", lambda: None)
+    monkeypatch.setattr(mcp_server, "_get_tenant", lambda: tenant)
+    monkeypatch.setattr(mcp_server, "_mcp_session", fake_session)
+
+    # Stub out usage metering so it doesn't hit the DB.
+    monkeypatch.setattr(mcp_server, "check_and_increment", AsyncMock(return_value=None))
+
+    # `_require_trust` is exercised directly in tests that need it; here we
+    # pre-emptively bypass it so handlers under test don't fail on agent lookup.
+    async def _always_allow(db, tenant_id, agent_id, min_level):
+        return 3, False, None  # max trust, not_found=False, no error
+
+    monkeypatch.setattr(mcp_server, "_require_trust", _always_allow)
+
+    service_mocks: dict[str, AsyncMock] = {}
+
+    def service(name: str) -> AsyncMock:
+        """Get or create a per-service-call AsyncMock.
+
+        Handlers reference service functions either via module-level import
+        or via inner ``from … import`` — we overwrite the mcp_server-level
+        attribute where one exists, and register a name→mock lookup that
+        tests can seed.
+        """
+        if name not in service_mocks:
+            service_mocks[name] = AsyncMock(name=name)
+        if hasattr(mcp_server, name):
+            monkeypatch.setattr(mcp_server, name, service_mocks[name])
+        return service_mocks[name]
+
+    yield {
+        "service": service,
+        "db": db,
+        "tenant": tenant,
+        "monkeypatch": monkeypatch,
+        "service_mocks": service_mocks,
+    }

@@ -1,0 +1,35 @@
+name: release-please
+
+# Conventional-Commits-driven release automation. On every push to main,
+# release-please scans new commits and either opens/updates a release
+# PR (when there are user-visible changes) or no-ops. Merging the
+# release PR cuts a GitHub Release, tags the version, and updates
+# CHANGELOG.md + every version-pinned file listed in
+# release-please-config.json.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
+        id: release
+        with:
+          # GITHUB_TOKEN is sufficient for opening release PRs and
+          # cutting GitHub Releases. Note: tags created via this token
+          # do NOT trigger downstream `on: release` or `on: push: tags`
+          # workflows (GitHub's loop prevention). When/if we add an
+          # auto-publish-to-npm or auto-publish-to-PyPI flow that must
+          # fire on release, swap this for a PAT or App token stored
+          # as secrets.RELEASE_PLEASE_TOKEN.
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

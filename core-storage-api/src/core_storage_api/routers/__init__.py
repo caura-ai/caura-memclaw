@@ -1,0 +1,23 @@
+from core_storage_api.routers.agents import router as agents_router
+from core_storage_api.routers.audit import router as audit_router
+from core_storage_api.routers.documents import router as documents_router
+from core_storage_api.routers.entities import router as entities_router
+from core_storage_api.routers.fleet import router as fleet_router
+from core_storage_api.routers.health import router as health_router
+from core_storage_api.routers.idempotency import router as idempotency_router
+from core_storage_api.routers.memories import router as memories_router
+from core_storage_api.routers.reports import router as reports_router
+from core_storage_api.routers.tasks import router as tasks_router
+
+__all__ = [
+    "agents_router",
+    "audit_router",
+    "documents_router",
+    "entities_router",
+    "fleet_router",
+    "health_router",
+    "idempotency_router",
+    "memories_router",
+    "reports_router",
+    "tasks_router",
+]
