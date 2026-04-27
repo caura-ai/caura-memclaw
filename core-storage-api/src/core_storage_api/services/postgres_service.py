@@ -353,7 +353,7 @@ class PostgresService:
                 memory.deleted_at = datetime.now(UTC)
                 memory.status = "deleted"
 
-    async def memory_update(self, memory_id: UUID, patch: dict) -> None:
+    async def memory_update(self, memory_id: UUID, patch: dict) -> bool:
         """Apply arbitrary field updates to a memory.
 
         Two patch shapes are supported in the same request:
@@ -369,9 +369,17 @@ class PostgresService:
 
         Other top-level keys whose names don't match a ``Memory`` column
         are silently dropped — callers validate upstream.
+
+        Returns ``True`` when the row exists and is live (the patch was
+        applied or was a no-op due to all-unknown keys); ``False`` when
+        the row is absent or soft-deleted, which the route turns into
+        404. Both UPDATE branches run inside a single
+        ``SELECT ... FOR UPDATE`` snapshot so a concurrent
+        ``memory_soft_delete`` can't commit between them and leave the
+        row in a torn state (status updated, metadata not, or vice
+        versa) — the bare per-statement ``deleted_at IS NULL`` guard
+        wasn't enough on its own under READ COMMITTED.
         """
-        if not patch:
-            return
         metadata_patch = patch.get("metadata_patch") if isinstance(patch, dict) else None
         # Map JSON keys to model columns. ``metadata_patch`` is handled
         # via a separate JSONB-merge statement below; skip it here so it
@@ -379,15 +387,54 @@ class PostgresService:
         values: dict = {
             key: val for key, val in patch.items() if key != "metadata_patch" and hasattr(Memory, key)
         }
-        # Early-return when the caller's patch contained only unknown
-        # keys — opening a session burns a connection-pool slot for no
-        # work. The pre-CAURA-595 shape gated the session on ``if
-        # values:`` for the same reason.
-        if not values and not metadata_patch:
-            return
         async with get_session() as session:
+            # Existence check FIRST — runs even on empty / all-unknown-
+            # keys patches so a PATCH on an absent or soft-deleted row
+            # consistently returns 404 regardless of body shape. Pre-
+            # this-change the no-op paths (empty body, all-unknown
+            # keys) short-circuited with ``return True`` and the route
+            # answered 200, so a deleted row could absorb a "successful"
+            # no-op PATCH that depended only on whether the body
+            # carried recognised columns.
+            #
+            # ``SELECT ... FOR UPDATE`` locks the row so the two UPDATE
+            # branches below run inside one snapshot: a concurrent soft
+            # DELETE blocks until this transaction commits or rolls
+            # back, eliminating the column-set-but-not-metadata torn
+            # state under READ COMMITTED.
+            #
+            # ``id, deleted_at`` come back as a tuple so "row absent"
+            # (None tuple) and "row exists, deleted_at IS NULL" (live)
+            # are distinguishable — ``scalar_one_or_none`` on
+            # ``deleted_at`` alone would collapse both into None.
+            row = (
+                await session.execute(
+                    select(Memory.id, Memory.deleted_at).where(Memory.id == memory_id).with_for_update()
+                )
+            ).first()
+            if row is None:
+                return False  # row truly absent — caller → 404
+            if row.deleted_at is not None:
+                return False  # soft-deleted — caller → 404, no UPDATE runs
+
+            # No-op patches on a live row are valid: existence check
+            # already passed, so report success without burning UPDATEs.
+            # Worth the SELECT roundtrip cost (rate-limited PATCH route
+            # bounds it) for the consistent 404-on-absent contract.
+            if not patch or (not values and not metadata_patch):
+                return True
+
+            # ``deleted_at IS NULL`` predicate stays on each UPDATE
+            # even though the FOR UPDATE lock above already gates this
+            # path; it's belt-and-suspenders against a future change
+            # that splits the lock and the UPDATEs into separate
+            # sessions.
             if values:
-                await session.execute(sql_update(Memory).where(Memory.id == memory_id).values(**values))
+                await session.execute(
+                    sql_update(Memory)
+                    .where(Memory.id == memory_id, Memory.deleted_at.is_(None))
+                    .values(**values)
+                )
             if metadata_patch:
                 # Single-statement JSONB merge — concurrent merges are
                 # last-writer-wins per key but never corrupt the doc.
@@ -406,13 +453,18 @@ class PostgresService:
                 # The cast is a no-op when the column is already
                 # ``jsonb`` and a one-time conversion when it isn't —
                 # cheap either way relative to the network round-trip.
+                #
+                # ``deleted_at IS NULL`` guard mirrors the column-set
+                # branch above so a PATCH never resurrects a deleted
+                # row via the metadata-merge path either.
                 await session.execute(
                     text(
                         "UPDATE memories "
                         "SET metadata = COALESCE(metadata::jsonb, '{}'::jsonb) || (:patch)::jsonb "
-                        "WHERE id = :id"
+                        "WHERE id = :id AND deleted_at IS NULL"
                     ).bindparams(patch=json.dumps(metadata_patch), id=memory_id),
                 )
+        return True
 
     async def memory_update_status(self, memory_id: UUID, status: str) -> None:
         async with get_session() as session:
@@ -2185,38 +2237,85 @@ class PostgresService:
     async def agent_add(self, data: dict) -> Agent:
         """Create new agent — handle race with concurrent registrations.
 
-        The uq_agents_tenant_agent unique index rejects duplicates at
-        INSERT time; on conflict we re-SELECT and merge updates.
+        Uses ``INSERT ... ON CONFLICT (tenant_id, agent_id) DO NOTHING
+        RETURNING ...`` paired with a same-session re-SELECT for the
+        conflicted case. The same shape ``memory_add_all`` uses for
+        per-attempt idempotency (caura-memclaw#23): it avoids the
+        ``flush() → IntegrityError → rollback() → re-SELECT`` pattern's
+        mid-session rollback, which is brittle (the rollback aborts any
+        other pending writes in the same session) and forced
+        ``test_concurrent_same_key_returns_same_id`` to pre-create the
+        agent row to dodge the failure mode.
         """
-        from sqlalchemy.exc import IntegrityError
-
         async with get_session() as session:
-            agent = Agent(**data)
-            session.add(agent)
-            try:
-                await session.flush()
-            except IntegrityError:
-                await session.rollback()
-                logger.info(
-                    "Agent dedup race: '%s/%s' already exists, re-selecting",
-                    data.get("tenant_id"),
-                    data.get("agent_id"),
-                )
-                result = await session.execute(
-                    select(Agent).where(
-                        Agent.tenant_id == data["tenant_id"],
-                        Agent.agent_id == data["agent_id"],
-                    )
-                )
+            stmt = (
+                pg_insert(Agent)
+                .values(**data)
+                .on_conflict_do_nothing(index_elements=["tenant_id", "agent_id"])
+                .returning(Agent.id)
+            )
+            inserted_id = (await session.execute(stmt)).scalar_one_or_none()
+
+            if inserted_id is not None:
+                # New row — fetch the full ORM object for the return.
+                # ``scalar_one_or_none`` (not ``scalar_one``) defends
+                # against a concurrent delete between INSERT RETURNING
+                # and the re-SELECT: ``scalar_one`` would raise
+                # ``NoResultFound`` and surface as a 500 with no
+                # actionable detail. We just-INSERTED this row in the
+                # same session so the realistic race window is
+                # vanishingly small, but cheap to be loud about it.
+                result = await session.execute(select(Agent).where(Agent.id == inserted_id))
                 agent = result.scalar_one_or_none()
                 if agent is None:
                     raise ValueError(
-                        f"Agent '{data.get('agent_id')}' conflict but re-select returned nothing"
+                        f"Agent row {inserted_id} vanished after INSERT — concurrent delete during agent_add"
                     )
-                # Apply any new fields from the request (e.g. fleet_id backfill)
-                for key in ("fleet_id", "trust_level"):
-                    if key in data and data[key] is not None:
-                        setattr(agent, key, data[key])
+                return agent
+
+            # Conflict: another caller (or a prior attempt) already
+            # created the row. Re-SELECT and apply any new fields the
+            # caller supplied (e.g. ``fleet_id`` backfill from a write
+            # that learned the fleet after the agent existed).
+            #
+            # ``.with_for_update()`` on the re-SELECT serialises against
+            # an in-progress concurrent ``agent_delete`` so we either
+            # see the live row or wait until that delete commits — if
+            # it does commit before we read, we still raise the
+            # ``ValueError`` below (the row genuinely vanished), but
+            # the lock removes the gap where the row was visible during
+            # ``ON CONFLICT`` and gone here.
+            logger.info(
+                "Agent dedup race: '%s/%s' already exists, re-selecting",
+                data.get("tenant_id"),
+                data.get("agent_id"),
+            )
+            result = await session.execute(
+                select(Agent)
+                .where(
+                    Agent.tenant_id == data["tenant_id"],
+                    Agent.agent_id == data["agent_id"],
+                )
+                .with_for_update()
+            )
+            agent = result.scalar_one_or_none()
+            if agent is None:
+                # Conflict happened but the row vanished — concurrent
+                # delete or schema drift. Surface as a clean ValueError
+                # so the caller sees the inconsistent state rather than
+                # an opaque ``None`` returned from a "create" call.
+                raise ValueError(f"Agent '{data.get('agent_id')}' conflict but re-select returned nothing")
+            # Track whether any field actually changed so we don't
+            # bump ``updated_at`` (or burn an UPDATE roundtrip) when
+            # the caller's data has nothing to backfill — e.g. a
+            # plain idempotent re-register that just wants the
+            # existing row back.
+            changed = False
+            for key in ("fleet_id", "trust_level"):
+                if key in data and data[key] is not None and getattr(agent, key) != data[key]:
+                    setattr(agent, key, data[key])
+                    changed = True
+            if changed:
                 agent.updated_at = datetime.now(UTC)
                 await session.flush()
             return agent

@@ -362,26 +362,16 @@ async def test_concurrent_same_key_returns_same_id(client):
     resolve to the same memory id — the loser polls for the winner's
     response rather than creating a duplicate row.
 
-    A throwaway warm-up write pre-creates the agent row so the two
-    parallel writes below don't race on ``agent_add`` — that path has
-    a separate latent bug (a session ``rollback()`` inside the
-    ``IntegrityError`` handler that closes the outer transaction)
-    which is orthogonal to the idempotency claim race this test is
-    guarding.
+    Pre-CAURA-602b, this test pre-created the agent row via a warm-up
+    write because ``agent_add`` had a separate latent bug — a mid-session
+    ``rollback()`` inside its ``IntegrityError`` handler that closed
+    the outer transaction. The agent path now uses
+    ``INSERT ... ON CONFLICT DO NOTHING RETURNING ...`` (same shape as
+    ``memory_add_all``) so the warm-up is no longer required; this test
+    drives the agent race directly to lock that fix in.
     """
     tenant_id, headers = get_test_auth()
     agent_id = f"idem-race-{uid()}"
-    # Warm-up: ensure the agent row exists so the parallel writes below
-    # can't both try to ``INSERT`` it concurrently.
-    warm = {
-        "tenant_id": tenant_id,
-        "agent_id": agent_id,
-        "memory_type": "fact",
-        "content": f"warm-up agent {uid()}",
-    }
-    warm_resp = await client.post("/api/v1/memories", json=warm, headers=headers)
-    assert warm_resp.status_code == 201, warm_resp.text
-
     key = _new_key()
     body = {
         "tenant_id": tenant_id,
