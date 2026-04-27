@@ -358,6 +358,17 @@ installs; skip this step.
 
 The recommended way to run MemClaw is via Docker Compose (see [Quick Start](#quick-start)). This gives you a production-ready PostgreSQL + pgvector + Redis + API stack with a single command.
 
+### Published container images
+
+Each release publishes multi-arch (linux/amd64, linux/arm64) images to [GitHub Container Registry](https://github.com/orgs/caura-ai/packages):
+
+```
+ghcr.io/caura-ai/caura-memclaw-core-api:v1.0.0
+ghcr.io/caura-ai/caura-memclaw-core-storage-api:v1.0.0
+```
+
+Tags follow SemVer with floating aliases — `:v1`, `:v1.0`, `:v1.0.0`, plus `:latest` for the latest stable release. Pull them in your own compose file or Kubernetes manifests instead of building from source.
+
 <a id="manual-deployment"></a>
 
 ### Manual deployment (without Docker)
