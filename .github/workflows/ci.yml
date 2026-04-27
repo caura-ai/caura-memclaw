@@ -76,11 +76,11 @@ jobs:
         run: alembic upgrade head
         env:
           PYTHONPATH: core-api/src:core-storage-api/src:.
-          ALLOYDB_HOST: localhost
-          ALLOYDB_USER: memclaw
-          ALLOYDB_PASSWORD: changeme
-          ALLOYDB_DATABASE: memclaw
-          ALLOYDB_REQUIRE_SSL: "false"
+          POSTGRES_HOST: localhost
+          POSTGRES_USER: memclaw
+          POSTGRES_PASSWORD: changeme
+          POSTGRES_DB: memclaw
+          POSTGRES_REQUIRE_SSL: "false"
 
       - name: Run tests
         run: |
@@ -92,11 +92,11 @@ jobs:
             --cov-report=term-missing
         env:
           PYTHONPATH: core-api/src:core-storage-api/src:.
-          ALLOYDB_HOST: localhost
-          ALLOYDB_USER: memclaw
-          ALLOYDB_PASSWORD: changeme
-          ALLOYDB_DATABASE: memclaw
-          ALLOYDB_REQUIRE_SSL: "false"
+          POSTGRES_HOST: localhost
+          POSTGRES_USER: memclaw
+          POSTGRES_PASSWORD: changeme
+          POSTGRES_DB: memclaw
+          POSTGRES_REQUIRE_SSL: "false"
           TEST_DATABASE_URL: "postgresql+asyncpg://memclaw:changeme@localhost:5432/memclaw"
           EMBEDDING_PROVIDER: fake
           ENTITY_EXTRACTION_PROVIDER: none

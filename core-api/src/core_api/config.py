@@ -1,20 +1,47 @@
 import logging
 from typing import Any, Literal
+from urllib.parse import quote
 
-from pydantic import SecretStr, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 logger = logging.getLogger(__name__)
 
 
+# Postgres connection settings. Canonical env var names follow the
+# official ``postgres`` Docker image conventions (POSTGRES_USER,
+# POSTGRES_PASSWORD, POSTGRES_DB) so the same ``.env`` works for both
+# the database container and the app. Legacy ``ALLOYDB_*`` aliases are
+# accepted for back-compat and will be dropped in a future major.
 class Settings(BaseSettings):
-    alloydb_host: str = "127.0.0.1"
-    alloydb_port: int = 5432
-    alloydb_user: str = "memclaw"
-    alloydb_password: str = "changeme"
-    alloydb_database: str = "memclaw"
-    alloydb_use_iam_auth: bool = False
-    alloydb_require_ssl: bool = True
+    postgres_host: str = Field(
+        default="127.0.0.1",
+        validation_alias=AliasChoices("POSTGRES_HOST", "ALLOYDB_HOST"),
+    )
+    postgres_port: int = Field(
+        default=5432,
+        validation_alias=AliasChoices("POSTGRES_PORT", "ALLOYDB_PORT"),
+    )
+    postgres_user: str = Field(
+        default="memclaw",
+        validation_alias=AliasChoices("POSTGRES_USER", "ALLOYDB_USER"),
+    )
+    postgres_password: SecretStr = Field(
+        default=SecretStr("changeme"),
+        validation_alias=AliasChoices("POSTGRES_PASSWORD", "ALLOYDB_PASSWORD"),
+    )
+    postgres_database: str = Field(
+        default="memclaw",
+        validation_alias=AliasChoices("POSTGRES_DB", "POSTGRES_DATABASE", "ALLOYDB_DATABASE"),
+    )
+    postgres_use_iam_auth: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("POSTGRES_USE_IAM_AUTH", "ALLOYDB_USE_IAM_AUTH"),
+    )
+    postgres_require_ssl: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("POSTGRES_REQUIRE_SSL", "ALLOYDB_REQUIRE_SSL"),
+    )
     api_key: str | None = None  # legacy, deprecated
     admin_api_key: str | None = None
     memclaw_api_key: str | None = None  # Optional: when set, all non-admin requests must present this key
@@ -218,9 +245,17 @@ class Settings(BaseSettings):
 
     @property
     def database_url(self) -> str:
+        # Percent-encode the user + password so credentials containing
+        # URL-reserved chars (@, :, /, ?, #) or whitespace don't silently
+        # produce a malformed URL and an opaque asyncpg connection error.
+        # quote(..., safe='') is correct for URL authority components —
+        # quote_plus would encode spaces as ``+`` (form-encoding), which
+        # is not valid in the userinfo section of a URL.
+        user = quote(self.postgres_user, safe="")
+        password = quote(self.postgres_password.get_secret_value(), safe="")
         return (
-            f"postgresql+asyncpg://{self.alloydb_user}:{self.alloydb_password}"
-            f"@{self.alloydb_host}:{self.alloydb_port}/{self.alloydb_database}"
+            f"postgresql+asyncpg://{user}:{password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_database}"
         )
 
     @model_validator(mode="after")

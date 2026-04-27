@@ -19,7 +19,7 @@ _TEST_DEFAULTS = {
     "USE_LLM_FOR_MEMORY_CREATION": "false",
     "ADMIN_API_KEY": "test-admin-key",
     "IS_STANDALONE": "true",
-    "ALLOYDB_REQUIRE_SSL": "false",
+    "POSTGRES_REQUIRE_SSL": "false",
     "PLATFORM_LLM_PROVIDER": "",
     "PLATFORM_EMBEDDING_PROVIDER": "",
     # CAURA-594: ``embed_on_hot_path`` defaults to True (OSS shape) as

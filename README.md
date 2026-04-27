@@ -38,7 +38,13 @@ Agents write plain text. MemClaw turns it into searchable, governed, self-improv
 
 ## Quick Start
 
-Choose between the managed platform or self-hosted:
+Three paths — pick the one that matches your setup:
+
+| Path | When | Time to first memory |
+|---|---|---|
+| **Managed platform** | Quickest. We host the DB + scaling. | ~2 min |
+| **Self-hosted (Docker)** | Privacy / on-prem / air-gapped. | ~5 min |
+| **OpenClaw plugin** | You already run an OpenClaw fleet — install MemClaw as a plugin against any of the above. | ~3 min |
 
 ### Managed Platform
 
@@ -60,6 +66,17 @@ Get up and running in minutes — no infrastructure, automatic updates, usage an
 ```
 
 ### Self-Hosted (Open Source)
+
+The fastest path is Docker Compose — one command brings up Postgres + pgvector + Redis + the API.
+
+> **Prefer not to use Docker?** Skip to [Manual deployment (Python + Postgres)](#manual-deployment) below for the bare-Python path.
+
+#### Prerequisites
+
+- **Docker Engine 24+** (Linux) or **Docker Desktop** (macOS / Windows). Confirm with `docker --version`.
+- **Docker Compose v2** (built into modern Docker). Confirm with `docker compose version`.
+- **Git** for cloning.
+- ~2 GB free disk for images + Postgres data volume.
 
 #### 1. Clone and configure
 
@@ -175,6 +192,26 @@ python scripts/smoke_test.py --url http://localhost:8000 --api-key <admin-key>
 ```
 
 </details>
+
+### OpenClaw Plugin
+
+Already running an OpenClaw fleet? Install MemClaw as a plugin against either the managed platform or your self-hosted stack:
+
+```bash
+# Point at whichever URL hosts your MemClaw API
+export MEMCLAW_URL=https://memclaw.net          # managed
+# or:  export MEMCLAW_URL=http://localhost:8000  # self-hosted
+export MEMCLAW_KEY=your-key                      # `standalone` works in self-hosted standalone mode
+export MEMCLAW_FLEET=my-fleet
+
+curl -sf -H "X-API-Key: $MEMCLAW_KEY" \
+  "$MEMCLAW_URL/api/v1/install-plugin?fleet_id=$MEMCLAW_FLEET&api_url=$MEMCLAW_URL" | bash
+
+# Restart the gateway to load the plugin
+openclaw gateway restart
+```
+
+The plugin claims the OpenClaw `memory` slot (replacing `memory-core`) and exposes the same 9 MCP tools. Full setup, agent prompts, and trust levels: [static/docs/integration-guide.md](static/docs/integration-guide.md).
 
 ---
 
@@ -319,7 +356,11 @@ installs; skip this step.
 
 The recommended way to run MemClaw is via Docker Compose (see [Quick Start](#quick-start)). This gives you a production-ready PostgreSQL + pgvector + Redis + API stack with a single command.
 
-For manual deployments, the `core-api/` service is a standard FastAPI app that runs under any ASGI server (uvicorn, hypercorn). Requirements:
+<a id="manual-deployment"></a>
+
+### Manual deployment (without Docker)
+
+The `core-api/` service is a standard FastAPI app that runs under any ASGI server (uvicorn, hypercorn). Requirements:
 
 - Python 3.12+
 - PostgreSQL 16+ with the `pgvector` extension
@@ -333,7 +374,7 @@ uvicorn core_api.app:app --host 0.0.0.0 --port 8000 --workers 2
 
 MemClaw ships with two operational modes for the storage layer. **Single-node (default)** is what you get from Docker Compose, `pip install`, or any fresh deploy — one `core-storage-api` instance serves both reads and writes. This is the right choice for any deployment that isn't seeing sustained 100+ writes/sec.
 
-The **reader/writer split** is an opt-in topology for high-write-rate deploys that want to scale reads independently of writes (e.g. on AlloyDB's read pool). Enabling it means running two `core-storage-api` services with different roles and pointing `core-api` at both:
+The **reader/writer split** is an opt-in topology for high-write-rate deploys that want to scale reads independently of writes — e.g. by pointing read traffic at a Postgres streaming replica. Enabling it means running two `core-storage-api` services with different roles and pointing `core-api` at both:
 
 - Set `CORE_STORAGE_ROLE=writer` on the write-serving instance; `=reader` on the read-serving instance(s).
 - Set `CORE_STORAGE_READ_URL` on `core-api` to the reader service URL. Leave `CORE_STORAGE_API_URL` pointing at the writer.
@@ -482,14 +523,16 @@ Exceeded limits return HTTP 429 with a `Retry-After` header.
 
 All configuration is via environment variables or `.env`. See `.env.example` for the full list.
 
+> **Migrating from a pre-1.0 deploy?** The legacy `ALLOYDB_*` env var names are still accepted as aliases — `POSTGRES_HOST` falls back to `ALLOYDB_HOST`, etc. Aliases will be dropped in a future major release.
+
 | Variable | Default | Description |
 |---|---|---|
-| `ALLOYDB_HOST` | `127.0.0.1` | Database host |
-| `ALLOYDB_PORT` | `5432` | Database port |
-| `ALLOYDB_USER` | `memclaw` | Database user |
-| `ALLOYDB_PASSWORD` | `changeme` | Database password |
-| `ALLOYDB_DATABASE` | `memclaw` | Database name |
-| `ALLOYDB_USE_IAM_AUTH` | `false` | Use GCP IAM for DB auth |
+| `POSTGRES_HOST` | `127.0.0.1` | Database host |
+| `POSTGRES_PORT` | `5432` | Database port |
+| `POSTGRES_USER` | `memclaw` | Database user |
+| `POSTGRES_PASSWORD` | `changeme` | Database password |
+| `POSTGRES_DB` | `memclaw` | Database name |
+| `POSTGRES_USE_IAM_AUTH` | `false` | Use GCP IAM for DB auth (managed Postgres on GCP only) |
 | `ADMIN_API_KEY` | *(empty)* | Admin API key — bypasses tenant enforcement |
 | `EMBEDDING_PROVIDER` | `openai` | `openai`, `local`, or `fake` |
 | `ENTITY_EXTRACTION_PROVIDER` | `openai` | `openai`, `gemini`, `anthropic`, `openrouter`, `fake`, or `none` |
@@ -638,7 +681,7 @@ These mirror the Configuration table above. See it for defaults.
 
 | Group | Vars |
 |---|---|
-| Database | `ALLOYDB_HOST`, `ALLOYDB_PORT`, `ALLOYDB_USER`, `ALLOYDB_PASSWORD`, `ALLOYDB_DATABASE`, `ALLOYDB_USE_IAM_AUTH`, `ALLOYDB_REQUIRE_SSL` |
+| Database | `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_USE_IAM_AUTH`, `POSTGRES_REQUIRE_SSL` |
 | Auth | `ADMIN_API_KEY`, `MEMCLAW_API_KEY`, `IS_STANDALONE` |
 | Providers | `EMBEDDING_PROVIDER`, `ENTITY_EXTRACTION_PROVIDER`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `USE_LLM_FOR_MEMORY_CREATION` |
 | Runtime | `CORS_ORIGINS`, `ENVIRONMENT`, `SETTINGS_ENCRYPTION_KEY`, `REDIS_URL` |

@@ -52,12 +52,12 @@ services:
     environment:
       PYTHONPATH: /app/core-storage-api/src:/app
       DATABASE_URL: postgresql+asyncpg://memclaw:changeme@db:5432/memclaw
-      ALLOYDB_HOST: db
-      ALLOYDB_PORT: 5432
-      ALLOYDB_USER: memclaw
-      ALLOYDB_PASSWORD: changeme
-      ALLOYDB_DATABASE: memclaw
-      ALLOYDB_REQUIRE_SSL: "false"
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: memclaw
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: memclaw
+      POSTGRES_REQUIRE_SSL: "false"
       ENVIRONMENT: development
     depends_on:
       db:
@@ -99,7 +99,7 @@ services:
       - ./VERSION:/app/VERSION:ro
     environment:
       PYTHONPATH: /app/core-api/src:/app
-      ALLOYDB_HOST: db
+      POSTGRES_HOST: db
       CORE_STORAGE_API_URL: http://core-storage-api:8002
       REDIS_URL: redis://redis:6379/0
       # Pass through provider keys from host

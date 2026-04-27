@@ -12,10 +12,10 @@ MemClaw is a shared memory layer for OpenClaw agents. It runs as a separate API 
 ### Architecture
 
 ```
-MCP Client      → Streamable HTTP  → MemClaw API (/mcp) → AlloyDB
-OpenClaw Agent  → tool call        → MemClaw Plugin → HTTP → MemClaw API → AlloyDB
+MCP Client      → Streamable HTTP  → MemClaw API (/mcp) → Postgres + pgvector
+OpenClaw Agent  → tool call        → MemClaw Plugin → HTTP → MemClaw API → Postgres + pgvector
 Plugin          → heartbeat (60s)  → MemClaw API ← commands (response)
-Browser (UI)    → HTTP             → MemClaw API → AlloyDB
+Browser (UI)    → HTTP             → MemClaw API → Postgres + pgvector
 ```
 
 ### Components
@@ -24,7 +24,7 @@ Browser (UI)    → HTTP             → MemClaw API → AlloyDB
 |---|---|---|
 | MemClaw API | Any host (Docker, VM, cloud run, local) | FastAPI service — memories, entities, search, enrichment |
 | MCP Server | Same process (`/mcp`) | Streamable HTTP endpoint for any MCP client |
-| AlloyDB | GCP | PostgreSQL with pgvector |
+| Postgres + pgvector | Anywhere (Docker, VM, managed) | Vector + relational store |
 | MemClaw Plugin | OpenClaw gateway VM | Thin adapter forwarding tool calls to the API |
 | Web UI | Served at `/ui` | Manage, Prism (with Graph button), Playground, Fleet, MCP Test, Ingest, Admin Dashboard |
 
@@ -145,8 +145,8 @@ MCP uses the same tenant-scoped API keys as the REST API. The `X-API-Key` header
 
 Once configured, the MCP client handles tool discovery. Agents can use MemClaw tools naturally:
 
-> "Search my memories for anything about the AlloyDB migration"
-> -> calls `memclaw_recall` with query "AlloyDB migration"
+> "Search my memories for anything about the Postgres migration"
+> -> calls `memclaw_recall` with query "Postgres migration"
 
 > "Remember that we decided to use pgvector for embeddings instead of Pinecone"
 > -> calls `memclaw_write` with that content; LLM auto-classifies as `decision` type
@@ -448,7 +448,7 @@ Returns the researcher's finding. Graph-enhanced retrieval expands through entit
 {
   "tool": "memclaw_write",
   "parameters": {
-    "content": "Customer X should be migrated to AlloyDB in Phase 2 due to high transaction volume."
+    "content": "Customer X should be migrated to managed Postgres in Phase 2 due to high transaction volume."
   }
 }
 ```
@@ -558,7 +558,7 @@ Auto-classified by LLM on every write. Agents can override with `memory_type`.
 |---|---|---|---|
 | `fact` | Durable knowledge | `active` | "Customer A uses Postgres 16" |
 | `episode` | Events that happened | `active` | "Deployed v2.3 on March 10" |
-| `decision` | Choices made | `active` | "Chose AlloyDB over Cloud SQL" |
+| `decision` | Choices made | `active` | "Chose managed Postgres over self-hosted" |
 | `preference` | User/org preferences | `active` | "Customer B prefers email over Slack" |
 | `task` | Work items | `pending` | "Migrate Customer X by Q3" |
 | `semantic` | Conceptual knowledge | `active` | "pgvector supports HNSW and IVFFlat" |
@@ -655,7 +655,7 @@ Available as the batch form of the `memclaw_write` tool (MCP + OpenClaw plugin, 
   "agent_id": "researcher-1",
   "items": [
     {"content": "Customer A uses PostgreSQL 16 in production"},
-    {"content": "Customer B migrated to AlloyDB last quarter", "memory_type": "fact"},
+    {"content": "Customer B migrated to managed Postgres last quarter", "memory_type": "fact"},
     {"content": "Customer C prefers email notifications", "weight": 0.8}
   ]
 }

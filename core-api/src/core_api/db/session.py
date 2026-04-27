@@ -6,11 +6,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from core_api.config import settings
 
-# asyncpg: enable SSL for AlloyDB (required by ENCRYPTED_ONLY mode)
+# asyncpg: enable SSL when the database requires it (default for managed
+# Postgres providers — required, e.g., on AlloyDB's ENCRYPTED_ONLY mode).
 _connect_args = {}
-if settings.alloydb_require_ssl:
+if settings.postgres_require_ssl:
     _connect_args["ssl"] = "require"
-    if settings.alloydb_use_iam_auth:
+    if settings.postgres_use_iam_auth:
         _connect_args["ssl"] = True  # full verification for IAM auth
 
 engine = create_async_engine(

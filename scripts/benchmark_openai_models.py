@@ -98,7 +98,7 @@ TEST_SAMPLES = [
         "label": "complex_decision",
         "content": (
             "After evaluating PostgreSQL, MongoDB, and DynamoDB for the new analytics service, "
-            "the team decided to go with AlloyDB on GCP. Key factors: native pgvector support "
+            "the team decided to go with managed Postgres. Key factors: native pgvector support "
             "for embeddings, ScaNN indexing for fast ANN search, and compatibility with existing "
             "Alembic migrations. John Smith from the platform team approved the $2,400/month budget. "
             "Migration deadline is March 30, 2026. Contact: john.smith@acme.com"
@@ -116,7 +116,7 @@ TEST_SAMPLES = [
         "label": "episode_incident",
         "content": (
             "Production outage on 2026-03-15 at 14:32 UTC. Root cause: connection pool exhaustion "
-            "in the search service due to a missing timeout on AlloyDB queries. 47 minutes MTTR. "
+            "in the search service due to a missing timeout on Postgres queries. 47 minutes MTTR. "
             "Affected 12% of API requests. Hotfix deployed by Sarah Chen."
         ),
     },
@@ -477,13 +477,13 @@ EMBEDDING_SAMPLES = [
     {"label": "short", "text": "The deployment uses GitHub Actions."},
     {"label": "medium", "text": (
         "After evaluating PostgreSQL, MongoDB, and DynamoDB for the new analytics service, "
-        "the team decided to go with AlloyDB on GCP. Key factors: native pgvector support "
+        "the team decided to go with managed Postgres. Key factors: native pgvector support "
         "for embeddings, ScaNN indexing for fast ANN search, and compatibility with existing "
         "Alembic migrations."
     )},
     {"label": "long", "text": (
         "Production outage on 2026-03-15 at 14:32 UTC. Root cause: connection pool exhaustion "
-        "in the search service due to a missing timeout on AlloyDB queries. 47 minutes MTTR. "
+        "in the search service due to a missing timeout on Postgres queries. 47 minutes MTTR. "
         "Affected 12% of API requests. Hotfix deployed by Sarah Chen. Post-mortem scheduled "
         "for Monday. Action items: add circuit breaker to connection pool, set query timeout "
         "to 5s, add monitoring alert for connection count > 80% capacity, update runbook with "
@@ -493,7 +493,7 @@ EMBEDDING_SAMPLES = [
     # Batch of 10 texts for batch throughput test
     {"label": "batch_10", "texts": [
         "The API uses FastAPI with async handlers.",
-        "AlloyDB is deployed in me-west1 region.",
+        "the database is deployed in me-west1 region.",
         "Memory dedup uses content_hash with SHA-256.",
         "Entity extraction runs via Gemini 2.5 Flash Lite.",
         "The search endpoint blends vector similarity with keyword FTS.",
@@ -509,7 +509,7 @@ EMBEDDING_SAMPLES = [
 SIMILARITY_PAIRS = [
     (
         "database connection pool exhaustion",
-        "AlloyDB query timeout caused connection pool to fill up",
+        "Postgres query timeout caused connection pool to fill up",
         "The marketing team reviewed Q3 campaign results",
     ),
     (

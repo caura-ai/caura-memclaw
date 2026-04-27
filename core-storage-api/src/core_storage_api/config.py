@@ -14,13 +14,12 @@ class Settings(BaseSettings):
     environment: Literal["development", "production", "sandbox"] = "development"
 
     # Database — writes go to the primary at ``database_url``. Reads
-    # route to ``read_database_url`` when it's set (SaaS wires this at
-    # the AlloyDB read pool; the IP lives in the enterprise deploy
-    # config, not here) and fall back to the primary when empty (OSS
+    # route to ``read_database_url`` when it's set (e.g. a managed-Postgres
+    # read replica) and fall back to the primary when empty (OSS
     # standalone — a single box with no replica). The split offloads
-    # search / GET traffic from the primary and unlocks the existing
-    # but idle read pool. Replication lag on AlloyDB is typically
-    # <5s, acceptable for the read paths we route.
+    # search / GET traffic from the primary. Replication lag on a
+    # streaming replica is typically <5s, acceptable for the read paths
+    # we route.
     database_url: str = "postgresql+asyncpg://memclaw:changeme@localhost:5432/memclaw"
     read_database_url: str = ""
     db_pool_size: int = 20

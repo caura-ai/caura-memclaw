@@ -71,7 +71,7 @@ See `README.md` for more deployment options and environment variable details.
 1. **Open an issue first** for anything non-trivial — a bug fix under ~30 lines
    is fine to submit directly as a PR, but larger changes benefit from
    discussion before code is written.
-2. **Create a branch** from `dev` with a short descriptive name.
+2. **Create a branch** from `main` with a short descriptive name (e.g. `feat/fleet-id-filter`, `fix/plugin-heartbeat`).
 3. **Make your change.** Keep PRs focused — one logical change per PR.
 4. **Add or update tests.** We don't accept new features without tests, and bug
    fixes should include a regression test.
@@ -88,7 +88,7 @@ See `README.md` for more deployment options and environment variable details.
    mypy core-api/src/ core-storage-api/src/
    pytest tests/
    ```
-6. **Open a PR against `dev`.** Fill out the PR template.
+6. **Open a PR against `main`.** Fill out the PR template. Branch protection requires CI green, DCO check green, and ≥1 maintainer approval before merge.
 7. **Respond to review.** Expect at least one round of feedback.
 
 ## Commit messages
@@ -167,9 +167,6 @@ release-please opens or updates a release PR. Merging the release PR:
    `pyproject.toml`, `plugin/package.json`, `plugin/openclaw.plugin.json`.
 
 You don't bump versions by hand; just write good commit messages.
-
-For the v1.0.0 cutover (only), a maintainer lands an empty commit with
-a `Release-As: 1.0.0` directive — release-please honors it.
 
 ## Code Style
 

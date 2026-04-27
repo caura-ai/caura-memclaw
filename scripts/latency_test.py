@@ -30,7 +30,7 @@ WRITE_SAMPLES = [
     "Product decided to sunset the legacy REST API by June 2026. All clients must migrate to GraphQL.",
     "Incident: payment service went down for 12 minutes on March 20 due to a certificate expiration. Automated renewal is now in place.",
     "The ML team trained a new embedding model — recall@10 improved from 0.82 to 0.91 on the internal benchmark.",
-    "Budget approved: $24K/month for AlloyDB Enterprise tier starting April 1.",
+    "Budget approved: $24K/month for managed Postgres Enterprise tier starting April 1.",
     "Customer Beta Inc requested SOC 2 Type II compliance documentation. Deadline is March 28.",
     "Architecture decision: all new microservices must use gRPC for inter-service communication.",
     "QA found a race condition in the dedup logic — two concurrent writes with identical content can both succeed.",

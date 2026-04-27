@@ -145,11 +145,16 @@ async def lifespan(app):
                 'Generate one with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
             )
         _dangerous = {
-            "alloydb_password": "changeme",
+            "postgres_password": "changeme",
             "jwt_secret": "change-me-in-production",
         }
         for var, bad_val in _dangerous.items():
-            if getattr(app_settings, var, None) == bad_val:
+            val = getattr(app_settings, var, None)
+            # SecretStr fields (e.g. postgres_password) wrap the value;
+            # unwrap before comparing so the guard isn't silently bypassed.
+            if hasattr(val, "get_secret_value"):
+                val = val.get_secret_value()
+            if val == bad_val:
                 raise RuntimeError(f"{var.upper()} must be changed from default for production")
         if not app_settings.admin_api_key:
             raise RuntimeError("ADMIN_API_KEY must be set for production")

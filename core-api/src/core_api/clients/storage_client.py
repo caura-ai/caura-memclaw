@@ -46,11 +46,11 @@ class CoreStorageClient:
         self._prefix = f"{self._base_url}/api/v1/storage"
         self._http = http or self._make_pool()
 
-        # CAURA-591 Part B: optional separate endpoint for reads so the
-        # enterprise deploy can point them at a reader-role core-storage
-        # Cloud Run service (smaller writer fleet = less connection-pool
-        # contention on the primary AlloyDB). Empty = no split; reads and
-        # writes share ``_http`` and behaviour is unchanged.
+        # Optional separate endpoint for reads — point reader-role
+        # core-storage instances at a Postgres read replica so the writer
+        # fleet stays small and connection-pool contention on the primary
+        # stays low. Empty = no split; reads and writes share ``_http``
+        # and behaviour is unchanged.
         configured_read_url = read_url if read_url is not None else settings.core_storage_read_url
         self._read_base_url = (configured_read_url or self._base_url).rstrip("/")
         self._read_prefix = f"{self._read_base_url}/api/v1/storage"
