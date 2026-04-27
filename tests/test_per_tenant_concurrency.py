@@ -11,7 +11,10 @@ import pytest
 
 from core_api.config import settings
 from core_api.middleware import per_tenant_concurrency
-from core_api.middleware.per_tenant_concurrency import per_tenant_slot
+from core_api.middleware.per_tenant_concurrency import (
+    per_tenant_slot,
+    per_tenant_storage_slot,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -32,9 +35,17 @@ def tight_caps(monkeypatch):
     concurrent in-flight slots exercises the exhaustion path. Tests
     request whichever cap they need via the returned setter."""
 
-    def _set(*, write: int = 2, search: int = 2) -> None:
+    def _set(
+        *,
+        write: int = 2,
+        search: int = 2,
+        storage_write: int = 2,
+        storage_search: int = 2,
+    ) -> None:
         monkeypatch.setattr(settings, "per_tenant_write_concurrency", write)
         monkeypatch.setattr(settings, "per_tenant_search_concurrency", search)
+        monkeypatch.setattr(settings, "per_tenant_storage_write_concurrency", storage_write)
+        monkeypatch.setattr(settings, "per_tenant_storage_search_concurrency", storage_search)
         per_tenant_concurrency._reset_for_tests()
 
     return _set
@@ -125,3 +136,74 @@ async def test_tenants_isolated(tight_caps):
     finally:
         release.set()
         await holder
+
+
+# ── Storage-call slot (CAURA-602 follow-up) ──
+
+
+async def test_storage_slot_queues_unboundedly(tight_caps):
+    """Unlike the route-entry slot, the storage slot queues without a
+    fast-fail timeout. The third caller waits until tenant A's two
+    in-flight writes release the slot — the route layer's outer budget
+    is what actually caps total wait time."""
+    tight_caps(storage_write=2)
+
+    held_count = 0
+    release = asyncio.Event()
+
+    async def hold_storage() -> None:
+        nonlocal held_count
+        async with per_tenant_storage_slot("storage_write", "tenant-a"):
+            held_count += 1
+            await release.wait()
+
+    holders = [asyncio.create_task(hold_storage()) for _ in range(2)]
+    await asyncio.sleep(0.01)
+    assert held_count == 2
+
+    third = asyncio.create_task(hold_storage())
+    await asyncio.sleep(0.01)
+    # Third caller is queued (not raised, not fast-failed).
+    assert held_count == 2
+    assert not third.done()
+
+    release.set()
+    await asyncio.gather(*holders, third)
+    assert held_count == 3
+
+
+async def test_storage_slot_isolates_tenants_under_storm(tight_caps):
+    """Tenant A saturating its storage cap doesn't block tenant B —
+    this is the noisy-neighbor target case for the bulkhead."""
+    tight_caps(storage_write=1)
+
+    release = asyncio.Event()
+
+    async def hold_a() -> None:
+        async with per_tenant_storage_slot("storage_write", "tenant-a"):
+            await release.wait()
+
+    holder = asyncio.create_task(hold_a())
+    await asyncio.sleep(0.01)
+    try:
+        # tenant-b's storage slot is a separate semaphore.
+        async with per_tenant_storage_slot("storage_write", "tenant-b"):
+            pass
+    finally:
+        release.set()
+        await holder
+
+
+async def test_storage_slot_release_on_exception(tight_caps):
+    """An exception inside the storage slot releases it cleanly so a
+    subsequent acquire doesn't deadlock."""
+    tight_caps(storage_write=1)
+
+    with pytest.raises(RuntimeError):
+        async with per_tenant_storage_slot("storage_write", "tenant-a"):
+            raise RuntimeError("boom")
+    # Cap was 1; if the slot wasn't released the next acquire would
+    # block forever rather than entering the body.
+    async with asyncio.timeout(1.0):
+        async with per_tenant_storage_slot("storage_write", "tenant-a"):
+            pass

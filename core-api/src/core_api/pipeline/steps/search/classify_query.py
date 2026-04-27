@@ -25,6 +25,7 @@ from core_api.constants import (
     GRAPH_MAX_BOOSTED_MEMORIES,
     GRAPH_MAX_EXPANDED_ENTITIES,
 )
+from core_api.middleware.per_tenant_concurrency import per_tenant_storage_slot
 from core_api.pipeline.context import PipelineContext
 from core_api.pipeline.step import StepResult
 from core_api.pipeline.steps.search.retrieval_types import (
@@ -318,7 +319,14 @@ class ClassifyQuery:
             "top_k": top_k,
             "entity_lookup": True,
         }
-        memories = await sc.scored_search(search_data)
+        # Per-tenant storage bulkhead (CAURA-602 follow-up). Same key as
+        # the main scored-search step in execute_scored_search.py — a
+        # single classify-then-execute pipeline acquires the slot twice
+        # (once here, once there) but each acquire/release is bounded
+        # to its own storage roundtrip, so there's no deadlock or
+        # cumulative latency beyond the time storage actually spends.
+        async with per_tenant_storage_slot("storage_search", tenant_id):
+            memories = await sc.scored_search(search_data)
 
         # Build result rows with boost scores.
         memories_by_id = {m["id"]: m for m in memories}
