@@ -396,7 +396,7 @@ All routes are versioned under `/api/v1/`. Interactive Swagger docs at `/api/doc
 | Endpoint | Method | Description |
 |---|---|---|
 | `/memories` | POST | Write a memory. LLM enrichment + embedding + entity extraction + contradiction detection. `"persist": false` for extract-only preview |
-| `/memories/bulk` | POST | Write up to 100 memories. Batches embeddings, parallelizes enrichment, single transaction |
+| `/memories/bulk` | POST | Write up to 100 memories. Batches embeddings, parallelizes enrichment, single transaction. Requires `X-Bulk-Attempt-Id` header (per-attempt idempotency); a retry with the same id resolves committed rows as `duplicate_attempt` instead of duplicating. Returns 200 (clean / all-error) or 207 Multi-Status (mixed) — read per-item `status` |
 | `/memories` | GET | List memories (filter by type, status, agent; paginate) |
 | `/memories/{id}` | GET | Full memory detail (embedding stats, entity links, RDF triple, temporal bounds) |
 | `/memories/{id}` | PATCH | Update content or metadata. Re-embeds if content changes |
