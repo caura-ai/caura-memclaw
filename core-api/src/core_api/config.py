@@ -144,6 +144,15 @@ class Settings(BaseSettings):
     # longer than any realistic client retry budget. Cached responses
     # older than this are treated as absent and the request re-runs.
     idempotency_ttl_seconds: int = 86400
+    # TTL for pending claims (rows with ``is_pending=True`` waiting for
+    # the handler to call ``record()``). MUST be much shorter than
+    # ``idempotency_ttl_seconds``: a crashed/timed-out handler leaves the
+    # row pending; without a short TTL it would soft-ban the key for the
+    # full 24h. The expired-row reclaim path in ``idempotency_claim``
+    # auto-recovers stuck pending rows once this TTL elapses. Sized
+    # generously above realistic handler latency (single write <2s, bulk
+    # write <60s, search <2s).
+    idempotency_pending_ttl_seconds: int = 90
     environment: Literal["development", "production", "sandbox"] = "development"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     # JSON output by default so Cloud Logging picks up severity/message.

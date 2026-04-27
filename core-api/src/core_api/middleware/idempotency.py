@@ -12,6 +12,7 @@ the route level. The boilerplate is five lines per decorated handler.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from datetime import UTC, datetime, timedelta
@@ -28,6 +29,27 @@ IDEMPOTENCY_HEADER = "Idempotency-Key"
 # Matches Stripe's limit. Guards the `Text` column against oversized
 # values from buggy or adversarial clients before it reaches storage.
 MAX_IDEMPOTENCY_KEY_LEN = 255
+
+# Poll cadence + budget while waiting for a concurrent holder of the
+# same key to finish. Total wait =
+# ``_CLAIM_POLL_INTERVAL_SECONDS * _CLAIM_POLL_MAX_ATTEMPTS``. Long
+# enough to absorb a typical write pipeline (~2-5s end-to-end) without
+# holding the second request indefinitely; on timeout the caller gets
+# 409 and can retry.
+_CLAIM_POLL_INTERVAL_SECONDS = 0.5
+_CLAIM_POLL_MAX_ATTEMPTS = 20
+
+# Sentinels ``_poll_until_complete`` may return alongside the
+# completed row dict and ``None`` (budget exhausted):
+#
+# - ``_POLL_VANISHED``: the row no longer exists (cleanup-job pruned
+#   or pending TTL elapsed). Caller can tell the client to retry as
+#   a fresh request.
+# - ``_POLL_STORAGE_ERROR``: the storage call itself failed (down,
+#   timeout, network). Caller should respond 503 — retrying into a
+#   downed cluster wastes the client's retry budget.
+_POLL_VANISHED = "vanished"
+_POLL_STORAGE_ERROR = "storage_error"
 
 # Body-metadata keys checked when the ``Idempotency-Key`` HTTP
 # header is absent. ``Idempotency-Key`` (header) remains the
@@ -112,10 +134,12 @@ async def idempotency_for(
     *,
     source: Literal["header", "body"] = "header",
 ) -> IdempotencyGuard | None:
-    """Look up the inbox for (tenant, key). Returns None if the key
-    was absent. On a cache hit with a *different* body hash, raises
-    422 — reusing the same key with different content is explicitly
-    a client error per the IETF idempotency-key draft.
+    """Look up — and atomically claim — the inbox for (tenant, key).
+
+    Returns None if the key was absent. On a cache hit with a
+    *different* body hash, raises 422 — reusing the same key with
+    different content is explicitly a client error per the IETF
+    idempotency-key draft.
 
     Call this inside a route handler *after* auth enforcement, so the
     tenant_id passed here is already vetted.
@@ -124,26 +148,28 @@ async def idempotency_for(
     ``header:``, ``"body"`` → ``body:``) prepended before the lookup
     so the same string value sent via different transports never
     shares a cache bucket. Validation runs against the RAW key the
-    caller supplied; the prefix is added only for storage. Defaults
-    to ``"header"`` so existing callers (header-only routes) keep
-    working without changes.
+    caller supplied; the prefix is added only for storage.
 
     Body hashing note: uses raw request bytes. Clients retrying a write
     MUST send byte-identical bodies (same JSON serializer, same key
     ordering). Non-deterministic serialization will falsely flag a
     retry as a conflict. Matches Stripe and the IETF draft.
 
-    Concurrency limitation (tracked as follow-up): this function acquires
-    no lock. Two requests with the same key arriving within a few
-    milliseconds of each other will both miss the cache, both execute
-    the handler, and both persist database rows — the ``record()``
-    upsert dedups the STORED RESPONSE (first writer wins on the
-    response body), but the write side effects have already happened
-    twice. Sequential retries (the primary target use case) are fully
-    protected. Truly concurrent idempotent writes need either a
-    PostgreSQL advisory lock keyed on ``hashtext(tenant_id||':'||key)``
-    spanning the handler, or a "processing" sentinel row inserted here
-    before the handler runs.
+    Concurrency: closes the race where two requests with the same key
+    arrive within milliseconds. The flow is lookup → claim → poll:
+
+    1. ``get_idempotency`` reads any existing row.
+    2. If a completed row matches the request hash, replay it.
+    3. If no row, ``claim_idempotency`` atomically inserts a pending
+       sentinel via INSERT ... ON CONFLICT DO NOTHING. The winning
+       caller proceeds with the handler; ``record()`` flips
+       ``is_pending`` to False.
+    4. If the claim collided (a concurrent caller raced ahead between
+       step 1 and step 3, or the row was pending in step 1), poll the
+       existing row until ``is_pending`` is False, then replay.
+
+    Storage outages degrade to "no cache" — a lost dedup opportunity
+    beats a blocked write.
     """
     if not idempotency_key:
         return None
@@ -155,29 +181,153 @@ async def idempotency_for(
             detail=f"Idempotency-Key must be at most {MAX_IDEMPOTENCY_KEY_LEN} characters",
         )
 
-    # Format change vs. pre-PR (bare key → ``header:<key>``) orphans any
-    # in-flight cache entries at deploy. The 24h TTL absorbs this: the
-    # worst case is a duplicate request arriving within 24h of deploy
-    # that re-executes instead of replaying — same outcome as a cache
-    # miss, never a wrong answer.
     namespaced_key = f"{source}:{idempotency_key}"
 
     body_bytes = await request.body()
     request_hash = hashlib.sha256(body_bytes).hexdigest()
 
+    sc = get_storage_client()
+
     cached: dict | None
     try:
-        cached = await get_storage_client().get_idempotency(tenant_id, namespaced_key)
+        cached = await sc.get_idempotency(tenant_id, namespaced_key)
     except Exception:
-        # Storage unavailable: degrade to "no cache" so writes still go
-        # through. A lost dedup opportunity beats a blocked write.
         logger.warning("Idempotency lookup failed (degrading to no-cache)", exc_info=True)
-        cached = None
+        return IdempotencyGuard(tenant_id, namespaced_key, request_hash, cached=None)
 
-    if cached and cached["request_hash"] != request_hash:
+    if cached and not cached.get("is_pending", False):
+        if cached["request_hash"] != request_hash:
+            raise HTTPException(
+                status_code=422,
+                detail="Idempotency-Key reused with a different request body",
+            )
+        return IdempotencyGuard(tenant_id, namespaced_key, request_hash, cached=cached)
+
+    if cached and cached.get("is_pending", False):
+        # Hash-check before polling: a different body for the same key is
+        # always a 422 regardless of the in-flight handler's outcome,
+        # and the pending row already carries the original hash. Without
+        # this short-circuit the loser burns the full poll budget before
+        # getting the same 422.
+        if cached["request_hash"] != request_hash:
+            raise HTTPException(
+                status_code=422,
+                detail="Idempotency-Key reused with a different request body",
+            )
+        completed = await _poll_until_complete(sc, tenant_id, namespaced_key)
+        if completed is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Idempotency-Key still in progress; retry shortly",
+            )
+        if completed == _POLL_STORAGE_ERROR:
+            raise HTTPException(
+                status_code=503,
+                detail="Upstream storage unavailable; retry later",
+            )
+        if completed == _POLL_VANISHED:
+            raise HTTPException(
+                status_code=409,
+                detail="Previous request did not complete; safe to retry",
+            )
+        assert isinstance(completed, dict)  # narrow for mypy after sentinel checks
+        if completed["request_hash"] != request_hash:
+            raise HTTPException(
+                status_code=422,
+                detail="Idempotency-Key reused with a different request body",
+            )
+        return IdempotencyGuard(tenant_id, namespaced_key, request_hash, cached=completed)
+
+    # Claim with a short pending-TTL. ``record()`` later extends to the
+    # full TTL on success. A crashed handler leaves the row pending only
+    # until ``idempotency_pending_ttl_seconds`` elapses; after that the
+    # expired-row reclaim path in ``idempotency_claim`` lets a fresh
+    # request take over the key automatically.
+    pending_expires_at = datetime.now(UTC) + timedelta(seconds=settings.idempotency_pending_ttl_seconds)
+    try:
+        claimed, existing = await sc.claim_idempotency(
+            tenant_id=tenant_id,
+            idempotency_key=namespaced_key,
+            request_hash=request_hash,
+            expires_at=pending_expires_at.isoformat(),
+        )
+    except Exception:
+        logger.warning("Idempotency claim failed (degrading to no-cache)", exc_info=True)
+        return IdempotencyGuard(tenant_id, namespaced_key, request_hash, cached=None)
+
+    if claimed:
+        return IdempotencyGuard(tenant_id, namespaced_key, request_hash, cached=None)
+
+    if existing and existing["request_hash"] != request_hash:
         raise HTTPException(
             status_code=422,
             detail="Idempotency-Key reused with a different request body",
         )
+    # Fast-path: the concurrent holder finished between our failed
+    # INSERT and our follow-up SELECT — the existing row is already
+    # complete and matches our hash. Skip the poll's GET roundtrip.
+    if existing and not existing.get("is_pending", True):
+        return IdempotencyGuard(tenant_id, namespaced_key, request_hash, cached=existing)
+    completed = await _poll_until_complete(sc, tenant_id, namespaced_key)
+    if completed is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Idempotency-Key still in progress; retry shortly",
+        )
+    if completed == _POLL_STORAGE_ERROR:
+        raise HTTPException(
+            status_code=503,
+            detail="Upstream storage unavailable; retry later",
+        )
+    if completed == _POLL_VANISHED:
+        raise HTTPException(
+            status_code=409,
+            detail="Previous request did not complete; safe to retry",
+        )
+    assert isinstance(completed, dict)  # narrow for mypy after sentinel checks
+    if completed["request_hash"] != request_hash:
+        raise HTTPException(
+            status_code=422,
+            detail="Idempotency-Key reused with a different request body",
+        )
+    return IdempotencyGuard(tenant_id, namespaced_key, request_hash, cached=completed)
 
-    return IdempotencyGuard(tenant_id, namespaced_key, request_hash, cached)
+
+async def _poll_until_complete(
+    sc: Any,
+    tenant_id: str,
+    namespaced_key: str,
+) -> dict | str | None:
+    """Poll ``get_idempotency`` until the row's ``is_pending`` is False
+    or the budget elapses.
+
+    Returns:
+    - the completed row dict on success
+    - ``_POLL_VANISHED``: the row no longer exists (cleanup-job
+      prune or expired pending TTL) — caller should tell the client
+      to retry as a fresh request
+    - ``_POLL_STORAGE_ERROR``: storage raised an exception (down,
+      timeout, network) — caller should respond 503
+    - ``None`` when the poll budget is exhausted while the row is
+      still pending — caller should tell the client to wait and retry
+
+    Checks first, sleeps after — a winner that finishes between the
+    initial cache hit and entry to this loop should be visible
+    immediately rather than after a guaranteed ``_CLAIM_POLL_INTERVAL``
+    delay.
+    """
+    for attempt in range(_CLAIM_POLL_MAX_ATTEMPTS):
+        try:
+            row = await sc.get_idempotency(tenant_id, namespaced_key)
+        except Exception:
+            logger.warning("Idempotency poll failed", exc_info=True)
+            return _POLL_STORAGE_ERROR
+        if row is None:
+            return _POLL_VANISHED
+        if not row.get("is_pending", False):
+            return row
+        # Skip the sleep on the final iteration — the next thing we'd
+        # do is exit the loop, so the wait would just add latency.
+        if attempt < _CLAIM_POLL_MAX_ATTEMPTS - 1:
+            await asyncio.sleep(_CLAIM_POLL_INTERVAL_SECONDS)
+    return None

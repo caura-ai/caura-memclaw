@@ -12,7 +12,15 @@ periodic job (tracked separately) prunes expired rows.
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Index, Integer, PrimaryKeyConstraint, Text, text
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Index,
+    Integer,
+    PrimaryKeyConstraint,
+    Text,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -41,4 +49,11 @@ class IdempotencyResponse(Base):
     )
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
+    )
+    # ``true`` while the handler is still running, flipped to ``false``
+    # by ``idempotency_record`` once the response body is durable.
+    # Closes the race where two concurrent requests with the same key
+    # both miss the cache and both execute the handler.
+    is_pending: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
     )

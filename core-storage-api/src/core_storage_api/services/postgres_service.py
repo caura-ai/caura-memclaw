@@ -2870,10 +2870,185 @@ class PostgresService:
             stmt = select(IdempotencyResponse).where(
                 IdempotencyResponse.tenant_id == tenant_id,
                 IdempotencyResponse.idempotency_key == idempotency_key,
-                IdempotencyResponse.expires_at > datetime.now(UTC),
+                # Match ``func.now()`` used by ``idempotency_claim``'s
+                # ON CONFLICT WHERE so the two paths agree on what
+                # "expired" means even when the app and DB clocks drift.
+                IdempotencyResponse.expires_at > func.now(),
             )
             result = await session.execute(stmt)
             return result.scalar_one_or_none()
+
+    async def idempotency_claim(
+        self,
+        *,
+        tenant_id: str,
+        idempotency_key: str,
+        request_hash: str,
+        expires_at: datetime,
+    ) -> IdempotencyResponse | None:
+        """Atomically claim ``(tenant_id, idempotency_key)`` for a new
+        request. Returns the freshly inserted (or reclaimed) row if the
+        caller won the race, ``None`` if a *live* row already existed.
+
+        Expired rows are reclaimed in place: the conflict triggers an
+        UPDATE only when ``expires_at`` is in the past. Without that
+        clause an expired-but-not-yet-pruned row would block fresh
+        claims indefinitely — ``idempotency_get`` filters expired rows
+        out, so the middleware would loop forever between "no cache"
+        and "claim conflicts" until the cleanup job pruned the row.
+
+        The claim row carries ``is_pending=True`` and an empty
+        ``response_body``. :meth:`idempotency_record` flips
+        ``is_pending`` to False once the handler completes.
+        """
+        async with get_session() as session:
+            stmt = (
+                pg_insert(IdempotencyResponse)
+                .values(
+                    tenant_id=tenant_id,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                    response_body={},
+                    status_code=0,
+                    expires_at=expires_at,
+                    is_pending=True,
+                )
+                .on_conflict_do_update(
+                    constraint="pk_idempotency_responses",
+                    set_={
+                        "request_hash": request_hash,
+                        "response_body": {},
+                        "status_code": 0,
+                        "expires_at": expires_at,
+                        "is_pending": True,
+                    },
+                    # ``func.now()`` evaluates against the DB clock, not the
+                    # app clock — avoids a row being treated as still-live
+                    # when the app and DB clocks have drifted.
+                    where=IdempotencyResponse.expires_at <= func.now(),
+                )
+                .returning(IdempotencyResponse)
+            )
+            # ``ON CONFLICT DO UPDATE WHERE`` either inserts a fresh row,
+            # reclaims an expired row, or returns nothing — the WHERE
+            # blocks the UPDATE on a live row, so RETURNING yields no
+            # rows. ``scalar_one_or_none`` cleanly maps that to None
+            # (caller must poll for the original request's completion).
+            result = await session.execute(stmt)
+            return result.scalar_one_or_none()
+
+    async def idempotency_record(
+        self,
+        *,
+        tenant_id: str,
+        idempotency_key: str,
+        request_hash: str,
+        response_body: dict,
+        status_code: int,
+        expires_at: datetime,
+    ) -> IdempotencyResponse:
+        """Persist the handler's response and clear ``is_pending``.
+
+        Optimistic about the prior :meth:`idempotency_claim` having
+        inserted the row: this is an UPDATE-by-(tenant, key, hash) first,
+        scoped to the still-pending claim. If no row exists (claim was
+        skipped, e.g. legacy callers calling ``upsert`` directly), falls
+        back to INSERT ON CONFLICT DO NOTHING and returns whichever row
+        wins. The ``request_hash`` filter ensures a late-arriving record
+        for an *expired* claim doesn't clobber a fresh claim that
+        reclaimed the slot — its UPDATE will match no rows and the
+        fallback INSERT will conflict against the new claim, returning
+        the new row's state.
+        """
+        async with get_session() as session:
+            update_stmt = (
+                sql_update(IdempotencyResponse)
+                .where(
+                    IdempotencyResponse.tenant_id == tenant_id,
+                    IdempotencyResponse.idempotency_key == idempotency_key,
+                    IdempotencyResponse.request_hash == request_hash,
+                    IdempotencyResponse.is_pending.is_(True),
+                )
+                .values(
+                    response_body=response_body,
+                    status_code=status_code,
+                    expires_at=expires_at,
+                    is_pending=False,
+                )
+                .returning(IdempotencyResponse)
+            )
+            result = await session.execute(update_stmt)
+            row = result.scalar_one_or_none()
+            if row is not None:
+                return row
+
+            insert_stmt = (
+                pg_insert(IdempotencyResponse)
+                .values(
+                    tenant_id=tenant_id,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                    response_body=response_body,
+                    status_code=status_code,
+                    expires_at=expires_at,
+                    is_pending=False,
+                )
+                .on_conflict_do_nothing(constraint="pk_idempotency_responses")
+                .returning(IdempotencyResponse)
+            )
+            result = await session.execute(insert_stmt)
+            row = result.scalar_one_or_none()
+            if row is not None:
+                return row
+
+            existing = await session.execute(
+                select(IdempotencyResponse).where(
+                    IdempotencyResponse.tenant_id == tenant_id,
+                    IdempotencyResponse.idempotency_key == idempotency_key,
+                )
+            )
+            row = existing.scalar_one_or_none()
+            if row is None:
+                # The cleanup job pruned the conflicting row between our
+                # INSERT (which got DO NOTHING because the row existed)
+                # and this SELECT. Vanishingly rare; raising explicitly
+                # gives a 500 with an actionable log line instead of a
+                # cryptic NoResultFound traceback.
+                raise RuntimeError(
+                    f"idempotency row ({tenant_id!r}, {idempotency_key!r}) "
+                    "vanished between INSERT conflict and SELECT — "
+                    "likely pruned by the cleanup job mid-request"
+                )
+            if row.is_pending:
+                # Expiry-reclaim race: our (slow) handler's pending row
+                # expired, a fresh request reclaimed the slot with a
+                # different hash, and now WE try to record a response
+                # against a slot that's no longer ours. The UPDATE
+                # missed (hash mismatch in the WHERE), the INSERT
+                # conflicted, and the SELECT returned the new claim's
+                # pending row (status_code=0, is_pending=True). Returning
+                # that to the caller would silently cache zero-state
+                # data; raise loudly so the middleware's outer
+                # try/except degrades to no-cache instead.
+                raise RuntimeError(
+                    f"idempotency row ({tenant_id!r}, {idempotency_key!r}) "
+                    "is still pending under a different claim — the original "
+                    "pending TTL likely elapsed and the slot was reclaimed"
+                )
+            if row.request_hash != request_hash:
+                # Same expiry-reclaim shape as above but the new claim
+                # already finished. The SELECT has no ``request_hash``
+                # filter (it can't — the new claim's hash is unknown
+                # ahead of time), so silently returning would cache the
+                # OTHER request's response under the original caller's
+                # hash. Raise so the caller sees a clear failure rather
+                # than a wrong-data replay.
+                raise RuntimeError(
+                    f"idempotency row ({tenant_id!r}, {idempotency_key!r}) "
+                    "holds a different request hash — slot reclaimed by a "
+                    "fresh request that completed before our record() arrived"
+                )
+            return row
 
     async def idempotency_upsert(
         self,
@@ -2885,31 +3060,18 @@ class PostgresService:
         status_code: int,
         expires_at: datetime,
     ) -> IdempotencyResponse:
-        """Insert a new idempotency record. On conflict, returns the
-        existing row unchanged — two concurrent writes to the same key
-        can't overwrite each other's response.
+        """Backwards-compatible alias for :meth:`idempotency_record`.
+
+        Existing callers that do single-shot upsert without a prior
+        claim continue to work. New code should use the
+        ``claim`` + ``record`` pair to close the concurrent-handler
+        race window.
         """
-        async with get_session() as session:
-            # DO UPDATE SET x=x is a no-op that keeps the existing row
-            # intact but makes RETURNING fire on conflict too — saves
-            # a second SELECT vs DO NOTHING, and preserves the first
-            # writer's response_body (DO NOTHING + re-SELECT has the
-            # same semantics but with an extra round-trip).
-            stmt = (
-                pg_insert(IdempotencyResponse)
-                .values(
-                    tenant_id=tenant_id,
-                    idempotency_key=idempotency_key,
-                    request_hash=request_hash,
-                    response_body=response_body,
-                    status_code=status_code,
-                    expires_at=expires_at,
-                )
-                .on_conflict_do_update(
-                    constraint="pk_idempotency_responses",
-                    set_={"tenant_id": IdempotencyResponse.tenant_id},
-                )
-                .returning(IdempotencyResponse)
-            )
-            result = await session.execute(stmt)
-            return result.scalar_one()
+        return await self.idempotency_record(
+            tenant_id=tenant_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            response_body=response_body,
+            status_code=status_code,
+            expires_at=expires_at,
+        )

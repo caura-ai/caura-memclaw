@@ -133,6 +133,7 @@ IDEMPOTENCY_RESPONSE_FIELDS: list[str] = [
     "status_code",
     "created_at",
     "expires_at",
+    "is_pending",
 ]
 
 FLEET_NODE_FIELDS: list[str] = [

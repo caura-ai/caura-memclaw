@@ -794,6 +794,53 @@ class CoreStorageClient:
             idempotency_key=idempotency_key,
         )
 
+    async def claim_idempotency(
+        self,
+        *,
+        tenant_id: str,
+        idempotency_key: str,
+        request_hash: str,
+        expires_at: str,
+    ) -> tuple[bool, dict | None]:
+        """Try to claim ``(tenant_id, idempotency_key)``.
+
+        Returns ``(True, row)`` if the caller won the race and should
+        proceed with the handler. Returns ``(False, existing_row_or_None)``
+        when another caller already holds the key — caller polls
+        :meth:`get_idempotency` until the existing row's ``is_pending``
+        flips to False. Existing row may be ``None`` if it expired
+        between the conflicting INSERT and our follow-up SELECT.
+        """
+        headers = await self._auth_headers(read=False)
+        resp = await self._http.post(
+            f"{self._prefix}/idempotency/claim",
+            json={
+                "tenant_id": tenant_id,
+                "idempotency_key": idempotency_key,
+                "request_hash": request_hash,
+                "expires_at": expires_at,
+            },
+            headers=headers,
+        )
+        self._maybe_evict_on_auth_error(resp, read=False)
+        if resp.status_code == 201:
+            return True, resp.json()
+        if resp.status_code == 409:
+            body = resp.json()
+            # Storage-api signals row presence via an explicit ``found``
+            # field on the 409 body so we don't infer it from incidental
+            # keys (the previous ``"tenant_id" in body`` check would
+            # silently break the moment the error body gained a
+            # tenant_id field). ``found is False`` only on the
+            # vanished-row branch; a real conflicting row sets
+            # ``found: True`` alongside the row payload.
+            return False, body if body.get("found") is not False else None
+        # Any status not caught above propagates as ``HTTPStatusError``.
+        resp.raise_for_status()
+        # Unreachable — included so mypy sees a return path matching
+        # the declared ``tuple[bool, dict | None]`` signature.
+        return False, None  # pragma: no cover
+
     async def upsert_idempotency(
         self,
         *,

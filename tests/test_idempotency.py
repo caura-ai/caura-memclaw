@@ -8,8 +8,12 @@ services). Each scenario:
 - conflict: same key + different body → 422
 - fresh: no key → writes normally
 - TTL expiry: expired rows treated as absent (manual time-warp)
+- concurrent claim: simultaneous POSTs with the same key resolve to one
+  memory row (closes the race documented in the middleware before
+  this fix shipped)
 """
 
+import asyncio
 import uuid
 
 import pytest
@@ -339,6 +343,84 @@ async def test_header_takes_precedence_over_body_key(client):
     assert r1.status_code == 201
     assert r2.status_code == 201
     assert r1.json()["id"] == r2.json()["id"]
+
+
+async def test_concurrent_same_key_returns_same_id(client):
+    """Two POSTs fired in parallel with the same Idempotency-Key must
+    resolve to the same memory id — the loser polls for the winner's
+    response rather than creating a duplicate row.
+
+    A throwaway warm-up write pre-creates the agent row so the two
+    parallel writes below don't race on ``agent_add`` — that path has
+    a separate latent bug (a session ``rollback()`` inside the
+    ``IntegrityError`` handler that closes the outer transaction)
+    which is orthogonal to the idempotency claim race this test is
+    guarding.
+    """
+    tenant_id, headers = get_test_auth()
+    agent_id = f"idem-race-{uid()}"
+    # Warm-up: ensure the agent row exists so the parallel writes below
+    # can't both try to ``INSERT`` it concurrently.
+    warm = {
+        "tenant_id": tenant_id,
+        "agent_id": agent_id,
+        "memory_type": "fact",
+        "content": f"warm-up agent {uid()}",
+    }
+    warm_resp = await client.post("/api/v1/memories", json=warm, headers=headers)
+    assert warm_resp.status_code == 201, warm_resp.text
+
+    key = _new_key()
+    body = {
+        "tenant_id": tenant_id,
+        "agent_id": agent_id,
+        "memory_type": "fact",
+        "content": f"concurrent content {uid()}",
+    }
+    h = {**headers, "Idempotency-Key": key}
+
+    r1, r2 = await asyncio.gather(
+        client.post("/api/v1/memories", json=body, headers=h),
+        client.post("/api/v1/memories", json=body, headers=h),
+    )
+
+    assert r1.status_code == 201
+    assert r2.status_code == 201
+    assert r1.json()["id"] == r2.json()["id"]
+
+
+async def test_expired_row_does_not_block_fresh_claim(client, sc):
+    """An expired row with the same key must be reclaimable.
+
+    Without ON CONFLICT DO UPDATE WHERE expires_at <= now() the claim
+    INSERT conflicts on the PK, ``idempotency_get`` filters the expired
+    row out, and the middleware loops between "no cache" and "claim
+    failed" until the cleanup job prunes the row.
+    """
+    tenant_id, headers = get_test_auth()
+    key = _new_key()
+
+    # Seed an expired row directly via storage_client. Namespacing prefix
+    # matches what the middleware writes (``header:<key>``).
+    await sc.upsert_idempotency(
+        tenant_id=tenant_id,
+        idempotency_key=f"header:{key}",
+        request_hash="stale-hash",
+        response_body={"stale": True},
+        status_code=201,
+        expires_at="2000-01-01T00:00:00+00:00",
+    )
+
+    body = {
+        "tenant_id": tenant_id,
+        "agent_id": f"idem-expired-{uid()}",
+        "memory_type": "fact",
+        "content": f"reclaim content {uid()}",
+    }
+    h = {**headers, "Idempotency-Key": key}
+    resp = await client.post("/api/v1/memories", json=body, headers=h)
+    assert resp.status_code == 201
+    assert resp.json()["content"] == body["content"]
 
 
 async def test_replay_respects_tenant_scoping(client, sc):
