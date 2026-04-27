@@ -353,7 +353,7 @@ class PostgresService:
                 memory.deleted_at = datetime.now(UTC)
                 memory.status = "deleted"
 
-    async def memory_update(self, memory_id: UUID, patch: dict) -> None:
+    async def memory_update(self, memory_id: UUID, patch: dict) -> bool:
         """Apply arbitrary field updates to a memory.
 
         Two patch shapes are supported in the same request:
@@ -369,9 +369,17 @@ class PostgresService:
 
         Other top-level keys whose names don't match a ``Memory`` column
         are silently dropped — callers validate upstream.
+
+        Returns ``True`` when the row exists and is live (the patch was
+        applied or was a no-op due to all-unknown keys); ``False`` when
+        the row is absent or soft-deleted, which the route turns into
+        404. Both UPDATE branches run inside a single
+        ``SELECT ... FOR UPDATE`` snapshot so a concurrent
+        ``memory_soft_delete`` can't commit between them and leave the
+        row in a torn state (status updated, metadata not, or vice
+        versa) — the bare per-statement ``deleted_at IS NULL`` guard
+        wasn't enough on its own under READ COMMITTED.
         """
-        if not patch:
-            return
         metadata_patch = patch.get("metadata_patch") if isinstance(patch, dict) else None
         # Map JSON keys to model columns. ``metadata_patch`` is handled
         # via a separate JSONB-merge statement below; skip it here so it
@@ -379,15 +387,54 @@ class PostgresService:
         values: dict = {
             key: val for key, val in patch.items() if key != "metadata_patch" and hasattr(Memory, key)
         }
-        # Early-return when the caller's patch contained only unknown
-        # keys — opening a session burns a connection-pool slot for no
-        # work. The pre-CAURA-595 shape gated the session on ``if
-        # values:`` for the same reason.
-        if not values and not metadata_patch:
-            return
         async with get_session() as session:
+            # Existence check FIRST — runs even on empty / all-unknown-
+            # keys patches so a PATCH on an absent or soft-deleted row
+            # consistently returns 404 regardless of body shape. Pre-
+            # this-change the no-op paths (empty body, all-unknown
+            # keys) short-circuited with ``return True`` and the route
+            # answered 200, so a deleted row could absorb a "successful"
+            # no-op PATCH that depended only on whether the body
+            # carried recognised columns.
+            #
+            # ``SELECT ... FOR UPDATE`` locks the row so the two UPDATE
+            # branches below run inside one snapshot: a concurrent soft
+            # DELETE blocks until this transaction commits or rolls
+            # back, eliminating the column-set-but-not-metadata torn
+            # state under READ COMMITTED.
+            #
+            # ``id, deleted_at`` come back as a tuple so "row absent"
+            # (None tuple) and "row exists, deleted_at IS NULL" (live)
+            # are distinguishable — ``scalar_one_or_none`` on
+            # ``deleted_at`` alone would collapse both into None.
+            row = (
+                await session.execute(
+                    select(Memory.id, Memory.deleted_at).where(Memory.id == memory_id).with_for_update()
+                )
+            ).first()
+            if row is None:
+                return False  # row truly absent — caller → 404
+            if row.deleted_at is not None:
+                return False  # soft-deleted — caller → 404, no UPDATE runs
+
+            # No-op patches on a live row are valid: existence check
+            # already passed, so report success without burning UPDATEs.
+            # Worth the SELECT roundtrip cost (rate-limited PATCH route
+            # bounds it) for the consistent 404-on-absent contract.
+            if not patch or (not values and not metadata_patch):
+                return True
+
+            # ``deleted_at IS NULL`` predicate stays on each UPDATE
+            # even though the FOR UPDATE lock above already gates this
+            # path; it's belt-and-suspenders against a future change
+            # that splits the lock and the UPDATEs into separate
+            # sessions.
             if values:
-                await session.execute(sql_update(Memory).where(Memory.id == memory_id).values(**values))
+                await session.execute(
+                    sql_update(Memory)
+                    .where(Memory.id == memory_id, Memory.deleted_at.is_(None))
+                    .values(**values)
+                )
             if metadata_patch:
                 # Single-statement JSONB merge — concurrent merges are
                 # last-writer-wins per key but never corrupt the doc.
@@ -406,13 +453,18 @@ class PostgresService:
                 # The cast is a no-op when the column is already
                 # ``jsonb`` and a one-time conversion when it isn't —
                 # cheap either way relative to the network round-trip.
+                #
+                # ``deleted_at IS NULL`` guard mirrors the column-set
+                # branch above so a PATCH never resurrects a deleted
+                # row via the metadata-merge path either.
                 await session.execute(
                     text(
                         "UPDATE memories "
                         "SET metadata = COALESCE(metadata::jsonb, '{}'::jsonb) || (:patch)::jsonb "
-                        "WHERE id = :id"
+                        "WHERE id = :id AND deleted_at IS NULL"
                     ).bindparams(patch=json.dumps(metadata_patch), id=memory_id),
                 )
+        return True
 
     async def memory_update_status(self, memory_id: UUID, status: str) -> None:
         async with get_session() as session:

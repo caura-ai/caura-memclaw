@@ -541,8 +541,20 @@ async def update_memory(memory_id: UUID, request: Request) -> dict:
     # core-api, future tooling) get the same coercion at the API
     # boundary.
     _parse_datetimes(body)
-    if body:
-        await _svc.memory_update(memory_id, body)
+    # No empty-body short-circuit here: ``memory_update`` runs the
+    # existence check first and returns False for absent/soft-deleted
+    # rows regardless of whether the body has actionable columns. An
+    # earlier short-circuit would let a PATCH ``{}`` on a deleted row
+    # answer 200 — inconsistent with the 404 the same row gets on a
+    # non-empty PATCH.
+    found = await _svc.memory_update(memory_id, body or {})
+    if not found:
+        # Pre-this-fix the route returned ``200 {"ok": True}`` regardless
+        # of whether the row was missing or soft-deleted, so a PATCH on
+        # a deleted memory looked successful to the caller while
+        # silently no-op'ing. Surface as 404 so clients can distinguish
+        # "applied" from "ignored because the row is gone."
+        raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
     return {"ok": True}
 
 

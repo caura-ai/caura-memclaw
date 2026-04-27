@@ -289,6 +289,68 @@ class TestMemories:
         assert fetched["deleted_at"] is not None
         assert fetched["status"] == "deleted"
 
+    async def test_patch_after_delete_does_not_resurrect(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        """A PATCH that lands after a soft DELETE must no-op against
+        the deleted row AND surface as 404 to the caller, not silently
+        resurrect or fake-success.
+
+        Pre-fix the UPDATE statement filtered only by ``Memory.id``, so
+        a PATCH with ``status="active"`` on a deleted row would set
+        ``status`` without touching ``deleted_at`` — the row showed
+        ``status='active', deleted_at=<ts>``, an inconsistent state.
+        The fix combines a ``SELECT ... FOR UPDATE`` snapshot lock
+        (atomicity across both UPDATE branches), a per-statement
+        ``deleted_at IS NULL`` predicate (defence in depth), and a 404
+        response so callers can distinguish "applied" from "row is
+        gone" rather than always seeing ``200 {"ok": True}``.
+        """
+        payload = _memory_payload(tenant_id, fleet_id)
+        mem = (await client.post(f"{PREFIX}/memories", json=payload)).json()
+        memory_id = mem["id"]
+
+        # 1. Soft-delete the row.
+        await client.delete(f"{PREFIX}/memories/{memory_id}")
+
+        # 2. PATCH it. Both the column-set branch (status) and the
+        # metadata-merge branch (metadata_patch) must no-op, and the
+        # route must surface 404.
+        resp = await client.patch(
+            f"{PREFIX}/memories/{memory_id}",
+            json={"status": "active", "metadata_patch": {"resurrect_attempt": True}},
+        )
+        assert resp.status_code == 404, resp.text
+
+        # 3. Re-read: deleted_at is still set, status is still 'deleted',
+        # metadata is unchanged.
+        after = (await client.get(f"{PREFIX}/memories/{memory_id}")).json()
+        assert after["deleted_at"] is not None
+        assert after["status"] == "deleted"
+        assert (after.get("metadata") or {}).get("resurrect_attempt") is None
+
+    async def test_patch_on_nonexistent_memory_returns_404(
+        self,
+        client: AsyncClient,
+    ) -> None:
+        """PATCH on a memory_id that never existed must surface 404 too,
+        not the legacy ``200 {"ok": True}`` silent success.
+
+        Pre-fix this returned 200 because ``memory_update`` issued an
+        UPDATE that matched zero rows and the route ignored the
+        rowcount. Locked here so a future change can't quietly
+        regress to silent-success.
+        """
+        fake_id = str(uuid.uuid4())
+        resp = await client.patch(
+            f"{PREFIX}/memories/{fake_id}",
+            json={"status": "active"},
+        )
+        assert resp.status_code == 404, resp.text
+
     async def test_bulk_per_attempt_idempotency(
         self,
         client: AsyncClient,
