@@ -1328,7 +1328,13 @@ class PostgresService:
             avg_recall = r.scalar()
             avg_recall = round(float(avg_recall), 2) if avg_recall is not None else 0.0
 
+            # ``total`` is duplicated under both keys for compatibility:
+            # ``total_memories`` was the original field; ``total`` matches the
+            # core-api stats response shape so callers that hit this endpoint
+            # directly (or via storage_client.get_memory_stats fallback) don't
+            # need to know about the rename.
             return {
+                "total": total,
                 "total_memories": total,
                 "embedding_coverage_pct": embedding_pct,
                 "type_distribution": type_dist,

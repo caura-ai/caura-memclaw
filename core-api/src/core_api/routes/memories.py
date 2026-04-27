@@ -3,14 +3,17 @@ import time
 from datetime import UTC, datetime
 from uuid import UUID
 
+import httpx
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select, tuple_
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as SQLATimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.models.memory import Memory
 from core_api.auth import AuthContext, get_auth_context
+from core_api.clients.storage_client import get_storage_client
 from core_api.constants import DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT
 from core_api.db.session import get_db
 from core_api.middleware.idempotency import (
@@ -57,6 +60,59 @@ from core_api.services.usage_service import bulk_check_and_increment, check_and_
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Memory"])
+
+
+async def _stats_fallback(tenant_id: str, fleet_id: str | None) -> dict:
+    """Map storage-api's ``memory_compute_health_stats`` shape onto the
+    flat ``{total, by_type, by_agent, by_status}`` shape both stats
+    endpoints return. ``by_agent`` is empty because storage-api doesn't
+    compute it; ``partial: True`` flags the degradation so callers can
+    distinguish a real empty tenant from a degraded response.
+
+    The two stats routes return bare dicts (no ``response_model``), so
+    the ``partial`` field survives FastAPI serialisation. If a
+    ``response_model`` is added later, include ``partial`` in the schema
+    or the degradation signal will be silently stripped.
+    """
+    try:
+        fallback = await get_storage_client().get_memory_stats(tenant_id=tenant_id, fleet_id=fleet_id)
+    except httpx.HTTPError as exc:
+        # Storage-api is also down. Without this catch the httpx
+        # exception would propagate through the route's ``except`` block
+        # as a 500 with raw internal detail (storage-api URL, etc.).
+        logger.warning(
+            "memory_stats fallback: storage-api request failed",
+            extra={"tenant_id": tenant_id, "fleet_id": fleet_id, "error": str(exc)},
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="memory stats unavailable: primary DB and storage-api fallback both failed",
+        ) from None
+    if not fallback:
+        # ``storage_client._get`` returns ``{}`` on 404 (treated as
+        # absent). The httpx-error case is handled above. So an empty
+        # ``fallback`` here means storage-api 404'd, but since we got
+        # here only because the primary DB blew up, we can't tell a
+        # real empty tenant from a storage-api hiccup. 503 surfaces the
+        # cascading failure instead of returning a plausible-looking
+        # ``total: 0`` to a live tenant.
+        logger.warning(
+            "memory_stats fallback: storage-api returned 404 or empty response "
+            "(cannot distinguish empty tenant from cascading failure)",
+            extra={"tenant_id": tenant_id, "fleet_id": fleet_id},
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="memory stats unavailable: primary DB and storage-api fallback both failed",
+        ) from None
+    return {
+        "total": fallback.get("total", fallback.get("total_memories", 0)),
+        "by_type": fallback.get("type_distribution", {}),
+        "by_agent": {},
+        "by_status": fallback.get("status_distribution", {}),
+        "partial": True,
+    }
 
 
 @router.get("/tenants")
@@ -221,28 +277,65 @@ async def memory_stats(
         filters.append(Memory.status == status)
     base = select(Memory).where(*filters)
 
-    total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar()
-    by_type = dict(
-        (
-            await db.execute(
-                select(Memory.memory_type, func.count()).where(*filters).group_by(Memory.memory_type)
+    try:
+        total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar()
+        by_type = dict(
+            (
+                await db.execute(
+                    select(Memory.memory_type, func.count()).where(*filters).group_by(Memory.memory_type)
+                )
+            ).all()
+        )
+        by_agent = dict(
+            (
+                await db.execute(
+                    select(Memory.agent_id, func.count()).where(*filters).group_by(Memory.agent_id)
+                )
+            ).all()
+        )
+        by_status = dict(
+            (
+                await db.execute(select(Memory.status, func.count()).where(*filters).group_by(Memory.status))
+            ).all()
+        )
+        return {
+            "total": total,
+            "by_type": by_type,
+            "by_agent": by_agent,
+            "by_status": by_status,
+        }
+    except (OperationalError, SQLATimeoutError):
+        # Connection pool exhaustion / connection drop / per-query timeout
+        # are the transient failure modes worth degrading for. Programming
+        # errors (ProgrammingError, IntegrityError, DataError) keep
+        # bubbling so they surface as 500s. ``warning`` not ``exception``
+        # so a sustained pool-exhaustion event doesn't flood logs with
+        # full tracebacks at ERROR; ``exc_info=True`` keeps the traceback
+        # for diagnosis. Fallback can only honour tenant_id+fleet_id (the
+        # filters storage-api accepts); if the caller asked for an
+        # agent_id/memory_type/status subset, returning unfiltered
+        # tenant-wide stats would lie to them — re-raise instead.
+        if not tenant_id or agent_id or memory_type or status:
+            # ``OperationalError`` / ``SQLATimeoutError`` are transient
+            # pool-exhaustion / connection-drop / per-query timeout
+            # conditions — surface as 503 so load balancers and clients
+            # treat them as retryable. A bare ``raise`` would default
+            # to 500 and trip alerting rules sized for programming
+            # bugs.
+            logger.warning(
+                "memory_stats: direct DB query failed; raising 503 "
+                "(unsupported filters or missing tenant_id)",
+                exc_info=True,
             )
-        ).all()
-    )
-    by_agent = dict(
-        (
-            await db.execute(select(Memory.agent_id, func.count()).where(*filters).group_by(Memory.agent_id))
-        ).all()
-    )
-    by_status = dict(
-        (await db.execute(select(Memory.status, func.count()).where(*filters).group_by(Memory.status))).all()
-    )
-    return {
-        "total": total,
-        "by_type": by_type,
-        "by_agent": by_agent,
-        "by_status": by_status,
-    }
+            raise HTTPException(
+                status_code=503,
+                detail="memory stats unavailable: database connection failed",
+            ) from None
+        logger.warning(
+            "memory_stats: direct DB query failed; falling back to storage-api",
+            exc_info=True,
+        )
+        return await _stats_fallback(tenant_id, fleet_id)
 
 
 @router.delete("/memories", status_code=204)
@@ -1134,25 +1227,52 @@ async def admin_memory_stats(
         filters.append(Memory.fleet_id == fleet_id)
     base = select(Memory).where(*filters)
 
-    total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar()
-    by_type = dict(
-        (
-            await db.execute(
-                select(Memory.memory_type, func.count()).where(*filters).group_by(Memory.memory_type)
+    try:
+        total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar()
+        by_type = dict(
+            (
+                await db.execute(
+                    select(Memory.memory_type, func.count()).where(*filters).group_by(Memory.memory_type)
+                )
+            ).all()
+        )
+        by_agent = dict(
+            (
+                await db.execute(
+                    select(Memory.agent_id, func.count()).where(*filters).group_by(Memory.agent_id)
+                )
+            ).all()
+        )
+        by_status = dict(
+            (
+                await db.execute(select(Memory.status, func.count()).where(*filters).group_by(Memory.status))
+            ).all()
+        )
+        return {
+            "total": total,
+            "by_type": by_type,
+            "by_agent": by_agent,
+            "by_status": by_status,
+        }
+    except (OperationalError, SQLATimeoutError):
+        # Same transient-only fallback as the tenant-facing /memories/stats
+        # above. ``warning`` (not ``exception``) avoids log floods under
+        # sustained pool exhaustion. The admin endpoint cannot pass an
+        # unbounded tenant_id to storage-api (storage_client requires
+        # one), so the cross-tenant case has no fallback path and
+        # re-raises.
+        if not tenant_id:
+            logger.warning(
+                "admin_memory_stats: direct DB query failed; raising 503 "
+                "(cross-tenant admin call has no fallback path)",
+                exc_info=True,
             )
-        ).all()
-    )
-    by_agent = dict(
-        (
-            await db.execute(select(Memory.agent_id, func.count()).where(*filters).group_by(Memory.agent_id))
-        ).all()
-    )
-    by_status = dict(
-        (await db.execute(select(Memory.status, func.count()).where(*filters).group_by(Memory.status))).all()
-    )
-    return {
-        "total": total,
-        "by_type": by_type,
-        "by_agent": by_agent,
-        "by_status": by_status,
-    }
+            raise HTTPException(
+                status_code=503,
+                detail="memory stats unavailable: database connection failed",
+            ) from None
+        logger.warning(
+            "admin_memory_stats: direct DB query failed; falling back to storage-api",
+            exc_info=True,
+        )
+        return await _stats_fallback(tenant_id, fleet_id)
