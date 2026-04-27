@@ -9,6 +9,7 @@
   <a href="https://github.com/caura-ai/caura-memclaw/stargazers"><img src="https://img.shields.io/github/stars/caura-ai/caura-memclaw?style=social" alt="GitHub Stars" /></a>
   <a href="https://github.com/caura-ai/caura-memclaw/actions"><img src="https://img.shields.io/github/actions/workflow/status/caura-ai/caura-memclaw/ci.yml?label=CI" alt="CI" /></a>
   <a href="https://github.com/caura-ai/caura-memclaw/releases"><img src="https://img.shields.io/github/v/release/caura-ai/caura-memclaw" alt="Release" /></a>
+  <a href="https://discord.com/invite/aNfpgfpj"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Join us on Discord" /></a>
 </p>
 
 <p align="center">
@@ -17,7 +18,8 @@
   <a href="#mcp-model-context-protocol">MCP</a> &middot;
   <a href="#api-reference">API Reference</a> &middot;
   <a href="static/docs/integration-guide.md">Plugin Docs</a> &middot;
-  <a href="CONTRIBUTING.md">Contributing</a>
+  <a href="CONTRIBUTING.md">Contributing</a> &middot;
+  <a href="https://discord.com/invite/aNfpgfpj">Discord</a>
 </p>
 
 ---

@@ -4,7 +4,7 @@ How you reach us depends on what you need.
 
 ## Usage questions and discussion
 
-For "how do I…", architecture sanity-checks, capacity questions, sharing what you built, or open-ended brainstorming — use [Discussions](https://github.com/caura-ai/caura-memclaw/discussions) instead of the issue tracker. The issue tracker is reserved for actionable bug reports and concrete feature proposals.
+For "how do I…", architecture sanity-checks, capacity questions, sharing what you built, or open-ended brainstorming — use [Discussions](https://github.com/caura-ai/caura-memclaw/discussions) or chat with us on [Discord](https://discord.com/invite/aNfpgfpj). The issue tracker is reserved for actionable bug reports and concrete feature proposals.
 
 ## Bug reports
 
