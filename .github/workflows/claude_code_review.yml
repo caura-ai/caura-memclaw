@@ -1,9 +1,19 @@
 # Claude Code Review
 #
-# Runs automatically when a PR is opened/reopened.
-# Re-trigger after pushing changes by commenting "@claude" on the PR.
+# Runs automatically when a PR is opened/reopened by a public member of
+# the ``caura-ai`` organization. Re-trigger after pushing changes by
+# commenting "@claude" on the PR (also restricted to org members).
 #
-# Only users with write access to the repo can trigger @claude reviews.
+# Why org-only: this workflow consumes ``ANTHROPIC_API_KEY`` and burns
+# real budget per review. ``pull_request`` events from forks don't
+# receive secrets anyway (GitHub strips them); restricting to org
+# members makes the policy explicit and stops fork PRs from triggering
+# silent-failure runs.
+#
+# The check uses ``author_association == 'MEMBER' | 'OWNER'``. Org
+# members with PRIVATE membership show as ``NONE`` and will be
+# skipped — they need to make their org membership public to use
+# the bot.
 
 name: Claude Code Review
 
@@ -59,7 +69,15 @@ env:
 
 jobs:
   pre-checks:
-    if: github.event_name == 'pull_request'
+    # Gate pre-checks on org membership too — otherwise the
+    # "Log skip reason" step posts a misleading
+    # ``Claude Code Review — skipped: ...`` comment on
+    # non-org-member PRs that the review was never going to
+    # run for anyway.
+    if: >-
+      github.event_name == 'pull_request'
+      && (github.event.pull_request.author_association == 'MEMBER'
+          || github.event.pull_request.author_association == 'OWNER')
     runs-on: ubuntu-latest
     outputs:
       skip: ${{ steps.decide.outputs.skip }}
@@ -130,7 +148,13 @@ jobs:
           gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
             -f body="**Claude Code Review** — skipped: ${REASON}" 2>/dev/null || true
 
-  # Runs on PR opened/reopened via claude-code-action (review mode)
+  # Runs on PR opened/reopened via claude-code-action (review mode).
+  # Gated on org membership transitively through ``pre-checks``: when
+  # ``pre-checks`` skips a non-member PR, ``needs.pre-checks.result``
+  # is ``'skipped'`` (not ``'success'``), so the ``== 'success'`` clause
+  # below already short-circuits this job. Don't re-check
+  # ``author_association`` here — keeping the gate in one place avoids
+  # the two conditions drifting out of sync.
   claude-review:
     needs: pre-checks
     if: >-
@@ -203,7 +227,7 @@ jobs:
             fi
           fi
 
-  # Runs on @claude comment — only for users with write access to the repo
+  # Runs on @claude comment — only for public org members (MEMBER or OWNER).
   claude-retrigger:
     if: >-
       github.event_name == 'issue_comment'
@@ -214,20 +238,33 @@ jobs:
       pull-requests: write
       issues: write
     steps:
-      - name: Check user has repo write access
+      - name: Check commenter is org member
         id: auth
         env:
-          GH_TOKEN: ${{ github.token }}
+          AUTHOR_ASSOC: ${{ github.event.comment.author_association }}
+          COMMENTER: ${{ github.event.comment.user.login }}
         run: |
-          COMMENTER="${{ github.event.comment.user.login }}"
-          REPO="${{ github.repository }}"
-          PERMISSION=$(gh api "repos/${REPO}/collaborators/${COMMENTER}/permission" --jq '.permission')
-          if [[ "$PERMISSION" == "admin" || "$PERMISSION" == "write" ]]; then
-            echo "authorized=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "authorized=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::@claude triggered by ${COMMENTER} (permission: ${PERMISSION}) — skipping, write access required"
-          fi
+          # ``author_association`` is set by GitHub on the event payload
+          # and reflects the commenter's relationship to the repo's
+          # owner organization. ``MEMBER`` = public org member,
+          # ``OWNER`` = org owner. PRIVATE org members surface as
+          # ``NONE`` — see header comment for the workaround.
+          #
+          # ``COLLABORATOR`` (non-org members granted direct repo write
+          # access via Settings → Collaborators) is INTENTIONALLY
+          # excluded — the policy is "members of our org only", which
+          # is stricter than the previous ``write``/``admin`` permission
+          # check. If a future operator wants to widen this, do it
+          # explicitly; do not "fix" it back as a presumed bug.
+          case "$AUTHOR_ASSOC" in
+            MEMBER|OWNER)
+              echo "authorized=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "authorized=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::@claude triggered by ${COMMENTER} (author_association: ${AUTHOR_ASSOC}) — skipping, org membership required"
+              ;;
+          esac
 
       - name: Get PR details
         if: steps.auth.outputs.authorized == 'true'
