@@ -129,6 +129,17 @@ class Settings(BaseSettings):
     # aligned with the single-write path (2/s * 100 = 200/s vs 10/s single).
     rate_limit_write_bulk: str = "2/second"
     rate_limit_search: str = "30/second"
+    # Per-tenant in-flight concurrency caps (see
+    # ``middleware/per_tenant_concurrency.py`` for full rationale).
+    # Per-instance state — fleet-wide cap is roughly
+    # ``cap * max_instances``.
+    per_tenant_search_concurrency: int = 8
+    per_tenant_write_concurrency: int = 4
+    # Fail-fast budget when the cap is exhausted. Long enough to absorb
+    # a benign race between two near-simultaneous arrivals; short
+    # enough that real exhaustion fails before the request hits the
+    # worker.
+    per_tenant_acquire_timeout_seconds: float = 0.05
     # Idempotency-Key inbox TTL. 24h matches Stripe's default and is
     # longer than any realistic client retry budget. Cached responses
     # older than this are treated as absent and the request re-runs.

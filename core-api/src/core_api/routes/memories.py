@@ -18,9 +18,11 @@ from core_api.constants import DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT
 from core_api.db.session import get_db
 from core_api.middleware.idempotency import (
     IDEMPOTENCY_HEADER,
+    IdempotencyGuard,
     idempotency_for,
     idempotency_key_from_metadata,
 )
+from core_api.middleware.per_tenant_concurrency import per_tenant_slot
 from core_api.middleware.rate_limit import search_limit, write_bulk_limit, write_limit
 from core_api.pagination import decode_cursor, encode_cursor, paginated_order_by
 from core_api.schemas import (
@@ -646,6 +648,45 @@ async def write_memory(
     auth.enforce_read_only()
     auth.enforce_usage_limits()
     auth.enforce_tenant(body.tenant_id)
+    # Idempotency replay is short-circuited BEFORE the per-tenant slot —
+    # a cached retry must not consume a write-concurrency slot, or a
+    # tenant retry storm starves its own legitimate new writes.
+    # ``idempotency_for`` handles transport-prefixing (``header:`` /
+    # ``body:``) and length validation; each transport gets a disjoint
+    # cache namespace.
+    if idempotency_key:
+        _idem = await idempotency_for(request, body.tenant_id, idempotency_key, source="header")
+    else:
+        _idem = await idempotency_for(
+            request,
+            body.tenant_id,
+            idempotency_key_from_metadata(body.metadata),
+            source="body",
+        )
+    if _idem and (_replay := _idem.cached_replay):
+        _body, _status = _replay
+        # Replays bypass the per-tenant slot AND the
+        # ``check_and_increment`` quota call below, so ``response.headers``
+        # is empty here — emit no rate-limit headers rather than
+        # passing empties. Acceptable trade-off: a replayed request
+        # didn't consume quota, so there's no fresh ``remaining`` value
+        # to publish.
+        return JSONResponse(content=_body, status_code=_status)
+    # Per-tenant in-flight cap fails fast with 429 if a single tenant is
+    # already saturating its slot budget on this instance, instead of
+    # queueing requests until they time out at the worker layer. Only
+    # the new-write path is gated; replays returned above bypass it.
+    async with per_tenant_slot("write", body.tenant_id):
+        return await _write_memory_inner(body, response, auth, db, _idem)
+
+
+async def _write_memory_inner(
+    body: MemoryCreate,
+    response: Response,
+    auth: AuthContext,
+    db: AsyncSession,
+    idem: IdempotencyGuard | None,
+):
     from core_api.services.tenant_settings import resolve_config
 
     write_config = await resolve_config(db, body.tenant_id)
@@ -671,37 +712,12 @@ async def write_memory(
     if usage:
         response.headers["X-RateLimit-Limit"] = str(usage.get("limit", "unlimited"))
         response.headers["X-RateLimit-Remaining"] = str(usage.get("remaining", "unlimited"))
-    # Idempotency check sits AFTER the usage/headers block so a replay
-    # carries the same X-RateLimit-* headers the live path sets via
-    # `response`. Pass them explicitly to JSONResponse because FastAPI
-    # only merges the injected `response` into returned models, not into
-    # directly-returned Response objects.
-    #
-    # Header takes precedence; ``body.metadata.idempotency_key`` (or the
-    # legacy ``client_idempotency_key`` alias) is a body-fallback for
-    # clients that can't easily set per-request headers.
-    # ``idempotency_for`` handles transport-prefixing (``header:`` /
-    # ``body:``) and length validation internally, so each transport
-    # gets a disjoint cache namespace and the limit applies to the raw
-    # user-supplied value regardless of which transport it arrived on.
-    if idempotency_key:
-        _idem = await idempotency_for(request, body.tenant_id, idempotency_key, source="header")
-    else:
-        _idem = await idempotency_for(
-            request,
-            body.tenant_id,
-            idempotency_key_from_metadata(body.metadata),
-            source="body",
-        )
-    if _idem and (_replay := _idem.cached_replay):
-        _body, _status = _replay
-        return JSONResponse(content=_body, status_code=_status, headers=dict(response.headers))
     result = await create_memory(db, body)
     # STM writes return STMWriteResponse (different shape from MemoryOut)
     if isinstance(result, STMWriteResponse):
         stm_body = result.model_dump(mode="json")
-        if _idem:
-            await _idem.record(stm_body, 201)
+        if idem:
+            await idem.record(stm_body, 201)
         return JSONResponse(content=stm_body, status_code=201)
     if usage:
         result.usage = UsageSummary(
@@ -712,8 +728,8 @@ async def write_memory(
     # identical response. The usage snapshot is stale in the replay
     # (bounded by idempotency_ttl_seconds, default 24h) — callers who
     # need live quota should consult a fresh endpoint, not a replay.
-    if _idem:
-        await _idem.record(result.model_dump(mode="json"), 201)
+    if idem:
+        await idem.record(result.model_dump(mode="json"), 201)
     return result
 
 
@@ -735,6 +751,26 @@ async def write_memories_bulk(
     auth.enforce_read_only()
     auth.enforce_usage_limits()
     auth.enforce_tenant(body.tenant_id)
+    # Idempotency replay short-circuits BEFORE the per-tenant slot — a
+    # cached retry must not consume a write-concurrency slot.
+    _idem = await idempotency_for(request, body.tenant_id, idempotency_key)
+    if _idem and (_replay := _idem.cached_replay):
+        _body, _status = _replay
+        # Replays bypass the per-tenant slot and the bulk
+        # quota-increment, so no rate-limit headers are available to
+        # carry on the cached response.
+        return JSONResponse(content=_body, status_code=_status)
+    async with per_tenant_slot("write", body.tenant_id):
+        return await _write_memories_bulk_inner(body, response, auth, db, _idem)
+
+
+async def _write_memories_bulk_inner(
+    body: BulkMemoryCreate,
+    response: Response,
+    auth: AuthContext,
+    db: AsyncSession,
+    idem: IdempotencyGuard | None,
+):
     agent = await get_or_create_agent(db, body.tenant_id, body.agent_id, body.fleet_id)
     if not body.fleet_id and agent.get("fleet_id"):
         body.fleet_id = agent["fleet_id"]
@@ -745,18 +781,9 @@ async def write_memories_bulk(
     if usage:
         response.headers["X-RateLimit-Limit"] = str(usage.get("limit", "unlimited"))
         response.headers["X-RateLimit-Remaining"] = str(usage.get("remaining", "unlimited"))
-    # Idempotency check sits AFTER the usage/headers block so a replay
-    # carries the same X-RateLimit-* headers the live path sets. Pass
-    # them explicitly to JSONResponse because FastAPI only merges the
-    # injected `response` into returned models, not into directly-
-    # returned Response objects.
-    _idem = await idempotency_for(request, body.tenant_id, idempotency_key)
-    if _idem and (_replay := _idem.cached_replay):
-        _body, _status = _replay
-        return JSONResponse(content=_body, status_code=_status, headers=dict(response.headers))
     result = await create_memories_bulk(db, body)
-    if _idem:
-        await _idem.record(result.model_dump(mode="json"), 200)
+    if idem:
+        await idem.record(result.model_dump(mode="json"), 200)
     return result
 
 
@@ -856,6 +883,16 @@ async def search(
     db: AsyncSession = Depends(get_db),
 ):
     auth.enforce_tenant(body.tenant_id)
+    async with per_tenant_slot("search", body.tenant_id):
+        return await _search_inner(body, response, auth, db)
+
+
+async def _search_inner(
+    body: SearchRequest,
+    response: Response,
+    auth: AuthContext,
+    db: AsyncSession,
+):
     usage = None
     _agent = None
     if auth.tenant_id:  # skip for admin
