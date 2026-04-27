@@ -6,9 +6,9 @@ import re
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
-from uuid import UUID
+from typing import cast
+from uuid import UUID, uuid4
 
-import httpx
 from fastapi import HTTPException
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -88,6 +88,16 @@ _USE_PIPELINE_SEARCH = True
 
 def _content_hash(tenant_id: str, fleet_id: str | None, content: str) -> str:
     return hashlib.sha256(f"{tenant_id}:{fleet_id or ''}:{content}".encode()).hexdigest()
+
+
+def _auto_chunk_request_id() -> str:
+    """Mint a per-row attempt id for in-process bulk-insert callers
+    (auto-chunk, atomic-facts) that have no ``X-Bulk-Attempt-Id`` from
+    a client (CAURA-602). The ``auto-chunk:`` prefix keeps these rows
+    visually distinguishable in the partial unique index from
+    real client-side bulk attempts (``f"{X-Bulk-Attempt-Id}:{idx}"``).
+    """
+    return f"auto-chunk:{uuid4()}"
 
 
 async def _find_semantic_duplicate(
@@ -421,6 +431,7 @@ async def _handle_auto_chunk_from_ctx(db: AsyncSession, data: MemoryCreate, ctx:
                         "source": "auto_chunk",
                     },
                     "content_hash": child_ch,
+                    "client_request_id": _auto_chunk_request_id(),
                     "expires_at": data.expires_at.isoformat() if data.expires_at else None,
                     "status": fields["status"],
                     "visibility": data.visibility or "scope_team",
@@ -681,6 +692,7 @@ async def _create_memory_legacy(db: AsyncSession, data: MemoryCreate) -> MemoryO
                             "source": "auto_chunk",
                         },
                         "content_hash": child_ch,
+                        "client_request_id": _auto_chunk_request_id(),
                         "expires_at": data.expires_at.isoformat() if data.expires_at else None,
                         "status": status,
                         "visibility": data.visibility or "scope_team",
@@ -856,14 +868,32 @@ async def _create_memory_legacy(db: AsyncSession, data: MemoryCreate) -> MemoryO
     )
 
 
-async def create_memories_bulk(db: AsyncSession, data: BulkMemoryCreate) -> BulkMemoryResponse:
-    """Create multiple memories in a single optimized operation.
+async def create_memories_bulk(
+    db: AsyncSession,
+    data: BulkMemoryCreate,
+    *,
+    bulk_attempt_id: str,
+) -> BulkMemoryResponse:
+    """Create multiple memories with per-attempt idempotency (CAURA-602).
 
-    Batches embeddings, parallelizes enrichment, does bulk hash dedup,
-    and inserts all memories in one transaction.
+    The route binds each item to a stable ``client_request_id`` of the
+    form ``f"{bulk_attempt_id}:{index}"``. Storage's per-item unique
+    constraint then turns retries into deterministic outcomes:
 
-    Partial failures surface per-item in ``results`` rather than killing
-    the whole batch — one bad row no longer poisons 99 good ones.
+    - first attempt → ``status="created"`` per item.
+    - retry of the same ``X-Bulk-Attempt-Id`` after a lost response →
+      every previously-committed row resolves to ``duplicate_attempt``
+      with the canonical id, so no row is ever silently committed.
+    - same content already exists from an earlier *different* attempt →
+      ``duplicate_content``, matching today's content-hash dedup
+      semantics.
+    - validation, embed/enrich budget, or storage-side missing id →
+      ``error`` per item.
+
+    Embed + enrich + content-hash pre-dedup runs as before; the storage
+    call returns one entry per surviving item, and we map by
+    ``client_request_id`` so input order is preserved without relying on
+    Postgres ``RETURNING`` order.
     """
     sc = get_storage_client()
     t0 = time.perf_counter()
@@ -935,10 +965,14 @@ async def create_memories_bulk(db: AsyncSession, data: BulkMemoryCreate) -> Bulk
                 BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS,
             )
 
-    # -- Batch hash dedup: compute all hashes, query storage API in one shot --
+    # -- Batch hash dedup: compute all hashes, query storage API in one shot.
+    # Storage returns ``{content_hash: {id, client_request_id}}`` so the
+    # per-item classifier below can split content matches into
+    # ``duplicate_attempt`` (this caller's own prior commit) vs
+    # ``duplicate_content`` (a different attempt's row).
     hashes = [_content_hash(data.tenant_id, data.fleet_id, item.content) for item in items]
 
-    existing_hashes: dict[str, str] = {}
+    existing_hashes: dict[str, dict] = {}
     if hashes:
         existing_hashes = await sc.bulk_find_by_content_hashes(
             data.tenant_id,
@@ -949,42 +983,84 @@ async def create_memories_bulk(db: AsyncSession, data: BulkMemoryCreate) -> Bulk
     seen_hashes: dict[str, int] = {}  # hash -> first index
 
     # -- Build memories and track results --
-    results: list[BulkItemResult] = []
-    memories_to_create: list[dict] = []
-    memory_index_map: list[int] = []
+    results: list[BulkItemResult | None] = [None] * n
+    # Each queued entry pairs the original input index with the row dict
+    # we'll send to storage. Carrying ``orig_idx`` alongside the dict
+    # avoids a parallel ``memory_index_map`` list, and the dict isn't
+    # mutated with the index because storage's column-filter would drop
+    # an unknown key on the way in.
+    pending: list[tuple[int, dict]] = []
     created_count = 0
     dup_count = 0
     error_count = 0
 
     for i, item in enumerate(items):
+        # Server-derived per-item attempt id. Stable across retries
+        # because ``bulk_attempt_id`` is the client-supplied
+        # ``X-Bulk-Attempt-Id`` and the index is positional within the
+        # request body — same body + same attempt id ⇒ same per-item id.
+        item_request_id = f"{bulk_attempt_id}:{i}"
+
         # Short-content items surface as per-item errors; never embedded,
         # enriched, deduped, or written.
         if i in short_content_errors:
-            results.append(BulkItemResult(index=i, status="error", error=short_content_errors[i]))
+            results[i] = BulkItemResult(
+                index=i,
+                client_request_id=item_request_id,
+                status="error",
+                error=short_content_errors[i],
+            )
             error_count += 1
             continue
 
         ch = hashes[i]
 
-        # Check DB duplicate
+        # An existing row matches this content. Two flavours:
+        #   - ``duplicate_attempt``: the stored row's
+        #     ``client_request_id`` equals the per-item id we're about
+        #     to claim — i.e. *this* caller's prior commit landed and
+        #     we're seeing our own retry. ``duplicate_of`` is omitted
+        #     because the row IS this attempt's row, not a foreign one.
+        #   - ``duplicate_content``: a different attempt (or a legacy
+        #     row with NULL ``client_request_id``) wrote the same
+        #     content first. Same semantics as the pre-CAURA-602
+        #     ``"duplicate"`` state.
         if ch in existing_hashes:
-            results.append(
-                BulkItemResult(
+            existing = existing_hashes[ch]
+            existing_id = existing["id"]
+            # Subscript (not ``.get()``) so a future router shape
+            # regression that drops the key surfaces as KeyError instead
+            # of silently misclassifying every retry as
+            # ``duplicate_content``. The router is the contract owner;
+            # see ``bulk_find_by_content_hashes`` in
+            # core-storage-api/routers/memories.py.
+            if existing["client_request_id"] == item_request_id:
+                results[i] = BulkItemResult(
                     index=i,
-                    status="duplicate",
-                    duplicate_of=existing_hashes[ch],
+                    client_request_id=item_request_id,
+                    status="duplicate_attempt",
+                    id=existing_id,
                 )
-            )
+            else:
+                results[i] = BulkItemResult(
+                    index=i,
+                    client_request_id=item_request_id,
+                    status="duplicate_content",
+                    id=existing_id,
+                    duplicate_of=existing_id,
+                )
             dup_count += 1
             continue
 
-        # Check intra-batch duplicate
+        # Intra-batch duplicate: two items with identical content in
+        # the same call. Surface as ``duplicate_content`` for caller
+        # consistency with the cross-batch case — both states mean
+        # "this row was not the canonical writer of the content."
         if ch in seen_hashes:
-            results.append(
-                BulkItemResult(
-                    index=i,
-                    status="duplicate",
-                )
+            results[i] = BulkItemResult(
+                index=i,
+                client_request_id=item_request_id,
+                status="duplicate_content",
             )
             dup_count += 1
             continue
@@ -1053,6 +1129,7 @@ async def create_memories_bulk(db: AsyncSession, data: BulkMemoryCreate) -> Bulk
             # column stores ``{}`` instead of NULL.
             "metadata_": metadata,
             "content_hash": ch,
+            "client_request_id": item_request_id,
             "expires_at": item.expires_at.isoformat() if item.expires_at else None,
             "subject_entity_id": item.subject_entity_id,
             "predicate": item.predicate,
@@ -1063,106 +1140,151 @@ async def create_memories_bulk(db: AsyncSession, data: BulkMemoryCreate) -> Bulk
             "visibility": data.visibility or "scope_team",
             "entity_links": entity_link_dicts,
         }
-        memories_to_create.append(mem_data)
-        memory_index_map.append(i)
-        # Placeholder -- will be filled after creation
-        results.append(None)
+        pending.append((i, mem_data))
 
-    # -- Bulk insert via storage client --
-    if memories_to_create:
-        try:
-            created_memories = await sc.create_memories(memories_to_create)
-        except httpx.ReadTimeout:
-            # Silent-create class: storage may have committed the rows
-            # but our socket timed out before reading the response.
-            # Re-query the content hashes we tried to write — any that
-            # are now present got persisted, the rest are in unknown
-            # state and surface as errors. `memory_index_map` and
-            # `created_memories` are compressed to the reconciled subset
-            # so the fill-in + background-task loops below still align.
-            # The reconcile call itself is bounded at 30s: if storage is
-            # stuck enough to time out on write, a hung reconcile would
-            # cascade.
-            logger.error("sc.create_memories ReadTimeout; reconciling via content-hash re-query")
-            hashes_to_create = [mem["content_hash"] for mem in memories_to_create]
-            try:
-                post_hashes = await asyncio.wait_for(
-                    sc.bulk_find_by_content_hashes(data.tenant_id, hashes_to_create),
-                    timeout=30.0,
+    # -- Bulk insert via storage client. The storage layer returns one
+    # entry per submitted item with ``was_inserted`` distinguishing
+    # newly-committed rows from those resolved against a prior attempt's
+    # commit (the silent-create eliminator). The legacy ReadTimeout
+    # reconcile branch is intentionally gone — its job is now done at
+    # the row level by the per-attempt unique constraint, and a retry of
+    # the entire request is the documented recovery path.
+    if pending:
+        storage_results = await sc.create_memories([d for _, d in pending])
+
+        # Map each storage result back to its source item via
+        # ``client_request_id``. Postgres ``RETURNING`` order is
+        # unspecified for ``ON CONFLICT DO NOTHING``, so we never
+        # zip on positional index.
+        by_request_id = {r["client_request_id"]: r for r in storage_results}
+
+        # Track the (orig_idx, mem_data, mem_id) trios for the
+        # successfully-resolved items so the audit log + background
+        # task loops below operate on rows that actually exist.
+        resolved: list[tuple[int, dict, str]] = []
+
+        for orig_idx, mem_data in pending:
+            crid = mem_data["client_request_id"]
+            sr = by_request_id.get(crid)
+            if sr is None or not sr.get("id"):
+                # Storage didn't return a row for this id — concurrent
+                # soft-delete or schema drift. Surface as per-item
+                # error rather than fabricating an id.
+                results[orig_idx] = BulkItemResult(
+                    index=orig_idx,
+                    client_request_id=crid,
+                    status="error",
+                    error="storage did not return an id for this item",
                 )
-            except (TimeoutError, httpx.ReadTimeout):
-                logger.error("Reconcile bulk_find_by_content_hashes also timed out")
-                post_hashes = {}
-            reconciled_memories: list[dict] = []
-            reconciled_index_map: list[int] = []
-            for mem_idx, mem_data in enumerate(memories_to_create):
-                orig_idx = memory_index_map[mem_idx]
-                ch = mem_data["content_hash"]
-                if ch in post_hashes:
-                    reconciled_memories.append(
-                        {
-                            "id": post_hashes[ch],
-                            "memory_type": mem_data["memory_type"],
-                            "title": mem_data.get("title"),
-                            "content": mem_data["content"],
-                        }
-                    )
-                    reconciled_index_map.append(orig_idx)
-                else:
-                    results[orig_idx] = BulkItemResult(
-                        index=orig_idx,
-                        status="error",
-                        error="storage timeout; write status unknown",
-                    )
-                    error_count += 1
-            created_memories = reconciled_memories
-            memory_index_map = reconciled_index_map
+                error_count += 1
+                continue
 
-        # Bulk audit log
-        _hooks = get_hooks()
-        if _hooks.audit_log:
-            for mem_idx, mem in enumerate(created_memories):
-                try:
-                    await _hooks.audit_log(
-                        db,
-                        tenant_id=data.tenant_id,
-                        agent_id=data.agent_id,
-                        action="create",
-                        resource_type="memory",
-                        resource_id=mem.get("id"),
-                        detail={
-                            "memory_type": mem.get("memory_type"),
-                            "title": mem.get("title"),
-                            "content_length": len(mem.get("content", "")),
-                            "source": "bulk",
-                        },
-                    )
-                except Exception:
-                    logger.warning("Audit hook failed (non-critical)", exc_info=True)
-
-        # Fill in results for created memories
-        result_idx = 0
-        for i, r in enumerate(results):
-            if r is None:
-                mem = created_memories[result_idx] if result_idx < len(created_memories) else {}
-                results[i] = BulkItemResult(
-                    index=memory_index_map[result_idx],
+            mem_id = sr["id"]
+            if sr.get("was_inserted"):
+                results[orig_idx] = BulkItemResult(
+                    index=orig_idx,
+                    client_request_id=crid,
                     status="created",
-                    id=mem.get("id"),
+                    id=mem_id,
                 )
                 created_count += 1
-                result_idx += 1
+                resolved.append((orig_idx, mem_data, mem_id))
+            else:
+                # Same attempt id already committed — i.e. a retry. The
+                # row exists; we don't re-run audit / entity-extraction
+                # / contradiction tasks for it because the original
+                # attempt already kicked those off (or will, if its
+                # tracked tasks haven't drained yet).
+                results[orig_idx] = BulkItemResult(
+                    index=orig_idx,
+                    client_request_id=crid,
+                    status="duplicate_attempt",
+                    id=mem_id,
+                )
+                dup_count += 1
 
-        # Fire-and-forget async tasks for each created memory. Items with
-        # an embedding run contradiction detection directly; items without
-        # (hot-path offload or provider failure) collect into a single
-        # batched ``_reembed_memories_bulk`` call so we preserve the
-        # provider-level batching the hot path used.
+        # Back-fill ``id`` / ``duplicate_of`` on intra-batch
+        # ``duplicate_content`` rows. The first-occurrence loop above
+        # marks them with no canonical id — at the time we couldn't
+        # know it, since the canonical row hadn't been written yet.
+        # Now that ``results[seen_hashes[ch]]`` carries the storage id
+        # (whether it's ``created`` or ``duplicate_attempt``), copy it
+        # forward so the ``BulkItemResult`` docstring contract holds:
+        # ``duplicate_content`` always has both fields populated.
+        for j in range(n):
+            later = results[j]
+            if later is None or later.status != "duplicate_content" or later.id is not None:
+                continue
+            canonical = results[seen_hashes[hashes[j]]]
+            if canonical is None or canonical.id is None:
+                # Canonical row never persisted (storage error) — leaving
+                # this slot as a contract-violating
+                # ``duplicate_content`` with both id fields ``None``
+                # would silently break clients that branch on status.
+                # Downgrade to ``error`` and rebalance the aggregate
+                # counts: we'd previously incremented ``dup_count`` for
+                # this item, undo that.
+                results[j] = BulkItemResult(
+                    index=j,
+                    client_request_id=later.client_request_id,
+                    status="error",
+                    error="canonical row for intra-batch duplicate did not persist",
+                )
+                dup_count -= 1
+                error_count += 1
+                continue
+            results[j] = BulkItemResult(
+                index=j,
+                client_request_id=later.client_request_id,
+                status="duplicate_content",
+                id=canonical.id,
+                duplicate_of=canonical.id,
+            )
+
+        # Bulk audit log — only for newly-inserted rows. Fire-and-forget
+        # so a parent ``asyncio.wait_for`` cancellation (e.g. the 90s
+        # bulk budget firing after storage commits but before the
+        # in-flight audit call returns) can't strand committed rows
+        # without their audit records: the retry sees those rows as
+        # ``duplicate_attempt`` and never re-enters this block, so the
+        # audit had to land on the original attempt or it's lost. The
+        # tasks reference ``data.tenant_id`` etc. by value, not the
+        # request-scoped ``db`` session (``log_action`` doesn't actually
+        # touch ``db`` — it calls ``sc.create_audit_log`` over HTTP),
+        # so a teardown of the request context after cancellation
+        # doesn't affect them.
+        _hooks = get_hooks()
+        if _hooks.audit_log:
+            for _orig_idx, mem_data, mem_id in resolved:
+                track_task(
+                    tracked_task(
+                        _hooks.audit_log(
+                            db,
+                            tenant_id=data.tenant_id,
+                            agent_id=data.agent_id,
+                            action="create",
+                            resource_type="memory",
+                            resource_id=mem_id,
+                            detail={
+                                "memory_type": mem_data["memory_type"],
+                                "title": mem_data.get("title"),
+                                "content_length": len(mem_data["content"]),
+                                "source": "bulk",
+                            },
+                        ),
+                        "audit_log",
+                        mem_id,
+                        data.tenant_id,
+                    )
+                )
+
+        # Fire-and-forget async tasks for each newly-created memory.
+        # ``duplicate_attempt`` rows skip these — the original attempt
+        # already enqueued them (and re-running would double-bill the
+        # LLM provider for entity extraction + enrichment).
         from core_api.services.contradiction_detector import detect_contradictions_async
 
-        # CAURA-595: per-row enrich publishes when the flag is off. The
-        # loop above left ``enrichments`` all-None for that path; one
-        # event per row hands the LLM work to core-worker.
+        # CAURA-595: per-row enrich publishes when the flag is off.
         defer_enrich_publish = (
             not settings.enrich_on_hot_path
             and tenant_config.enrichment_enabled
@@ -1170,9 +1292,7 @@ async def create_memories_bulk(db: AsyncSession, data: BulkMemoryCreate) -> Bulk
         )
 
         reembed_batch: list[tuple[UUID, str]] = []
-        for mem_idx, mem in enumerate(created_memories):
-            orig_idx = memory_index_map[mem_idx]
-            mem_id = mem.get("id")
+        for orig_idx, mem_data, mem_id in resolved:
             if tenant_config.entity_extraction_enabled:
                 track_task(
                     tracked_task(
@@ -1182,14 +1302,14 @@ async def create_memories_bulk(db: AsyncSession, data: BulkMemoryCreate) -> Bulk
                             data.fleet_id,
                             data.agent_id,
                             items[orig_idx].content,
-                            mem.get("memory_type"),
+                            mem_data["memory_type"],
                         ),
                         "entity_extraction",
                         mem_id,
                         data.tenant_id,
                     )
                 )
-            if defer_enrich_publish and mem_id is not None:
+            if defer_enrich_publish:
                 # ``defer_enrich_publish`` already encodes
                 # ``not enrich_on_hot_path`` — call the publisher
                 # directly instead of routing through
@@ -1210,13 +1330,7 @@ async def create_memories_bulk(db: AsyncSession, data: BulkMemoryCreate) -> Bulk
                         data.tenant_id,
                     )
                 )
-            if mem_id is None:
-                # Defensive: the storage-api response should always include
-                # ``id`` for a successful create, but a schema drift or
-                # partial-response bug would silently stringify to "None"
-                # in the re-embed task and corrupt observability. Skip.
-                logger.warning("Skipping re-embed for memory at orig_idx=%d: missing id field", orig_idx)
-            elif embeddings[orig_idx] is None:
+            if embeddings[orig_idx] is None:
                 reembed_batch.append((mem_id, items[orig_idx].content))
             else:
                 track_task(
@@ -1247,16 +1361,26 @@ async def create_memories_bulk(db: AsyncSession, data: BulkMemoryCreate) -> Bulk
                 )
             )
 
-    # Sort results by original index
-    results = [r for r in results if r is not None]
-    results.sort(key=lambda r: r.index)
+    # Every slot in ``results`` is filled by now — short-content errors,
+    # content/intra-batch duplicates, or post-storage outcomes. Surface
+    # any gap loudly: ``-O`` strips bare ``assert`` and a silent filter
+    # would hide an entire row from the response, which is exactly the
+    # silent-create class this PR is meant to close.
+    unfilled = [i for i, r in enumerate(results) if r is None]
+    if unfilled:
+        logger.error("bulk results contain unfilled slots at indices %s", unfilled)
+        raise HTTPException(
+            status_code=500,
+            detail="internal error: unfilled bulk result slots",
+        )
+    final_results = cast("list[BulkItemResult]", results)
 
     bulk_ms = round((time.perf_counter() - t0) * 1000)
     return BulkMemoryResponse(
         created=created_count,
         duplicates=dup_count,
         errors=error_count,
-        results=results,
+        results=final_results,
         bulk_ms=bulk_ms,
     )
 

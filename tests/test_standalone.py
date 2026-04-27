@@ -173,15 +173,19 @@ class TestStandaloneWorkflow:
         tenant_id = _get_standalone_tenant()
         tag = _uid()
 
-        resp = await client.post("/api/v1/memories/bulk", json={
-            "tenant_id": tenant_id,
-            "agent_id": f"bulk-agent-{tag}",
-            "items": [
-                {"content": f"Bulk item 1: user prefers dark mode [{tag}]"},
-                {"content": f"Bulk item 2: user timezone is UTC+2 [{tag}]"},
-                {"content": f"Bulk item 3: user speaks Hebrew and English [{tag}]"},
-            ],
-        })
+        resp = await client.post(
+            "/api/v1/memories/bulk",
+            json={
+                "tenant_id": tenant_id,
+                "agent_id": f"bulk-agent-{tag}",
+                "items": [
+                    {"content": f"Bulk item 1: user prefers dark mode [{tag}]"},
+                    {"content": f"Bulk item 2: user timezone is UTC+2 [{tag}]"},
+                    {"content": f"Bulk item 3: user speaks Hebrew and English [{tag}]"},
+                ],
+            },
+            headers={"X-Bulk-Attempt-Id": f"standalone-bulk-{tag}"},
+        )
         assert resp.status_code == 200
         data = resp.json()
         assert data["created"] == 3
@@ -303,13 +307,17 @@ class TestZeroConfigWorkflow:
         _get_standalone_tenant()
         tag = _uid()
 
-        resp = await client.post("/api/v1/memories/bulk", json={
-            "agent_id": f"zero-bulk-agent-{tag}",
-            "items": [
-                {"content": f"Zero-config bulk item 1 [{tag}]"},
-                {"content": f"Zero-config bulk item 2 [{tag}]"},
-            ],
-        })
+        resp = await client.post(
+            "/api/v1/memories/bulk",
+            json={
+                "agent_id": f"zero-bulk-agent-{tag}",
+                "items": [
+                    {"content": f"Zero-config bulk item 1 [{tag}]"},
+                    {"content": f"Zero-config bulk item 2 [{tag}]"},
+                ],
+            },
+            headers={"X-Bulk-Attempt-Id": f"zero-bulk-{tag}"},
+        )
         assert resp.status_code == 200
         assert resp.json()["created"] == 2
 

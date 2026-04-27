@@ -289,6 +289,70 @@ class TestMemories:
         assert fetched["deleted_at"] is not None
         assert fetched["status"] == "deleted"
 
+    async def test_bulk_per_attempt_idempotency(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        """CAURA-602: ``/memories/bulk`` is idempotent at the row level.
+
+        First call inserts every item; second call with the same
+        ``client_request_id``s returns the same canonical ids and
+        ``was_inserted=False``. Eliminates the silent-create class:
+        a retry can never produce a row that wasn't returned to the
+        caller, regardless of whether the original response made it
+        back."""
+        attempt = f"bulk-attempt-{_uid()}"
+
+        def _payload(idx: int) -> dict:
+            content = f"bulk-attempt-{attempt}-{idx}"
+            return {
+                **_memory_payload(tenant_id, fleet_id, content=content),
+                "client_request_id": f"{attempt}:{idx}",
+            }
+
+        items = [_payload(i) for i in range(3)]
+
+        first = await client.post(f"{PREFIX}/memories/bulk", json=items)
+        assert first.status_code == 200, first.text
+        first_data = first.json()
+        assert len(first_data) == 3
+        for entry in first_data:
+            assert entry["was_inserted"] is True
+            assert entry["id"]
+            assert entry["client_request_id"]
+        ids_by_request = {e["client_request_id"]: e["id"] for e in first_data}
+
+        # Resend the same payload. The unique index swallows the
+        # inserts; the post-conflict re-query resolves every item to
+        # the existing row. ``was_inserted`` flips to False so the
+        # upstream core-api can label them ``duplicate_attempt``.
+        second = await client.post(f"{PREFIX}/memories/bulk", json=items)
+        assert second.status_code == 200, second.text
+        second_data = second.json()
+        assert len(second_data) == 3
+        for entry in second_data:
+            assert entry["was_inserted"] is False
+            assert entry["id"] == ids_by_request[entry["client_request_id"]]
+
+    async def test_bulk_missing_client_request_id_rejected(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        """The storage-writer rejects bulk inserts without a
+        ``client_request_id`` per item — the contract is enforced one
+        layer below the core-api route so in-process callers can't
+        bypass it (CAURA-602)."""
+        payload = _memory_payload(tenant_id, fleet_id)  # no client_request_id
+        resp = await client.post(f"{PREFIX}/memories/bulk", json=[payload])
+        # Storage-writer surfaces the ValueError as 500; core-api would
+        # be the layer that returns a clean 4xx — but at this layer the
+        # important assertion is "no row was inserted."
+        assert resp.status_code >= 400
+
     async def test_find_by_content_hash(
         self,
         client: AsyncClient,

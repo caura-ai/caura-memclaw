@@ -13,7 +13,7 @@ import json
 import logging
 import time
 from typing import Annotated
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 from mcp.server.fastmcp import FastMCP
@@ -362,7 +362,16 @@ async def memclaw_write(
                 items=bulk_items,
                 visibility=visibility,
             )
-            result = await create_memories_bulk(db, bulk_data)
+            # MCP transport doesn't surface ``X-Bulk-Attempt-Id``;
+            # mint a server-side attempt id so each MCP-driven bulk
+            # call still gets per-item idempotency. A retried MCP tool
+            # call will use a different attempt id (so it isn't
+            # idempotent across MCP retries) — the MCP transport is
+            # unary and the loadtest finding (CAURA-602) doesn't apply
+            # to it; the trade-off is acceptable to keep this path
+            # simple. If a use case needs MCP retry idempotency, the
+            # client can pass an explicit token via metadata.
+            result = await create_memories_bulk(db, bulk_data, bulk_attempt_id=f"mcp:{uuid4()}")
             return _with_latency(_serialize(result), t0)
         except HTTPException as e:
             logger.warning("MCP tool error (%s): %s", e.status_code, e.detail)

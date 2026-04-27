@@ -70,16 +70,23 @@ class CoreStorageClient:
         """Construct an httpx pool with the tuned timeouts + limits.
 
         Per-phase timeouts: connect/pool are short (5s) to fail fast on
-        network issues; read/write are generous (90s) for heavy bulk
-        writes where storage-side commits can be slow under load. The
-        previous scalar 10s caused the silent-create class: storage
-        committed rows in ~12s, core-api timed out reading the response
-        at 10s, so the client saw 5xx and retried → duplicate rows
-        classified as "duplicate" on retry → acked counter undercounts
-        persisted.
+        network issues; read/write are generous (120s) for heavy bulk
+        writes where storage-side commits can be slow under load.
+
+        The 120s read budget is deliberately ABOVE the bulk route's own
+        90s ``bulk_request_timeout_seconds`` (CAURA-602) so
+        ``asyncio.wait_for`` almost always wins the race against an
+        httpx-level timeout: the route layer cancels cleanly, returns
+        a 504 with the ``X-Bulk-Attempt-Id`` retry hint, and the
+        per-row attempt-id constraint recovers any committed rows.
+        Equal values would 50/50 race — if httpx fired first the
+        request propagated as 500 with no retry contract, which
+        was the silent-create regression mode. The route still
+        catches ``httpx.TimeoutException`` as a defence-in-depth
+        fallback for the remaining 1%.
         """
         return httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5.0, read=90.0, write=90.0, pool=5.0),
+            timeout=httpx.Timeout(connect=5.0, read=120.0, write=120.0, pool=5.0),
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
             follow_redirects=True,
         )
@@ -201,6 +208,23 @@ class CoreStorageClient:
         return await self._post("/memories", data)
 
     async def create_memories(self, data: list[dict]) -> list[dict]:
+        """Bulk-insert memories with per-attempt idempotency (CAURA-602).
+
+        Every input item must include ``client_request_id`` — the
+        bulk endpoint derives it from ``X-Bulk-Attempt-Id`` upstream;
+        in-process callers (auto-chunk) generate a UUID per item.
+
+        Returns one entry per input item, in input order::
+
+            {"client_request_id": str, "id": str | None, "was_inserted": bool}
+
+        ``was_inserted=True`` means this attempt's row newly committed.
+        ``False`` means the same ``(tenant_id, fleet_id, client_request_id)``
+        was already in the table from a prior attempt — the canonical id
+        is returned in ``id``. ``id is None`` is the rare third bucket
+        (concurrent soft-delete or a torn write); the upstream caller
+        treats it as a per-item error.
+        """
         return await self._post("/memories/bulk", data)
 
     async def get_memory(self, memory_id: str) -> dict | None:
@@ -272,13 +296,21 @@ class CoreStorageClient:
         self,
         tenant_id: str,
         hashes: list[str],
-    ) -> dict[str, str]:
-        # Explicit ``read=False``: this is the dedup lookup called inline
-        # during bulk writes. Routing to a read replica risks missing a
-        # just-written row and re-creating a duplicate. Matches
-        # postgres_service's get_session() choice for dedup (CAURA-591 A).
-        # Not relying on the default so a future flip of _post's default
-        # can't silently re-route it.
+    ) -> dict[str, dict]:
+        """Look up existing rows by content_hash for the dedup gate.
+
+        Returns ``{content_hash: {"id": str, "client_request_id": str | None}}``.
+        ``client_request_id`` lets the bulk path tell ``duplicate_attempt``
+        (the caller's own retry) apart from ``duplicate_content``
+        (different attempt, same content).
+
+        Explicit ``read=False``: this is the dedup lookup called inline
+        during bulk writes. Routing to a read replica risks missing a
+        just-written row and re-creating a duplicate. Matches
+        postgres_service's get_session() choice for dedup (CAURA-591 A).
+        Not relying on the default so a future flip of _post's default
+        can't silently re-route it.
+        """
         result = await self._post(
             "/memories/bulk-by-content-hashes",
             {"tenant_id": tenant_id, "hashes": hashes},
