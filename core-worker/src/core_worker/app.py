@@ -99,7 +99,7 @@ def create_app() -> FastAPI:
             "computed embeddings back to core-storage-api. Exposes only "
             "health endpoints."
         ),
-        version="1.0.0",
+        version="1.0.1",
         lifespan=lifespan,
     )
 

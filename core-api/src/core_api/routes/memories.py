@@ -256,7 +256,17 @@ async def delete_all_memories(
     db: AsyncSession = Depends(get_db),
     body: dict | None = Body(default=None),
 ):
-    """Soft-delete all matching memories for a tenant."""
+    """Soft-delete all matching memories for a tenant.
+
+    Body fields (all optional):
+
+    * ``exclude_ids``: list of UUID strings to skip from the soft-delete.
+    * ``metadata_filter``: dict of equality matches against
+      ``metadata->>key``. Lets clients (most concretely the load-test
+      harness, tagging rows with ``metadata.load_test_run_id``) clean
+      up by tag in one round-trip instead of paginated enumerate +
+      per-row delete. All entries combine with AND.
+    """
     auth.enforce_read_only()
     auth.enforce_tenant(tenant_id)
     from sqlalchemy import update
@@ -273,6 +283,37 @@ async def delete_all_memories(
     exclude_ids = (body or {}).get("exclude_ids", [])
     if exclude_ids:
         stmt = stmt.where(Memory.id.notin_([UUID(i) for i in exclude_ids]))
+    metadata_filter = (body or {}).get("metadata_filter") or {}
+    if metadata_filter:
+        if not isinstance(metadata_filter, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="metadata_filter must be an object of {key: value} equality matches",
+            )
+        if len(metadata_filter) > 20:
+            raise HTTPException(
+                status_code=400,
+                detail="metadata_filter supports at most 20 key/value pairs",
+            )
+        for key, value in metadata_filter.items():
+            # PG ``metadata->>'key'`` returns JSON text — ``"true"`` for
+            # booleans, ``"null"`` for None, ``'{"k":"v"}'`` for nested
+            # objects. Comparing against Python ``str(value)`` would
+            # produce the repr (``"True"``, ``"None"``, ``"{'k': 'v'}"``)
+            # and silently match nothing. Reject non-string values
+            # outright so the caller learns immediately rather than
+            # debugging an empty result set.
+            if not isinstance(value, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "metadata_filter values must be strings "
+                        f"(got {type(value).__name__!r} for key {key!r})"
+                    ),
+                )
+            # ``Memory.metadata_`` maps to the JSONB ``metadata`` column.
+            # ``[key].astext == value`` compiles to PG ``metadata->>'key' = 'value'``.
+            stmt = stmt.where(Memory.metadata_[str(key)].astext == value)
     stmt = stmt.values(deleted_at=datetime.now(UTC), status="deleted")
     result = await db.execute(stmt)
     deleted_count = result.rowcount
@@ -287,6 +328,7 @@ async def delete_all_memories(
             "agent_id": agent_id,
             "memory_type": memory_type,
             "status_filter": status,
+            "metadata_filter": metadata_filter or None,
         },
     )
     await db.commit()

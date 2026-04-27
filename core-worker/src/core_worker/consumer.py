@@ -55,6 +55,7 @@ from common.enrichment import EnrichmentResult, enrich_memory
 from common.events.base import Event
 from common.events.factory import get_event_bus
 from common.events.memory_embed_request import MemoryEmbedRequest
+from common.events.memory_embedded_publisher import publish_memory_embedded
 from common.events.memory_enrich_request import MemoryEnrichRequest
 from common.events.memory_enriched_publisher import publish_memory_enriched
 from common.events.topics import Topics
@@ -162,6 +163,28 @@ async def handle_embed_request(event: Event) -> None:
         tenant_id=request.tenant_id,
         embedding=embedding,
     )
+
+    # Back-channel: announce successful embed so core-api can fire
+    # post-embed contradiction detection. Closes the documented
+    # ``handle_memory_enriched`` gap that silently dropped detection
+    # whenever enrichment landed before embedding (the only case under
+    # ``EMBED_ON_HOT_PATH=false``). Best-effort — a publish failure
+    # MUST NOT nack the upstream PATCH that already succeeded; the
+    # embedding is durable in storage either way.
+    try:
+        await publish_memory_embedded(
+            memory_id=request.memory_id,
+            tenant_id=request.tenant_id,
+            content=request.content,
+        )
+    except Exception:
+        logger.exception(
+            "embedded back-channel publish failed; ack-continuing",
+            extra={
+                "memory_id": str(request.memory_id),
+                "tenant_id": request.tenant_id,
+            },
+        )
 
     logger.info(
         "embed-request processed",

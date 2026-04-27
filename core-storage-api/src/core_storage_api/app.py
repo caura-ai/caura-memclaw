@@ -68,7 +68,7 @@ def create_app() -> FastAPI:
             "documents, fleet, audit logs, and reports.\n\n"
             "**Base path:** `/api/v1/storage`"
         ),
-        version="1.0.0",
+        version="1.0.1",
         lifespan=lifespan,
         redirect_slashes=False,
     )

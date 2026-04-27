@@ -254,15 +254,24 @@ async def test_handle_memory_enriched_drops_non_mapping_payload(
 # ── register_consumers wires the right topic ──────────────────────────
 
 
-async def test_register_consumers_subscribes_to_enriched_topic() -> None:
-    """``register_consumers()`` MUST attach ``handle_memory_enriched``
-    to ``Topics.Memory.ENRICHED`` — a typo in either side would
-    silently orphan the handler."""
+async def test_register_consumers_subscribes_to_both_topics() -> None:
+    """``register_consumers()`` MUST attach the right handler to each
+    back-channel topic — a typo on either side would silently orphan
+    the handler.
+
+    Two subscriptions wired: ``ENRICHED`` (CAURA-595) and ``EMBEDDED``
+    (the symmetric path that fires contradiction detection on the
+    embed-after-enrich ordering — the only case under
+    ``EMBED_ON_HOT_PATH=false``).
+    """
     fake_bus = MagicMock()
     with patch("core_api.consumer.get_event_bus", return_value=fake_bus):
         consumer.register_consumers()
 
-    # Only one subscribe call expected (no other topics handled here yet).
-    fake_bus.subscribe.assert_called_once_with(
+    assert fake_bus.subscribe.call_count == 2
+    fake_bus.subscribe.assert_any_call(
         Topics.Memory.ENRICHED, consumer.handle_memory_enriched
+    )
+    fake_bus.subscribe.assert_any_call(
+        Topics.Memory.EMBEDDED, consumer.handle_memory_embedded
     )
