@@ -22,8 +22,22 @@ class Settings(BaseSettings):
     # we route.
     database_url: str = "postgresql+asyncpg://memclaw:changeme@localhost:5432/memclaw"
     read_database_url: str = ""
-    db_pool_size: int = 20
-    db_max_overflow: int = 20
+    # 5+5 matches the post-PR-#166 ``platform-storage-api`` defaults so
+    # both services share the same pool sizing without per-environment
+    # env-var overrides. Pre-this-fix the source defaults were 20+20,
+    # which staging worked around with ``--remove-env-vars`` /
+    # explicit env-var overrides on the writer + reader Cloud Run
+    # services; the mismatch was a footgun for fresh deploys (a new
+    # operator would inherit the 20+20 source default and silently
+    # over-allocate against AlloyDB's connection ceiling, which we
+    # observed on loadtest-1777301515 as
+    # ``asyncpg.TooManyConnectionsError`` during the storm window).
+    # Operators that genuinely need a larger pool can still set
+    # ``DB_POOL_SIZE`` / ``DB_MAX_OVERFLOW`` explicitly; the source
+    # default is now the safe baseline rather than a value that
+    # requires environment-side correction.
+    db_pool_size: int = 5
+    db_max_overflow: int = 5
     db_pool_timeout: int = 60
     db_pool_recycle: int = 1800
 
