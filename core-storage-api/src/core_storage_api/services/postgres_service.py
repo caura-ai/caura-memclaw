@@ -1254,19 +1254,32 @@ class PostgresService:
             return result.scalar() or 0
 
     async def memory_count_all(self) -> int:
+        # Exclude soft-deleted rows so the public counter matches the live,
+        # queryable footprint — same predicate every other count in this
+        # file uses. Without the filter, tombstoned tenant clean-ups inflate
+        # the number by an order of magnitude on busy environments.
         async with get_read_session() as session:
-            result = await session.scalar(select(func.count()).select_from(Memory))
+            result = await session.scalar(
+                select(func.count())
+                .select_from(Memory)
+                .where(Memory.deleted_at.is_(None))
+            )
             return result or 0
 
     async def memory_distinct_agent_count(self) -> int:
         """Count distinct agent identities across all memories in all tenants.
 
         Powers the public Agents counter — reflects actual agent *activity*
-        (wrote at least one memory) rather than provisioned API keys.
+        (wrote at least one memory) rather than provisioned API keys. Agents
+        whose memories have all been soft-deleted are excluded so the count
+        tracks live activity, not historical churn.
         """
         async with get_session() as session:
             result = await session.scalar(
-                select(func.count(func.distinct(Memory.agent_id))).where(Memory.agent_id.isnot(None))
+                select(func.count(func.distinct(Memory.agent_id))).where(
+                    Memory.agent_id.isnot(None),
+                    Memory.deleted_at.is_(None),
+                )
             )
             return result or 0
 
