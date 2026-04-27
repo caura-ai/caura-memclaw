@@ -145,6 +145,18 @@ class Settings(BaseSettings):
     # ``cap * max_instances``.
     per_tenant_search_concurrency: int = 8
     per_tenant_write_concurrency: int = 4
+    # Deeper bulkhead at the storage roundtrip itself
+    # (CAURA-602 follow-up). Smaller than the route-entry caps above
+    # because each request only holds the storage slot for the actual
+    # roundtrip (~500ms-3s), not for the whole embed/enrich/storage
+    # cycle. Sizing target: ``per_tenant_storage_write_concurrency *
+    # max_instances`` should sit comfortably below the storage-writer
+    # pool size (10/instance x 11 = 110 fleet-wide today) so a single
+    # tenant can't park more than ~20% of pool slots. Acquire is
+    # unbounded — a saturated tenant queues here while the route
+    # budget caps total wait time; see ``per_tenant_storage_slot``.
+    per_tenant_storage_write_concurrency: int = 2
+    per_tenant_storage_search_concurrency: int = 4
     # Fail-fast budget when the cap is exhausted. Long enough to absorb
     # a benign race between two near-simultaneous arrivals; short
     # enough that real exhaustion fails before the request hits the

@@ -13,11 +13,12 @@ from types import SimpleNamespace
 
 from core_api.clients.storage_client import get_storage_client
 from core_api.constants import SEARCH_OVERFETCH_FACTOR
-
-logger = logging.getLogger(__name__)
+from core_api.middleware.per_tenant_concurrency import per_tenant_storage_slot
 from core_api.pipeline.context import PipelineContext
 from core_api.pipeline.step import StepOutcome, StepResult
 from core_api.schemas import EntityLinkOut
+
+logger = logging.getLogger(__name__)
 
 _ALLOWED_OVERRIDES = frozenset({"freshness_decay_days", "freshness_floor", "top_k"})
 
@@ -103,8 +104,15 @@ class ExecuteScoredSearch:
                 date_range["end_date"],
             )
 
+        # Per-tenant storage bulkhead (CAURA-602 follow-up). The pipeline
+        # search path is the active path (``_USE_PIPELINE_SEARCH=True``);
+        # without this slot, the legacy-path bulkhead in
+        # ``memory_service._search_memories_legacy`` was applied to dead
+        # code only. ``data["tenant_id"]`` is set upstream by
+        # ``_search_memories_pipeline`` before this step runs.
         sc = get_storage_client()
-        rows = await sc.scored_search(search_data)
+        async with per_tenant_storage_slot("storage_search", data["tenant_id"]):
+            rows = await sc.scored_search(search_data)
 
         # Map response dicts to SimpleNamespace rows expected by downstream steps.
         grouped: OrderedDict[str, SimpleNamespace] = OrderedDict()

@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core_api.clients.storage_client import get_storage_client
 from core_api.config import settings
+from core_api.middleware.per_tenant_concurrency import per_tenant_storage_slot
 from core_api.tasks import track_task
 
 try:
@@ -357,33 +358,42 @@ async def _handle_auto_chunk_from_ctx(db: AsyncSession, data: MemoryCreate, ctx:
         parent_metadata["child_count"] = len(facts)
         parent_metadata["write_latency_ms"] = round((time.perf_counter() - t0) * 1000)
 
-        parent = await sc.create_memory(
-            {
-                "tenant_id": data.tenant_id,
-                "fleet_id": data.fleet_id,
-                "agent_id": data.agent_id,
-                "memory_type": fields["memory_type"],
-                "title": fields["title"],
-                "content": data.content,
-                "embedding": embedding,
-                "weight": fields["weight"],
-                "source_uri": data.source_uri,
-                "run_id": data.run_id,
-                # See ``write_memory_row`` for the falsy-``{}`` trap.
-                "metadata_": parent_metadata,
-                "content_hash": ch,
-                "expires_at": data.expires_at.isoformat() if data.expires_at else None,
-                "subject_entity_id": data.subject_entity_id,
-                "predicate": data.predicate,
-                "object_value": data.object_value,
-                "ts_valid_start": fields["ts_valid_start"].isoformat()
-                if fields.get("ts_valid_start")
-                else None,
-                "ts_valid_end": fields["ts_valid_end"].isoformat() if fields.get("ts_valid_end") else None,
-                "status": fields["status"],
-                "visibility": data.visibility or "scope_team",
-            }
-        )
+        # Auto-chunk parent insert — wrapped in the storage bulkhead
+        # like the regular single-write path. Auto-chunk fires two
+        # storage roundtrips per request (parent here, children below);
+        # both count toward the per-tenant ``storage_write`` cap so a
+        # tenant doing heavy auto-chunking can't park more storage
+        # connections than the cap allows.
+        async with per_tenant_storage_slot("storage_write", data.tenant_id):
+            parent = await sc.create_memory(
+                {
+                    "tenant_id": data.tenant_id,
+                    "fleet_id": data.fleet_id,
+                    "agent_id": data.agent_id,
+                    "memory_type": fields["memory_type"],
+                    "title": fields["title"],
+                    "content": data.content,
+                    "embedding": embedding,
+                    "weight": fields["weight"],
+                    "source_uri": data.source_uri,
+                    "run_id": data.run_id,
+                    # See ``write_memory_row`` for the falsy-``{}`` trap.
+                    "metadata_": parent_metadata,
+                    "content_hash": ch,
+                    "expires_at": data.expires_at.isoformat() if data.expires_at else None,
+                    "subject_entity_id": data.subject_entity_id,
+                    "predicate": data.predicate,
+                    "object_value": data.object_value,
+                    "ts_valid_start": fields["ts_valid_start"].isoformat()
+                    if fields.get("ts_valid_start")
+                    else None,
+                    "ts_valid_end": fields["ts_valid_end"].isoformat()
+                    if fields.get("ts_valid_end")
+                    else None,
+                    "status": fields["status"],
+                    "visibility": data.visibility or "scope_team",
+                }
+            )
 
         parent_id = parent.get("id")
 
@@ -437,7 +447,11 @@ async def _handle_auto_chunk_from_ctx(db: AsyncSession, data: MemoryCreate, ctx:
                     "visibility": data.visibility or "scope_team",
                 }
             )
-        await sc.create_memories(child_payloads)
+        # Auto-chunk children — second storage roundtrip in this
+        # request after the parent insert above. Same per-tenant cap
+        # applies; held only across the bulk call itself.
+        async with per_tenant_storage_slot("storage_write", data.tenant_id):
+            await sc.create_memories(child_payloads)
 
         if tenant_config.entity_extraction_enabled:
             track_task(
@@ -620,31 +634,34 @@ async def _create_memory_legacy(db: AsyncSession, data: MemoryCreate) -> MemoryO
             parent_metadata["child_count"] = len(facts)
             parent_metadata["write_latency_ms"] = round((time.perf_counter() - t0) * 1000)
 
-            parent = await sc.create_memory(
-                {
-                    "tenant_id": data.tenant_id,
-                    "fleet_id": data.fleet_id,
-                    "agent_id": data.agent_id,
-                    "memory_type": memory_type,
-                    "title": title,
-                    "content": data.content,
-                    "embedding": embedding,
-                    "weight": weight,
-                    "source_uri": data.source_uri,
-                    "run_id": data.run_id,
-                    # See ``write_memory_row`` for the falsy-``{}`` trap.
-                    "metadata_": parent_metadata,
-                    "content_hash": ch,
-                    "expires_at": data.expires_at.isoformat() if data.expires_at else None,
-                    "subject_entity_id": data.subject_entity_id,
-                    "predicate": data.predicate,
-                    "object_value": data.object_value,
-                    "ts_valid_start": ts_valid_start.isoformat() if ts_valid_start else None,
-                    "ts_valid_end": ts_valid_end.isoformat() if ts_valid_end else None,
-                    "status": status,
-                    "visibility": data.visibility or "scope_team",
-                }
-            )
+            # Legacy-path auto-chunk parent insert. Mirrors the
+            # pipeline-path coverage in ``_handle_auto_chunk_from_ctx``.
+            async with per_tenant_storage_slot("storage_write", data.tenant_id):
+                parent = await sc.create_memory(
+                    {
+                        "tenant_id": data.tenant_id,
+                        "fleet_id": data.fleet_id,
+                        "agent_id": data.agent_id,
+                        "memory_type": memory_type,
+                        "title": title,
+                        "content": data.content,
+                        "embedding": embedding,
+                        "weight": weight,
+                        "source_uri": data.source_uri,
+                        "run_id": data.run_id,
+                        # See ``write_memory_row`` for the falsy-``{}`` trap.
+                        "metadata_": parent_metadata,
+                        "content_hash": ch,
+                        "expires_at": data.expires_at.isoformat() if data.expires_at else None,
+                        "subject_entity_id": data.subject_entity_id,
+                        "predicate": data.predicate,
+                        "object_value": data.object_value,
+                        "ts_valid_start": ts_valid_start.isoformat() if ts_valid_start else None,
+                        "ts_valid_end": ts_valid_end.isoformat() if ts_valid_end else None,
+                        "status": status,
+                        "visibility": data.visibility or "scope_team",
+                    }
+                )
 
             parent_id = parent.get("id")
 
@@ -698,7 +715,11 @@ async def _create_memory_legacy(db: AsyncSession, data: MemoryCreate) -> MemoryO
                         "visibility": data.visibility or "scope_team",
                     }
                 )
-            await sc.create_memories(child_payloads)
+            # Legacy-path auto-chunk children — same bulkhead key as
+            # the parent insert above. See ``_handle_auto_chunk_from_ctx``
+            # for the pipeline-path equivalent.
+            async with per_tenant_storage_slot("storage_write", data.tenant_id):
+                await sc.create_memories(child_payloads)
 
             if tenant_config.entity_extraction_enabled:
                 track_task(
@@ -754,38 +775,74 @@ async def _create_memory_legacy(db: AsyncSession, data: MemoryCreate) -> MemoryO
         metadata["embedding_pending"] = True
         logger.warning("Storing memory without embedding; deferred backfill scheduled")
 
-    # Store write latency in metadata
+    # Pre-storage processing latency (embed + enrichment + dedup);
+    # excludes the storage-slot queue wait below. We capture it here
+    # because the value gets stored ON the row's ``metadata`` column,
+    # which must be set before the INSERT — moving the measurement
+    # past the storage call would require a follow-up PATCH for a
+    # debug-level metric, which isn't worth the extra roundtrip.
+    # Operators reading this metric should treat it as
+    # "core-api pre-storage time," not "total core-api wall time."
     write_ms = round((time.perf_counter() - t0) * 1000)
     metadata["write_latency_ms"] = write_ms
 
     # Create memory via storage client
     entity_link_dicts = [{"entity_id": str(link.entity_id), "role": link.role} for link in data.entity_links]
 
-    created = await sc.create_memory(
-        {
+    # CAURA-602 follow-up: per-tenant bulkhead at the storage roundtrip
+    # itself. Bounds how many of one tenant's writes can hold storage-
+    # writer connections at the same time so a hot tenant can't park
+    # the whole pool while a cold tenant's single write queues. The
+    # route-entry slot (``per_tenant_slot("write", ...)``) was already
+    # held; this slot is held only across the storage call.
+    async with per_tenant_storage_slot("storage_write", data.tenant_id):
+        created = await sc.create_memory(
+            {
+                "tenant_id": data.tenant_id,
+                "fleet_id": data.fleet_id,
+                "agent_id": data.agent_id,
+                "memory_type": memory_type,
+                "title": title,
+                "content": data.content,
+                "embedding": embedding,
+                "weight": weight,
+                "source_uri": data.source_uri,
+                "run_id": data.run_id,
+                # See ``write_memory_row`` for the falsy-``{}`` trap.
+                "metadata_": metadata,
+                "content_hash": ch,
+                "expires_at": data.expires_at.isoformat() if data.expires_at else None,
+                "subject_entity_id": data.subject_entity_id,
+                "predicate": data.predicate,
+                "object_value": data.object_value,
+                "ts_valid_start": ts_valid_start.isoformat() if ts_valid_start else None,
+                "ts_valid_end": ts_valid_end.isoformat() if ts_valid_end else None,
+                "status": status,
+                "visibility": data.visibility or "scope_team",
+                "entity_links": entity_link_dicts,
+            }
+        )
+
+    # Total core-api wall time (embed + enrich + dedup + storage-slot
+    # queue + storage roundtrip). The row-level ``write_latency_ms`` in
+    # ``metadata_`` covers the pre-storage portion only; under
+    # storage-slot contention (CAURA-602 follow-up) those two values
+    # diverge, and operators investigating a tenant-storm latency spike
+    # need the wall-time figure to localise the source. Renaming the
+    # row metric would break operator dashboards built against
+    # historical data, so we leave it intact and emit total time as a
+    # structured log line — DEBUG-level so steady-state load doesn't
+    # drown the signal but the value is queryable when needed.
+    total_ms = round((time.perf_counter() - t0) * 1000)
+    logger.debug(
+        "single-write latency",
+        extra={
             "tenant_id": data.tenant_id,
-            "fleet_id": data.fleet_id,
             "agent_id": data.agent_id,
-            "memory_type": memory_type,
-            "title": title,
-            "content": data.content,
-            "embedding": embedding,
-            "weight": weight,
-            "source_uri": data.source_uri,
-            "run_id": data.run_id,
-            # See ``write_memory_row`` for the falsy-``{}`` trap.
-            "metadata_": metadata,
-            "content_hash": ch,
-            "expires_at": data.expires_at.isoformat() if data.expires_at else None,
-            "subject_entity_id": data.subject_entity_id,
-            "predicate": data.predicate,
-            "object_value": data.object_value,
-            "ts_valid_start": ts_valid_start.isoformat() if ts_valid_start else None,
-            "ts_valid_end": ts_valid_end.isoformat() if ts_valid_end else None,
-            "status": status,
-            "visibility": data.visibility or "scope_team",
-            "entity_links": entity_link_dicts,
-        }
+            "prestorage_ms": write_ms,
+            "total_ms": total_ms,
+            "storage_slot_wait_ms": total_ms - write_ms,
+        },
     )
 
     memory_id = created.get("id")
@@ -1149,8 +1206,17 @@ async def create_memories_bulk(
     # reconcile branch is intentionally gone — its job is now done at
     # the row level by the per-attempt unique constraint, and a retry of
     # the entire request is the documented recovery path.
+    #
+    # Per-tenant storage bulkhead (CAURA-602 follow-up): the slot wraps
+    # only the storage roundtrip itself, holding tight while the call
+    # is in flight and releasing as soon as the storage response (or
+    # cancellation) returns. Embed/enrich already finished above and
+    # the audit/contradiction/reembed fan-out below runs as
+    # fire-and-forget tasks, so the slot's grip on storage stays tight
+    # even for long-tail batches.
     if pending:
-        storage_results = await sc.create_memories([d for _, d in pending])
+        async with per_tenant_storage_slot("storage_write", data.tenant_id):
+            storage_results = await sc.create_memories([d for _, d in pending])
 
         # Map each storage result back to its source item via
         # ``client_request_id``. Postgres ``RETURNING`` order is
@@ -2036,6 +2102,19 @@ async def _enrich_memory_background(
                     "source": "atomic_fact_fanout",
                     "retrieval_hint": fact_hint,
                 }
+                # Intentionally NOT wrapped in ``per_tenant_storage_slot``
+                # (CAURA-602 follow-up): this site runs inside
+                # ``_enrich_memory_background``, a fire-and-forget task
+                # with no outer request budget. The bulkhead's
+                # unbounded-queue contract relies on an outer deadline
+                # to cap wait time; without one, a saturated tenant
+                # could pile fan-out tasks behind hot-path requests
+                # indefinitely. The fan-out is rare enough (only fires
+                # when the LLM extracts >1 atomic fact from a parent)
+                # that letting it bypass the cap is the safer trade —
+                # but if loadtest data ever shows it materially driving
+                # storage-pool occupancy, revisit by giving the task
+                # its own deadline first.
                 try:
                     await sc.create_memory(
                         {
@@ -2965,7 +3044,13 @@ async def _search_memories_legacy(
         else None,
     }
 
-    rows = await sc.scored_search(search_data)
+    # CAURA-602 follow-up: per-tenant search bulkhead at the storage
+    # roundtrip. The route-entry slot was already held above; this slot
+    # bounds how many of one tenant's searches occupy storage-reader
+    # connections simultaneously, preserving cold-tenant search latency
+    # under a hot-tenant storm.
+    async with per_tenant_storage_slot("storage_search", tenant_id):
+        rows = await sc.scored_search(search_data)
 
     # Post-filter by min_similarity, then trim to top_k. The `vec_sim is None`
     # branch is defensive: the scored_search SQL currently enforces
