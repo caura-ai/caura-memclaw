@@ -2185,38 +2185,85 @@ class PostgresService:
     async def agent_add(self, data: dict) -> Agent:
         """Create new agent — handle race with concurrent registrations.
 
-        The uq_agents_tenant_agent unique index rejects duplicates at
-        INSERT time; on conflict we re-SELECT and merge updates.
+        Uses ``INSERT ... ON CONFLICT (tenant_id, agent_id) DO NOTHING
+        RETURNING ...`` paired with a same-session re-SELECT for the
+        conflicted case. The same shape ``memory_add_all`` uses for
+        per-attempt idempotency (caura-memclaw#23): it avoids the
+        ``flush() → IntegrityError → rollback() → re-SELECT`` pattern's
+        mid-session rollback, which is brittle (the rollback aborts any
+        other pending writes in the same session) and forced
+        ``test_concurrent_same_key_returns_same_id`` to pre-create the
+        agent row to dodge the failure mode.
         """
-        from sqlalchemy.exc import IntegrityError
-
         async with get_session() as session:
-            agent = Agent(**data)
-            session.add(agent)
-            try:
-                await session.flush()
-            except IntegrityError:
-                await session.rollback()
-                logger.info(
-                    "Agent dedup race: '%s/%s' already exists, re-selecting",
-                    data.get("tenant_id"),
-                    data.get("agent_id"),
-                )
-                result = await session.execute(
-                    select(Agent).where(
-                        Agent.tenant_id == data["tenant_id"],
-                        Agent.agent_id == data["agent_id"],
-                    )
-                )
+            stmt = (
+                pg_insert(Agent)
+                .values(**data)
+                .on_conflict_do_nothing(index_elements=["tenant_id", "agent_id"])
+                .returning(Agent.id)
+            )
+            inserted_id = (await session.execute(stmt)).scalar_one_or_none()
+
+            if inserted_id is not None:
+                # New row — fetch the full ORM object for the return.
+                # ``scalar_one_or_none`` (not ``scalar_one``) defends
+                # against a concurrent delete between INSERT RETURNING
+                # and the re-SELECT: ``scalar_one`` would raise
+                # ``NoResultFound`` and surface as a 500 with no
+                # actionable detail. We just-INSERTED this row in the
+                # same session so the realistic race window is
+                # vanishingly small, but cheap to be loud about it.
+                result = await session.execute(select(Agent).where(Agent.id == inserted_id))
                 agent = result.scalar_one_or_none()
                 if agent is None:
                     raise ValueError(
-                        f"Agent '{data.get('agent_id')}' conflict but re-select returned nothing"
+                        f"Agent row {inserted_id} vanished after INSERT — concurrent delete during agent_add"
                     )
-                # Apply any new fields from the request (e.g. fleet_id backfill)
-                for key in ("fleet_id", "trust_level"):
-                    if key in data and data[key] is not None:
-                        setattr(agent, key, data[key])
+                return agent
+
+            # Conflict: another caller (or a prior attempt) already
+            # created the row. Re-SELECT and apply any new fields the
+            # caller supplied (e.g. ``fleet_id`` backfill from a write
+            # that learned the fleet after the agent existed).
+            #
+            # ``.with_for_update()`` on the re-SELECT serialises against
+            # an in-progress concurrent ``agent_delete`` so we either
+            # see the live row or wait until that delete commits — if
+            # it does commit before we read, we still raise the
+            # ``ValueError`` below (the row genuinely vanished), but
+            # the lock removes the gap where the row was visible during
+            # ``ON CONFLICT`` and gone here.
+            logger.info(
+                "Agent dedup race: '%s/%s' already exists, re-selecting",
+                data.get("tenant_id"),
+                data.get("agent_id"),
+            )
+            result = await session.execute(
+                select(Agent)
+                .where(
+                    Agent.tenant_id == data["tenant_id"],
+                    Agent.agent_id == data["agent_id"],
+                )
+                .with_for_update()
+            )
+            agent = result.scalar_one_or_none()
+            if agent is None:
+                # Conflict happened but the row vanished — concurrent
+                # delete or schema drift. Surface as a clean ValueError
+                # so the caller sees the inconsistent state rather than
+                # an opaque ``None`` returned from a "create" call.
+                raise ValueError(f"Agent '{data.get('agent_id')}' conflict but re-select returned nothing")
+            # Track whether any field actually changed so we don't
+            # bump ``updated_at`` (or burn an UPDATE roundtrip) when
+            # the caller's data has nothing to backfill — e.g. a
+            # plain idempotent re-register that just wants the
+            # existing row back.
+            changed = False
+            for key in ("fleet_id", "trust_level"):
+                if key in data and data[key] is not None and getattr(agent, key) != data[key]:
+                    setattr(agent, key, data[key])
+                    changed = True
+            if changed:
                 agent.updated_at = datetime.now(UTC)
                 await session.flush()
             return agent
