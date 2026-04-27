@@ -191,7 +191,7 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 1
 
@@ -311,7 +311,7 @@ jobs:
 
       - name: Checkout PR branch
         if: steps.auth.outputs.authorized == 'true' && steps.pr.outputs.is_pr == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ steps.pr.outputs.head_ref }}
           fetch-depth: 1
