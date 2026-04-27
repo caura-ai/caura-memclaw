@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import re
 import time
 from datetime import UTC, datetime
 from uuid import UUID
@@ -14,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from common.models.memory import Memory
 from core_api.auth import AuthContext, get_auth_context
 from core_api.clients.storage_client import get_storage_client
+from core_api.config import settings as app_settings
 from core_api.constants import DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT
 from core_api.db.session import get_db
 from core_api.middleware.idempotency import (
@@ -733,7 +736,28 @@ async def _write_memory_inner(
     return result
 
 
-@router.post("/memories/bulk", response_model=BulkMemoryResponse, status_code=200)
+BULK_ATTEMPT_ID_HEADER = "X-Bulk-Attempt-Id"
+# Tighter than ``MAX_IDEMPOTENCY_KEY_LEN`` (255) because the token is
+# concatenated with ``:{i}`` to form the per-row ``client_request_id``
+# stored on every memory; 128 leaves comfortable room for a 100-item
+# batch (``:99`` adds 3 chars) while keeping the partial-unique index
+# leaves narrow.
+MAX_BULK_ATTEMPT_ID_LEN = 128
+_BULK_ATTEMPT_ID_PATTERN = re.compile(rf"^[A-Za-z0-9._:\-]{{1,{MAX_BULK_ATTEMPT_ID_LEN}}}$")
+
+
+@router.post(
+    "/memories/bulk",
+    status_code=200,
+    # The route returns ``JSONResponse`` directly so it can vary the
+    # status code between 200 and 207, which strips FastAPI's automatic
+    # response-model inference. Declare both shapes explicitly so the
+    # OpenAPI doc keeps documenting the body for SDK generators.
+    responses={
+        200: {"model": BulkMemoryResponse},
+        207: {"model": BulkMemoryResponse},
+    },
+)
 @write_bulk_limit
 async def write_memories_bulk(
     request: Request,
@@ -742,15 +766,59 @@ async def write_memories_bulk(
     auth: AuthContext = Depends(get_auth_context),
     db: AsyncSession = Depends(get_db),
     idempotency_key: str | None = Header(None, alias=IDEMPOTENCY_HEADER),
+    bulk_attempt_id: str | None = Header(None, alias=BULK_ATTEMPT_ID_HEADER),
 ):
-    """Write up to 100 memories in a single request.
+    """Write up to 100 memories with per-attempt idempotency (CAURA-602).
 
-    Batches embeddings and enrichment for throughput. Returns per-item
-    results (created/duplicate/error).
+    Required header ``X-Bulk-Attempt-Id`` identifies the *attempt*. A
+    retry of the same logical batch reuses the same value; storage's
+    per-item unique constraint then converts each row into either
+    ``created`` or ``duplicate_attempt`` deterministically. The route
+    returns:
+
+    - ``200`` when every item resolved as ``created``,
+      ``duplicate_attempt``, or ``duplicate_content``.
+    - ``207 Multi-Status`` when at least one item has ``status="error"``
+      (validation, enrichment timeout, missing storage id) AND at least
+      one item succeeded — partial outcomes are explicit, never inferred
+      from a 5xx with side effects.
+    - ``200`` when every item is an error too — the request was processed
+      successfully; per-item ``status`` carries the rejection. We
+      deliberately don't reuse 422 here because FastAPI already emits
+      422 for request-body Pydantic validation, and clients that branch
+      on status code alone shouldn't have to disambiguate "request was
+      malformed" from "request parsed and every item was rejected on
+      merit."
+    - ``504`` when the bulk-only budget burns before storage commits;
+      the response carries no per-item state, so a retry with the same
+      attempt id is the recovery path.
+
+    The pre-existing ``Idempotency-Key`` header still controls
+    *response*-level replay; ``X-Bulk-Attempt-Id`` is a separate
+    contract operating one layer down. Both are honoured: the header
+    cache short-circuits when the receipt is final, the per-row
+    constraint resolves the slow path when the receipt is missing or
+    pending.
     """
     auth.enforce_read_only()
     auth.enforce_usage_limits()
     auth.enforce_tenant(body.tenant_id)
+
+    if not bulk_attempt_id:
+        # Required as of CAURA-602 — without it we can't make the bulk
+        # write retry-safe, and silent-create regressions reappear under
+        # any storage-side cancellation. Reject with a 4xx so SDKs see
+        # the breaking change, not a soft-fallback that masks the bug.
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing required {BULK_ATTEMPT_ID_HEADER} header",
+        )
+    if not _BULK_ATTEMPT_ID_PATTERN.match(bulk_attempt_id):
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Invalid {BULK_ATTEMPT_ID_HEADER}: must match ^[A-Za-z0-9._:\\-]{{1,128}}$"),
+        )
+
     # Idempotency replay short-circuits BEFORE the per-tenant slot — a
     # cached retry must not consume a write-concurrency slot.
     _idem = await idempotency_for(request, body.tenant_id, idempotency_key)
@@ -761,7 +829,34 @@ async def write_memories_bulk(
         # carry on the cached response.
         return JSONResponse(content=_body, status_code=_status)
     async with per_tenant_slot("write", body.tenant_id):
-        return await _write_memories_bulk_inner(body, response, auth, db, _idem)
+        return await _write_memories_bulk_inner(body, response, auth, db, _idem, bulk_attempt_id)
+
+
+def _bulk_response(result: BulkMemoryResponse) -> JSONResponse:
+    """Pick HTTP status per CAURA-602 contract:
+
+    - 200 when there are no errors at all, OR every item is an error
+      (the request was processed; rejections are per-item business
+      logic, not a transport-level failure). Avoiding 422 here keeps
+      the route's response space disjoint from FastAPI's automatic
+      422-on-body-validation.
+    - 207 Multi-Status when the batch is mixed — at least one error
+      AND at least one resolved row. ``duplicate_attempt`` and
+      ``duplicate_content`` both count as resolved (they carry an
+      ``id``), so a batch of ``[error, duplicate_attempt]`` (i.e.
+      ``created=0, duplicates=1, errors=1``) is 207, not 200 — the
+      condition tests ``created == 0 and duplicates == 0`` *together*
+      so any duplicate keeps the response in the mixed bucket.
+
+    Always returns the body verbatim; per-item ``status`` carries the
+    real outcome, so the HTTP code is purely a hint for clients that
+    can branch on 2xx / 207.
+    """
+    if result.errors == 0 or (result.created == 0 and result.duplicates == 0):
+        status_code = 200
+    else:
+        status_code = 207
+    return JSONResponse(content=result.model_dump(mode="json"), status_code=status_code)
 
 
 async def _write_memories_bulk_inner(
@@ -770,6 +865,7 @@ async def _write_memories_bulk_inner(
     auth: AuthContext,
     db: AsyncSession,
     idem: IdempotencyGuard | None,
+    bulk_attempt_id: str,
 ):
     agent = await get_or_create_agent(db, body.tenant_id, body.agent_id, body.fleet_id)
     if not body.fleet_id and agent.get("fleet_id"):
@@ -781,10 +877,55 @@ async def _write_memories_bulk_inner(
     if usage:
         response.headers["X-RateLimit-Limit"] = str(usage.get("limit", "unlimited"))
         response.headers["X-RateLimit-Remaining"] = str(usage.get("remaining", "unlimited"))
-    result = await create_memories_bulk(db, body)
+
+    try:
+        result = await asyncio.wait_for(
+            create_memories_bulk(db, body, bulk_attempt_id=bulk_attempt_id),
+            timeout=app_settings.bulk_request_timeout_seconds,
+        )
+    except (TimeoutError, httpx.TimeoutException):
+        # ``asyncio.wait_for`` documents raising ``asyncio.TimeoutError``,
+        # which Python 3.11 aliased to the builtin ``TimeoutError``.
+        # Project floor is 3.12 (``requires-python = ">=3.12"``), so the
+        # builtin form is correct everywhere we run; ruff UP041 also
+        # mandates this shape. Anyone porting back to Python 3.10 must
+        # change this to ``except asyncio.TimeoutError:`` first.
+        #
+        # ``httpx.TimeoutException`` is the base for ReadTimeout /
+        # WriteTimeout / ConnectTimeout / PoolTimeout. The storage
+        # client's pool sets ``read=120s`` deliberately above the 90s
+        # ``bulk_request_timeout_seconds`` so the asyncio cancellation
+        # almost always wins the race, but we catch httpx timeouts here
+        # as a defence-in-depth fallback. Either path means the storage
+        # call may have committed without surfacing an id; the
+        # ``X-Bulk-Attempt-Id`` retry contract recovers it.
+        logger.warning(
+            "bulk write exceeded %ss budget; client should retry with same %s",
+            app_settings.bulk_request_timeout_seconds,
+            BULK_ATTEMPT_ID_HEADER,
+        )
+        # No per-item state to surface — the storage call may have
+        # committed some rows, none, or be still in flight. Do NOT
+        # record the idempotency receipt so a retry doesn't replay an
+        # incomplete answer; the per-item attempt-id is the recovery
+        # contract and a retry will resolve every committed row to
+        # ``duplicate_attempt`` with its canonical id.
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "bulk write timed out before completing; retry with "
+                f"the same {BULK_ATTEMPT_ID_HEADER} to recover any "
+                "committed items."
+            ),
+        )
+
+    bulk_resp = _bulk_response(result)
     if idem:
-        await idem.record(result.model_dump(mode="json"), 200)
-    return result
+        # Replay the live status code, not a hardcoded 200 — a 207
+        # batch with mixed errors must replay AS 207, not as a 200
+        # that hides the partial failure from the retried client.
+        await idem.record(result.model_dump(mode="json"), bulk_resp.status_code)
+    return bulk_resp
 
 
 @router.delete("/memories/{memory_id}", status_code=204)

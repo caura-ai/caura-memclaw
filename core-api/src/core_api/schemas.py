@@ -91,14 +91,47 @@ class BulkMemoryCreate(BaseModel):
 
 
 class BulkItemResult(BaseModel):
+    """Per-item outcome of a bulk write (CAURA-602).
+
+    Status semantics:
+
+    - ``"created"``: this attempt newly inserted the row; ``id`` is the
+      new row's id.
+    - ``"duplicate_attempt"``: same ``X-Bulk-Attempt-Id``+index already
+      committed in a prior call. ``id`` is the canonical row from that
+      first attempt. Returned when a retry hits the per-item unique
+      constraint — what eliminates the silent-create class.
+    - ``"duplicate_content"``: a different attempt's row with the same
+      ``content_hash`` already exists. ``id`` and ``duplicate_of`` both
+      point at the existing row; emitted in place of an insert.
+    - ``"error"``: the row could not be processed (validation,
+      enrichment timeout, missing storage id). ``error`` describes.
+
+    The legacy ``"duplicate"`` status is gone — callers must read
+    ``duplicate_attempt`` vs ``duplicate_content`` because they imply
+    different client-side actions (an idempotent retry succeeded vs
+    "you already wrote this content earlier").
+    """
+
     index: int
-    status: str  # "created", "duplicate", "error"
+    client_request_id: str | None = None
+    status: Literal["created", "duplicate_attempt", "duplicate_content", "error"]
     id: UUID | None = None
     duplicate_of: UUID | None = None
     error: str | None = None
 
 
 class BulkMemoryResponse(BaseModel):
+    """Aggregate response from the bulk-write endpoint.
+
+    ``duplicates`` rolls up both ``duplicate_attempt`` and
+    ``duplicate_content`` for top-level metric continuity; per-item
+    detail lives in ``results``. The route returns 200 when everything
+    succeeded and 207 Multi-Status when at least one item is in error —
+    callers must read per-item ``status`` and never infer success from
+    a 2xx alone.
+    """
+
     created: int
     duplicates: int
     errors: int

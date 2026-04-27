@@ -85,7 +85,12 @@ async def test_different_body_same_key_returns_422(client):
 
 
 async def test_replay_bulk_endpoint(client):
-    """Same Idempotency-Key on /memories/bulk replays too."""
+    """Same Idempotency-Key on /memories/bulk replays too.
+
+    The header path (this test) is independent of the row-level
+    per-attempt-id path (CAURA-602): both layers compose, but a real
+    replay short-circuits before the storage call.
+    """
     tenant_id, headers = get_test_auth()
     key = _new_key()
     body = {
@@ -96,7 +101,14 @@ async def test_replay_bulk_endpoint(client):
             {"content": f"bulk idem b {uid()}"},
         ],
     }
-    h = {**headers, "Idempotency-Key": key}
+    h = {
+        **headers,
+        "Idempotency-Key": key,
+        # Required as of CAURA-602; same value across both calls so the
+        # row-level fallback would also be deterministic if the
+        # header-level cache somehow missed.
+        "X-Bulk-Attempt-Id": f"idem-replay-{uid()}",
+    }
 
     r1 = await client.post("/api/v1/memories/bulk", json=body, headers=h)
     r2 = await client.post("/api/v1/memories/bulk", json=body, headers=h)

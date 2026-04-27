@@ -145,6 +145,15 @@ def _relation_weight(relation_type: str, row_weight: float) -> float:
     return type_w * row_weight
 
 
+# Cached at import time so the per-row column-name filter on the bulk
+# write hot path (100 items x ~25 columns) doesn't pay the cost of
+# walking ``Memory.__table__.columns`` and ``__mapper__.column_attrs``
+# on every call. Both sets are static for the lifetime of the process.
+_MEMORY_VALID_FIELDS = frozenset(
+    {c.key for c in Memory.__table__.columns} | {a.key for a in Memory.__mapper__.column_attrs}
+)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # PostgresService
 # ═══════════════════════════════════════════════════════════════════════════
@@ -192,11 +201,7 @@ class PostgresService:
 
     @staticmethod
     def _filter_memory_fields(data: dict) -> dict:
-        # Accept both DB column names and ORM attribute names
-        col_keys = {c.key for c in Memory.__table__.columns}
-        attr_keys = {attr.key for attr in Memory.__mapper__.column_attrs}
-        valid = col_keys | attr_keys
-        return {k: v for k, v in data.items() if k in valid}
+        return {k: v for k, v in data.items() if k in _MEMORY_VALID_FIELDS}
 
     async def memory_add(self, data: dict) -> Memory:
         async with get_session() as session:
@@ -205,12 +210,141 @@ class PostgresService:
             await session.flush()
             return memory
 
-    async def memory_add_all(self, items: list[dict]) -> list[Memory]:
+    async def memory_add_all(self, items: list[dict]) -> list[dict]:
+        """Insert with per-attempt idempotency (CAURA-602).
+
+        Every item must carry a non-empty ``client_request_id``. Callers
+        on the bulk-write path derive it from the
+        ``X-Bulk-Attempt-Id`` header (``f"{attempt_id}:{index}"``);
+        server-internal callers (auto-chunk, atomic-facts) generate a
+        UUID per item. Partial unique
+        ``ix_memories_attempt_unique`` makes a retry of the same logical
+        attempt deterministic: rows already committed by a prior call
+        are detected via ``ON CONFLICT DO NOTHING`` and returned with
+        ``was_inserted=False`` and the canonical row id, instead of
+        being silently re-inserted or vanishing because the response
+        was lost mid-flight.
+
+        Returns one entry per input item, **in input order**:
+
+            ``{client_request_id, id, was_inserted}``
+
+        ``id`` is ``None`` only in the pathological case where the
+        item was neither inserted nor found on a follow-up read — e.g.
+        a concurrent soft-delete between INSERT and SELECT, or the
+        unresolved row drifted out of scope. The caller surfaces those
+        as per-item errors.
+        """
+        if not items:
+            return []
+
+        for d in items:
+            if not d.get("client_request_id"):
+                # Required at this layer so the partial-unique guarantee
+                # holds for every row. Routing the rejection here, rather
+                # than at the FastAPI route, also catches in-process
+                # callers (auto-chunk via ``sc.create_memories``) that
+                # forgot to mint an id.
+                raise ValueError("memory_add_all: every item must carry client_request_id")
+
+        # All callers send a single-tenant, single-fleet batch (the
+        # bulk endpoint is tenant-and-fleet-scoped on the way in). Pin
+        # the post-conflict re-query to BOTH dimensions so an attacker
+        # who learned a foreign ``client_request_id`` can't read
+        # across tenants OR fleets by sneaking it into an items list,
+        # and so the re-query window matches the unique index's scope
+        # ``(tenant_id, COALESCE(fleet_id, ''), client_request_id)``
+        # exactly. Validating up-front keeps the invariant explicit
+        # instead of relying on the upstream schema.
+        tenant_id = items[0]["tenant_id"]
+        fleet_id = items[0].get("fleet_id")
+        if any(d.get("tenant_id") != tenant_id for d in items):
+            raise ValueError("memory_add_all: all items must share the same tenant_id")
+        if any(d.get("fleet_id") != fleet_id for d in items):
+            raise ValueError("memory_add_all: all items must share the same fleet_id")
+
         async with get_session() as session:
-            memories = [Memory(**self._filter_memory_fields(d)) for d in items]
-            session.add_all(memories)
-            await session.flush()
-            return memories
+            rows = [self._filter_memory_fields(d) for d in items]
+            # The conflict target must mirror ``ix_memories_attempt_unique``
+            # *expression-for-expression* — the planner only treats the
+            # ON CONFLICT and the partial-unique index as matched if every
+            # element is byte-equivalent, including the ``COALESCE`` over
+            # nullable ``fleet_id``. Stripping the COALESCE here would
+            # silently fall back to "no inferred constraint" and double-
+            # insert on retry for fleetless attempts.
+            stmt = (
+                pg_insert(Memory)
+                .values(rows)
+                .on_conflict_do_nothing(
+                    # ``text("COALESCE(fleet_id, '')")`` matches migration
+                    # 007's CREATE INDEX SQL character-for-character.
+                    # ``func.coalesce(Memory.fleet_id, "")`` works today
+                    # via Postgres conflict-inference normalisation
+                    # (which strips table qualifiers), but pinning the
+                    # raw text removes the dependency on that
+                    # normalisation behaviour across SQLAlchemy + asyncpg
+                    # versions. A future renderer change that emits
+                    # ``coalesce(memories.fleet_id, '')`` *would* still
+                    # match today, but if the planner ever returns "no
+                    # unique constraint matches the ON CONFLICT
+                    # specification" the silent-create class re-emerges
+                    # as a 500-on-every-retry. The model-level Index in
+                    # ``common/models/memory.py`` uses the same text()
+                    # form for the same reason.
+                    index_elements=[
+                        Memory.tenant_id,
+                        text("COALESCE(fleet_id, '')"),
+                        Memory.client_request_id,
+                    ],
+                    index_where=text("deleted_at IS NULL AND client_request_id IS NOT NULL"),
+                )
+                .returning(Memory.id, Memory.client_request_id)
+            )
+            inserted: dict[str, UUID] = {
+                row.client_request_id: row.id for row in (await session.execute(stmt)).all()
+            }
+
+            # Items the conflict swallowed already exist — committed by a
+            # prior attempt with the same ``X-Bulk-Attempt-Id``. Re-read
+            # their canonical ids in the same session so the caller can
+            # surface ``duplicate_attempt`` instead of dropping them.
+            unresolved = [d["client_request_id"] for d in items if d["client_request_id"] not in inserted]
+            existing: dict[str, UUID] = {}
+            if unresolved:
+                # Chunk the IN-list to keep the parameter count well below
+                # asyncpg's 32k bind-arg ceiling. 500 mirrors the bulk
+                # batch ceiling so a single-batch retry is one query;
+                # larger calls (auto-chunk) split cleanly.
+                fleet_predicate = (
+                    Memory.fleet_id == fleet_id if fleet_id is not None else Memory.fleet_id.is_(None)
+                )
+                for chunk_start in range(0, len(unresolved), 500):
+                    chunk = unresolved[chunk_start : chunk_start + 500]
+                    result = await session.execute(
+                        select(Memory.id, Memory.client_request_id).where(
+                            Memory.tenant_id == tenant_id,
+                            fleet_predicate,
+                            Memory.client_request_id.in_(chunk),
+                            Memory.deleted_at.is_(None),
+                        )
+                    )
+                    for row in result.all():
+                        existing[row.client_request_id] = row.id
+
+        out: list[dict] = []
+        for d in items:
+            crid = d["client_request_id"]
+            if crid in inserted:
+                out.append({"client_request_id": crid, "id": str(inserted[crid]), "was_inserted": True})
+            elif crid in existing:
+                out.append({"client_request_id": crid, "id": str(existing[crid]), "was_inserted": False})
+            else:
+                # Soft-delete or schema-skew edge case: the row was neither
+                # newly inserted nor visible on the follow-up read. ``id``
+                # is None so the core-api layer surfaces this as a
+                # per-item error rather than fabricating an id.
+                out.append({"client_request_id": crid, "id": None, "was_inserted": False})
+        return out
 
     async def memory_soft_delete(self, memory_id: UUID) -> None:
         async with get_session() as session:
@@ -400,9 +534,19 @@ class PostgresService:
         tenant_id: str,
         hashes: list[str],
         fleet_id: str | None = None,
-    ) -> dict[str, UUID]:
+    ) -> dict[str, dict]:
+        """Map ``content_hash → {id, client_request_id}`` for existing rows.
+
+        ``client_request_id`` is included so the upstream bulk-write
+        path can distinguish the two duplicate states (CAURA-602):
+        a content match whose stored ``client_request_id`` equals the
+        current request's per-item id is the caller's *own* retry
+        (``duplicate_attempt``); any other match is a different
+        attempt's content (``duplicate_content``). NULL on legacy rows
+        written before the column existed.
+        """
         async with get_session() as session:
-            stmt = select(Memory.content_hash, Memory.id).where(
+            stmt = select(Memory.content_hash, Memory.id, Memory.client_request_id).where(
                 Memory.tenant_id == tenant_id,
                 Memory.content_hash.in_(hashes),
                 Memory.deleted_at.is_(None),
@@ -412,7 +556,7 @@ class PostgresService:
             else:
                 stmt = stmt.where(Memory.fleet_id.is_(None))
             rows = (await session.execute(stmt)).all()
-            return {row[0]: row[1] for row in rows}
+            return {row[0]: {"id": row[1], "client_request_id": row[2]} for row in rows}
 
     # ------------------------------------------------------------------
     # C) Scored search (CTE-based)

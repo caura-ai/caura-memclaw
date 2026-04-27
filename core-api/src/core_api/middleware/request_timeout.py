@@ -26,6 +26,22 @@ from core_api.constants import is_mcp_path
 
 logger = logging.getLogger(__name__)
 
+# Routes that opt out of the blanket middleware budget and enforce their
+# own deadline at the route layer. Bulk-write (CAURA-602) needs a longer
+# budget than the single-write hot path, and cancelling it from this
+# middleware *after* storage commits is exactly what produced the
+# silent-create regression in loadtest-1777301515 — the route now wraps
+# its own ``asyncio.wait_for`` and surfaces the 504 with the retry
+# contract intact.
+_TIMEOUT_OPT_OUT_PATHS: frozenset[str] = frozenset({"/api/v1/memories/bulk"})
+
+
+def _is_opted_out(path: str) -> bool:
+    # Exact match keeps neighbours like ``/memories/bulk-delete`` on the
+    # default budget. ASGI ``scope["path"]`` excludes the querystring, so
+    # no startswith-with-``?`` fallback is needed.
+    return path in _TIMEOUT_OPT_OUT_PATHS
+
 
 class RequestTimeoutMiddleware:
     def __init__(self, app: ASGIApplication, timeout_seconds: float) -> None:
@@ -33,7 +49,7 @@ class RequestTimeoutMiddleware:
         self.timeout_seconds = timeout_seconds
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or is_mcp_path(scope["path"]):
+        if scope["type"] != "http" or is_mcp_path(scope["path"]) or _is_opted_out(scope["path"]):
             await self.app(scope, receive, send)
             return
 

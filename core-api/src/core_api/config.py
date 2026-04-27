@@ -118,6 +118,16 @@ class Settings(BaseSettings):
     # Must stay >= BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS in constants.py
     # so the inner cap can actually fire before the outer one.
     request_timeout_seconds: float = 45.0
+    # Bulk-only request budget (CAURA-602). The blanket 45s cap above
+    # cancelled in-flight ``/memories/bulk`` calls *after* storage had
+    # already committed, surfacing as silent creates on retry. Bulk
+    # routes opt out of the global middleware (see ``app.py``) and
+    # enforce this longer budget themselves; the per-attempt unique
+    # constraint on ``memories.client_request_id`` makes a 504-here
+    # retry-safe at the row level. p95 today is ~42s under load, so
+    # 90s is roughly 2x headroom while staying well under the 300s
+    # Cloud Run platform ceiling.
+    bulk_request_timeout_seconds: float = 90.0
     # Rate limits applied per-route via slowapi decorators
     # (middleware/rate_limit.py). Syntax: "<count>/<period>" where period
     # is second | minute | hour | day.
@@ -249,6 +259,16 @@ class Settings(BaseSettings):
                 f"enrichment_inline_timeout_seconds ({self.enrichment_inline_timeout_seconds}s) "
                 f"must be < request_timeout_seconds ({self.request_timeout_seconds}s) so the "
                 "inline embed+enrich cap fires before the outer request budget."
+            )
+        if self.bulk_request_timeout_seconds < BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS:
+            # Bulk runs its own budget, so the same inner-fires-first
+            # rule has to hold here. If enrichment can't finish under
+            # the bulk budget, the only safe outcome is a 504 with the
+            # per-attempt-id retry path.
+            raise ValueError(
+                f"bulk_request_timeout_seconds ({self.bulk_request_timeout_seconds}s) "
+                f"must be >= BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS "
+                f"({BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS}s)."
             )
         return self
 

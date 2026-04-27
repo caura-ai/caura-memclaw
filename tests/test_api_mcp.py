@@ -156,11 +156,15 @@ async def test_bulk_write_via_api(client):
         for i in range(5)
     ]
 
-    bulk_resp = await client.post("/api/v1/memories/bulk", json={
-        "tenant_id": tenant_id,
-        "agent_id": f"bulk-test-agent-{tag}",
-        "items": items,
-    }, headers=headers)
+    bulk_resp = await client.post(
+        "/api/v1/memories/bulk",
+        json={
+            "tenant_id": tenant_id,
+            "agent_id": f"bulk-test-agent-{tag}",
+            "items": items,
+        },
+        headers={**headers, "X-Bulk-Attempt-Id": f"bulk-write-{tag}"},
+    )
     assert bulk_resp.status_code == 200, bulk_resp.text
     data = bulk_resp.json()
     assert data["created"] == 5
@@ -191,13 +195,19 @@ async def test_bulk_write_dedup(client):
         {"content": f"Unique content — {tag}"},
     ]
 
-    bulk_resp = await client.post("/api/v1/memories/bulk", json={
-        "tenant_id": tenant_id,
-        "agent_id": f"dedup-test-agent-{tag}",
-        "items": items,
-    }, headers=headers)
+    bulk_resp = await client.post(
+        "/api/v1/memories/bulk",
+        json={
+            "tenant_id": tenant_id,
+            "agent_id": f"dedup-test-agent-{tag}",
+            "items": items,
+        },
+        headers={**headers, "X-Bulk-Attempt-Id": f"dedup-{tag}"},
+    )
     assert bulk_resp.status_code == 200, bulk_resp.text
     data = bulk_resp.json()
-    # At least one should be flagged as duplicate (intra-batch)
+    # At least one should be flagged as a duplicate (intra-batch).
+    # Counted under the rolled-up ``duplicates`` field which now includes
+    # both ``duplicate_attempt`` and ``duplicate_content`` per CAURA-602.
     assert data["duplicates"] >= 1
     assert data["created"] + data["duplicates"] + data["errors"] == 3

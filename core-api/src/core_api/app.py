@@ -34,7 +34,10 @@ from core_api.constants import VERSION, is_mcp_path
 from core_api.consumer import register_consumers
 from core_api.mcp_server import get_mcp_app, mcp_lifespan
 from core_api.middleware.rate_limit import limiter
-from core_api.middleware.request_timeout import RequestTimeoutMiddleware
+from core_api.middleware.request_timeout import (
+    _TIMEOUT_OPT_OUT_PATHS,
+    RequestTimeoutMiddleware,
+)
 from core_api.routes.agents import router as agents_router
 from core_api.routes.audit import router as audit_router
 from core_api.routes.crystallizer import router as crystallizer_router
@@ -315,6 +318,26 @@ if _os.getenv("TESTING") == "1":
     app.include_router(testing_router, prefix="/api/v1")
 
 app.mount("/mcp", get_mcp_app())
+
+
+# CAURA-602: turn a silent regression into a startup crash. The
+# request-timeout middleware skips a hardcoded path-allowlist; if a
+# router prefix or path ever moves and the allowlist isn't updated to
+# match, the silent-create class would re-emerge with no error. Verify
+# at import time that every opt-out path is actually mounted on this
+# app — string-matching is forced by the ASGI scope shape, but at
+# least the divergence will fail loudly. ``getattr`` filters out
+# ``Host`` route entries (no ``.path``); ``Mount`` and ``APIRoute``
+# both carry it.
+_registered_paths = {getattr(r, "path", None) for r in app.routes if getattr(r, "path", None)}
+for _opt_out in _TIMEOUT_OPT_OUT_PATHS:
+    if _opt_out not in _registered_paths:
+        raise RuntimeError(
+            f"RequestTimeoutMiddleware opt-out path {_opt_out!r} is not "
+            "registered on the FastAPI app. Either the route was renamed/"
+            "removed or _TIMEOUT_OPT_OUT_PATHS in middleware/request_timeout.py "
+            "is stale; both are silent-create regressions waiting to happen."
+        )
 
 
 _static = Path(__file__).resolve().parent.parent.parent / "static"

@@ -185,18 +185,21 @@ class TestBulkResponseModel:
 
     def test_mixed_results(self):
         resp = BulkMemoryResponse(
-            created=1, duplicates=1, errors=1,
+            created=1, duplicates=2, errors=1,
             results=[
                 BulkItemResult(index=0, status="created", id=uuid4()),
-                BulkItemResult(index=1, status="duplicate", duplicate_of=uuid4()),
-                BulkItemResult(index=2, status="error", error="something broke"),
+                BulkItemResult(index=1, status="duplicate_content", duplicate_of=uuid4()),
+                BulkItemResult(index=2, status="duplicate_attempt", id=uuid4()),
+                BulkItemResult(index=3, status="error", error="something broke"),
             ],
             bulk_ms=200,
         )
         assert resp.created == 1
-        assert resp.duplicates == 1
+        assert resp.duplicates == 2
         assert resp.errors == 1
-        assert resp.results[2].error == "something broke"
+        assert resp.results[3].error == "something broke"
+        assert resp.results[1].status == "duplicate_content"
+        assert resp.results[2].status == "duplicate_attempt"
 
 
 # ---------------------------------------------------------------------------

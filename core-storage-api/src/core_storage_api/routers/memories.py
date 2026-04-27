@@ -64,11 +64,21 @@ async def create_memory(request: Request) -> dict:
 
 @router.post("/bulk")
 async def create_memories_bulk(request: Request) -> list[dict]:
+    """Insert a batch with per-attempt idempotency (CAURA-602).
+
+    Each item must carry ``client_request_id`` (server-derived from
+    ``X-Bulk-Attempt-Id`` upstream, or a UUID for in-process callers
+    like auto-chunk). The response is per-item — ``{client_request_id,
+    id, was_inserted}`` in input order — so the upstream core-api can
+    map to ``created`` (was_inserted=True) vs ``duplicate_attempt``
+    (False) without a second roundtrip. The full ORM dict was the prior
+    contract; downstream callers reconstruct any other fields from the
+    request payload they already hold.
+    """
     body: list[dict] = await request.json()
     for item in body:
         _parse_datetimes(item)
-    memories = await _svc.memory_add_all(body)
-    return [orm_to_dict(m, MEMORY_FIELDS) for m in memories]
+    return await _svc.memory_add_all(body)
 
 
 # ------------------------------------------------------------------
@@ -278,12 +288,19 @@ async def find_duplicate_hash(
 
 @router.post("/bulk-by-content-hashes")
 async def bulk_find_by_content_hashes(request: Request) -> dict:
+    """Wire format: ``{content_hash: {id, client_request_id}}``.
+
+    See ``memory_bulk_find_by_content_hashes`` for why
+    ``client_request_id`` is part of the response — the upstream bulk
+    route uses it to distinguish ``duplicate_attempt`` from
+    ``duplicate_content`` (CAURA-602).
+    """
     body: dict = await request.json()
     result = await _svc.memory_bulk_find_by_content_hashes(
         tenant_id=body["tenant_id"],
         hashes=body["hashes"],
     )
-    return {k: str(v) for k, v in result.items()}
+    return {ch: {"id": str(v["id"]), "client_request_id": v["client_request_id"]} for ch, v in result.items()}
 
 
 @router.get("/rdf-conflicts")

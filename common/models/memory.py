@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, Text, text
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -31,6 +31,12 @@ class Memory(Base):
     )
     title: Mapped[str | None] = mapped_column(Text)
     content_hash: Mapped[str | None] = mapped_column(Text)
+    # Per-attempt idempotency token (CAURA-602). Server-derived from
+    # ``X-Bulk-Attempt-Id + ":" + index`` on the bulk path; NULL for
+    # single-write and pre-rollout rows. The partial unique index
+    # ``ix_memories_attempt_unique`` (migration 007) enforces uniqueness
+    # only when this is non-NULL, so legacy paths are unaffected.
+    client_request_id: Mapped[str | None] = mapped_column(Text)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     search_vector = mapped_column(TSVECTOR)
@@ -80,6 +86,23 @@ class Memory(Base):
         Index("ix_memories_tenant_type", "tenant_id", "memory_type"),
         Index("ix_memories_tenant_agent", "tenant_id", "agent_id"),
         Index("ix_memories_content_hash", "tenant_id", "content_hash"),
+        # Backs per-attempt bulk-write idempotency (CAURA-602). Created
+        # ``CONCURRENTLY`` in migration 007 with the same predicates;
+        # declared here so SQLAlchemy reflection / Alembic autogen
+        # round-trips match the live schema. ``COALESCE(fleet_id, '')``
+        # makes fleetless rows participate in the unique constraint —
+        # PostgreSQL treats NULLs as distinct by default, so without
+        # this two retries with ``fleet_id IS NULL`` would both insert.
+        Index(
+            "ix_memories_attempt_unique",
+            "tenant_id",
+            func.coalesce(text("fleet_id"), ""),
+            "client_request_id",
+            unique=True,
+            postgresql_where=text(
+                "deleted_at IS NULL AND client_request_id IS NOT NULL"
+            ),
+        ),
         Index("ix_memories_status", "status"),
         Index("ix_memories_visibility", "visibility"),
         Index("ix_memories_valid_range", "ts_valid_start", "ts_valid_end"),

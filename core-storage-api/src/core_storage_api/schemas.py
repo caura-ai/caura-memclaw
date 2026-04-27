@@ -65,6 +65,7 @@ MEMORY_FIELDS: list[str] = [
     "created_at",
     "title",
     "content_hash",
+    "client_request_id",
     "expires_at",
     "deleted_at",
     "search_vector",
