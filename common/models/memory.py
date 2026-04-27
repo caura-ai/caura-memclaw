@@ -37,7 +37,8 @@ class Memory(Base):
 
     # RDF triple representation
     subject_entity_id: Mapped[uuid.UUID | None] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("entities.id", ondelete="SET NULL"),
+        PG_UUID(as_uuid=True),
+        ForeignKey("entities.id", ondelete="SET NULL"),
     )
     predicate: Mapped[str | None] = mapped_column(Text)
     object_value: Mapped[str | None] = mapped_column(Text)
@@ -47,23 +48,32 @@ class Memory(Base):
     ts_valid_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     # Status lifecycle
-    status: Mapped[str] = mapped_column(Text, server_default=text("'active'"), nullable=False)
+    status: Mapped[str] = mapped_column(
+        Text, server_default=text("'active'"), nullable=False
+    )
 
     # Visibility scope
     visibility: Mapped[str] = mapped_column(
-        Text, server_default=text("'scope_team'"), nullable=False,
+        Text,
+        server_default=text("'scope_team'"),
+        nullable=False,
     )
 
     # Recall tracking (incremented on agent-facing retrievals only)
-    recall_count: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
+    recall_count: Mapped[int] = mapped_column(
+        Integer, server_default=text("0"), nullable=False
+    )
     last_recalled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     # Crystallizer dedup tracking
-    last_dedup_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_dedup_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
 
     # Contradiction tracking
     supersedes_id: Mapped[uuid.UUID | None] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("memories.id", ondelete="SET NULL"),
+        PG_UUID(as_uuid=True),
+        ForeignKey("memories.id", ondelete="SET NULL"),
     )
 
     __table_args__ = (
@@ -76,4 +86,19 @@ class Memory(Base):
         Index("ix_memories_subject_entity", "subject_entity_id"),
         Index("ix_memories_recall_count", "recall_count"),
         Index("ix_memories_tenant_fleet", "tenant_id", "fleet_id"),
+        # Backs the cursor-paginated list path (``list_by_filters`` +
+        # the ``memclaw_list`` MCP tool) which orders by
+        # ``(created_at DESC, id DESC)`` under ``tenant_id = ?`` and
+        # ``deleted_at IS NULL``. Partial WHERE keeps the index small
+        # since soft-deleted rows are never read on the hot path.
+        # Bare-column references (``created_at.desc()`` not
+        # ``text("created_at DESC")``) so Alembic autogen can reflect
+        # and compare the index — matches ``analysis_report.py:38``.
+        Index(
+            "ix_memories_tenant_created_active",
+            "tenant_id",
+            created_at.desc(),
+            id.desc(),
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
     )
