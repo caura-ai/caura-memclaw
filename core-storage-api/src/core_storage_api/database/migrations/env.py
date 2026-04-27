@@ -30,7 +30,15 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 
 def do_run_migrations(connection):
-    context.configure(connection=connection, target_metadata=Base.metadata)
+    # ``transaction_per_migration=True`` is required so each migration owns its
+    # own transaction. Without it Alembic shares one tx across all migrations
+    # and ``autocommit_block`` (used by ``CREATE INDEX CONCURRENTLY`` etc.) has
+    # no per-migration tx to commit out of and asserts on entry.
+    context.configure(
+        connection=connection,
+        target_metadata=Base.metadata,
+        transaction_per_migration=True,
+    )
     with context.begin_transaction():
         context.run_migrations()
 

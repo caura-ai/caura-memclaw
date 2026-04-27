@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -83,37 +84,75 @@ async def init_database() -> None:
     alembic_cfg = Config()
     alembic_cfg.set_main_option("script_location", migrations_dir)
 
-    # Acquire a transaction-level advisory lock so concurrent workers serialise.
-    # pg_advisory_xact_lock is released on transaction commit or rollback,
-    # which is correct for a pooled connection where the session never closes.
+    # Session-scoped advisory lock on a dedicated connection so it survives
+    # the per-migration commits Alembic performs — migrations that use
+    # ``autocommit_block`` (e.g. ``CREATE INDEX CONCURRENTLY``) commit and
+    # reopen the transaction on the work connection, and the transaction-scoped
+    # variant would be released by those commits, breaking the multi-worker
+    # serialisation guarantee.
     _MIGRATION_LOCK_ID = 8_675_309  # arbitrary unique int
-    async with engine.begin() as conn:
-        await conn.execute(text("SET LOCAL lock_timeout = '120s'"))
-        await conn.execute(
-            text("SELECT pg_advisory_xact_lock(:lock_id)"),
-            {"lock_id": _MIGRATION_LOCK_ID},
-        )
-
-        has_tables = await conn.scalar(
-            text(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'memories')"
+    _LOCK_WAIT_SECONDS = 300
+    _LOCK_POLL_INTERVAL = 0.5
+    async with engine.connect() as lock_conn:
+        # AUTOCOMMIT so the lock_conn never sits "idle in transaction": a
+        # blocking ``pg_advisory_lock`` waiter keeps an open tx for the full
+        # wait, and ``CREATE INDEX CONCURRENTLY`` waits for all in-flight txs
+        # before proceeding — so a blocking waiter would stall the winning
+        # worker's migration. ``pg_try_advisory_lock`` polled in autocommit
+        # holds a tx for sub-ms per attempt and avoids that interaction.
+        lock_conn = await lock_conn.execution_options(isolation_level="AUTOCOMMIT")
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + _LOCK_WAIT_SECONDS
+        while True:
+            got = await lock_conn.scalar(
+                text("SELECT pg_try_advisory_lock(:lock_id)"),
+                {"lock_id": _MIGRATION_LOCK_ID},
             )
-        )
-        has_alembic = await conn.scalar(
-            text(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'alembic_version')"
+            if got:
+                break
+            if loop.time() >= deadline:
+                raise TimeoutError(
+                    f"Migration advisory lock {_MIGRATION_LOCK_ID} not "
+                    f"acquired within {_LOCK_WAIT_SECONDS}s — another worker "
+                    "still running migrations or stuck"
+                )
+            await asyncio.sleep(_LOCK_POLL_INTERVAL)
+        try:
+            async with engine.connect() as work_conn:
+                has_tables = await work_conn.scalar(
+                    text(
+                        "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                        "WHERE table_schema = 'public' AND table_name = 'memories')"
+                    )
+                )
+                has_alembic = await work_conn.scalar(
+                    text(
+                        "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                        "WHERE table_schema = 'public' AND table_name = 'alembic_version')"
+                    )
+                )
+                # End the implicit read tx so Alembic owns transaction lifecycle
+                # on this connection — required for ``autocommit_block``.
+                await work_conn.commit()
+
+                def _run_upgrade(connection: Connection) -> None:
+                    alembic_cfg.attributes["connection"] = connection
+                    if has_tables and not has_alembic:
+                        # Tables exist from legacy backend — stamp as current, skip creation
+                        logger.info("Existing tables detected, stamping Alembic at head")
+                        command.stamp(alembic_cfg, "head")
+                    else:
+                        command.upgrade(alembic_cfg, "head")
+
+                await work_conn.run_sync(_run_upgrade)
+        finally:
+            # Must release before the connection returns to the pool —
+            # SQLAlchemy's rollback-on-return doesn't release session-scoped
+            # advisory locks, so a pooled session could otherwise hand the
+            # lock to the next caller.
+            await lock_conn.execute(
+                text("SELECT pg_advisory_unlock(:lock_id)"),
+                {"lock_id": _MIGRATION_LOCK_ID},
             )
-        )
-
-        def _run_upgrade(connection: Connection) -> None:
-            alembic_cfg.attributes["connection"] = connection
-            if has_tables and not has_alembic:
-                # Tables exist from legacy backend — stamp as current, skip creation
-                logger.info("Existing tables detected, stamping Alembic at head")
-                command.stamp(alembic_cfg, "head")
-            else:
-                command.upgrade(alembic_cfg, "head")
-
-        await conn.run_sync(_run_upgrade)
 
     logger.info("Database initialization complete")
