@@ -36,6 +36,34 @@ services:
   # ── Core Storage API (PostgreSQL CRUD) ──────────────────────────
 
   core-storage-api:
+    # Pulls the published multi-arch image from ghcr.io.
+    #
+    # ``pull_policy: missing`` is required because Compose's default
+    # when both ``image:`` and ``build:`` are present is to BUILD
+    # locally and ignore the registry — the opposite of what we want.
+    # ``missing`` pulls only when the image is absent from the local
+    # cache: first ``docker compose up`` fetches; subsequent ``up``
+    # commands re-use the cached image (fast, no registry round-trip,
+    # works offline). Crucially, this means a moving tag like
+    # ``:latest`` does NOT silently upgrade on every ``up`` — version
+    # changes are explicit. Upgrade path:
+    #
+    #     docker compose pull && docker compose up -d
+    #
+    # The ``build:`` block is for ``docker compose up --build
+    # --no-pull`` (``--no-pull`` is needed when no local image is
+    # cached and you want to build from source without network: without
+    # it, ``pull_policy: missing`` triggers a pull attempt before the
+    # build starts and fails if the registry is unreachable. When the
+    # image already exists locally, ``--build`` alone is sufficient to
+    # force a rebuild.) Compose does NOT auto-fall-back to ``build:``
+    # on pull failure; an unreachable registry hard-fails ``up`` only
+    # when no local image is cached.
+    #
+    # Pin a specific version with ``MEMCLAW_VERSION=v1.2.3`` in your
+    # ``.env``; defaults to ``latest`` for the most recent stable.
+    image: ghcr.io/caura-ai/caura-memclaw-core-storage-api:${MEMCLAW_VERSION:-latest}
+    pull_policy: missing
     build:
       context: .
       dockerfile: core-storage-api/Dockerfile
@@ -64,6 +92,10 @@ services:
   # ── Core API (main application) ─────────────────────────────────
 
   core-api:
+    # Same pull-on-first-up + ``pull_policy: missing`` pattern as
+    # core-storage-api above. See its block for the full rationale.
+    image: ghcr.io/caura-ai/caura-memclaw-core-api:${MEMCLAW_VERSION:-latest}
+    pull_policy: missing
     build:
       context: .
       dockerfile: core-api/Dockerfile

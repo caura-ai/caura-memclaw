@@ -119,6 +119,15 @@ Anthropic, Gemini, and OpenRouter don't offer embedding APIs here — pair them 
 docker compose up -d
 ```
 
+By default this **pulls the multi-arch images from `ghcr.io`** (`linux/amd64` + `linux/arm64`) on first run — takes ~30 seconds. Subsequent `up` commands re-use the cached image (no registry round-trip, works offline). To pin a specific version, set `MEMCLAW_VERSION=v1.2.3` in your `.env`. To build from local source instead (e.g. when iterating on a fork), run `docker compose up --build --no-pull`.
+
+To upgrade to a newer image at the same tag (e.g. `:latest` after we cut a new release), run `docker compose pull && docker compose up -d`. Without an explicit `pull`, the local cache wins — there's no silent version drift.
+
+> **Offline / air-gapped operation**: depending on whether the image is already cached locally:
+> - **Image cached, no network**: `docker compose up -d` works as-is — `pull_policy: missing` doesn't try to pull when the image is present. Use `docker compose up --no-pull` if you want to be explicit.
+> - **No local image, no network**: `docker compose up --build --no-pull` (build from source, don't try to pull).
+> - **Strict no-network guarantee** (e.g. an air-gapped pipeline that should never reach `ghcr.io`): drop a `docker-compose.override.yml` setting `pull_policy: never` for both services — Compose then fails fast if the image is absent rather than attempting a pull.
+
 | Service | URL |
 |---|---|
 | Core API (REST + MCP) | http://localhost:8000 |
