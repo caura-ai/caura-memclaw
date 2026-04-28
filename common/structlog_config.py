@@ -214,6 +214,112 @@ def configure_logging(
         _configured = True
 
 
+# Names of third-party loggers that install their own (typically stderr,
+# plain-text) handlers OR set ``propagate=False``, bypassing the root
+# ``ProcessorFormatter`` without explicit re-routing. CAURA-588.
+#
+# Ordering caveat: ``_route_third_party_to_root`` only re-routes loggers
+# whose libraries have already initialised them at call time. uvicorn's
+# ``Config.configure_logging()`` runs at server start; if our
+# ``configure_logging()`` is called at module import (the typical app.py
+# path), the uvicorn loggers may not yet have their handlers when we
+# iterate. The function logs a debug line in that case so the caller can
+# move the call into an ASGI lifespan startup handler if production logs
+# show un-rerouted output.
+_THIRD_PARTY_LOGGERS_TO_REROUTE: tuple[str, ...] = (
+    # uvicorn ships three loggers with propagate=False + own StreamHandlers
+    # via uvicorn.config.LOGGING_CONFIG.
+    "uvicorn",
+    "uvicorn.access",
+    "uvicorn.error",
+    # FastMCP / underlying mcp library register their own stream handler.
+    "fastmcp",
+    "mcp",
+    # slowapi (rate-limit middleware) — included defensively. Some versions
+    # install their own handler when rate-limit decisions are configured to
+    # log; on versions that don't, the rerouting is a harmless no-op (no
+    # snapshotted handlers, level untouched).
+    "slowapi",
+)
+
+# Pre-config state for each rerouted logger (handlers, propagate, level).
+# Captured by ``_route_third_party_to_root`` on first invocation and
+# replayed by ``_reset_for_testing`` so test fixtures can return to a
+# state structurally identical to import-time. Handlers are *not* closed
+# in the route-to-root path so the snapshot retains usable handler objects
+# for restore — Python's GC handles FD release when the logger no longer
+# references them after the next reset.
+_third_party_logger_original_state: dict[
+    str, tuple[list[logging.Handler], bool, int]
+] = {}
+
+
+def _route_third_party_to_root() -> None:
+    """Strip third-party loggers' own handlers and force propagation to root.
+
+    Without this, uvicorn access/error and FastMCP server lines bypass the
+    root ``ProcessorFormatter`` and emit as unstructured plain text at
+    DEFAULT severity in Cloud Logging — breaking severity filtering and
+    audit log searches. After this runs, those lines flow through the
+    same JSON formatter as application logs.
+
+    Only resets the level when the library actually had its own handlers
+    — otherwise the level was an operator-/library-configured filter
+    relative to root (e.g. ``uvicorn --log-level warning``) and we mustn't
+    silently widen it.
+    """
+    for name in _THIRD_PARTY_LOGGERS_TO_REROUTE:
+        lg = logging.getLogger(name)
+        # Skip iff the snapshot says we already did the work (had handlers
+        # captured). Lets a re-call (e.g. from an ASGI lifespan startup
+        # after uvicorn initialised) idempotently no-op.
+        already_rerouted = name in _third_party_logger_original_state and bool(
+            _third_party_logger_original_state[name][0]
+        )
+        if already_rerouted:
+            continue
+        # Library may not have initialised this logger yet — there's nothing
+        # to reroute right now. Don't snapshot the empty state (would freeze
+        # us into "no work to do" forever) and warn the operator at WARNING
+        # so they notice in Cloud Logging if a uvicorn-fronted service is
+        # calling configure_logging at module import (before uvicorn's own
+        # ``Config.configure_logging`` runs at server start).
+        if not lg.handlers and lg.propagate:
+            logging.getLogger(__name__).warning(
+                "logger %r has no own handlers at rerouting time; rerouting was a no-op (library may not be imported yet — call _route_third_party_to_root from an ASGI lifespan startup handler if this is a uvicorn-fronted service)",
+                name,
+            )
+            continue
+        # First effective call. Snapshot the pre-reroute state so
+        # ``_reset_for_testing`` can restore. Handlers retained for the
+        # process lifetime — bounded for the listed libraries (uvicorn /
+        # fastmcp / mcp / slowapi only install StreamHandlers pointing at
+        # stderr, ~kilobytes total) so no FD-leak risk.
+        if name not in _third_party_logger_original_state:
+            _third_party_logger_original_state[name] = (
+                list(lg.handlers),
+                lg.propagate,
+                lg.level,
+            )
+        had_own_handlers = bool(_third_party_logger_original_state[name][0])
+        # Remove the library's own handlers without closing them. Closing
+        # would invalidate the snapshot's handler objects — ``_reset_for_testing``
+        # restores from that snapshot, and a closed FileHandler/SocketHandler
+        # silently emits nothing.
+        for h in list(lg.handlers):
+            lg.removeHandler(h)
+        lg.propagate = True
+        # Reset level only when the library installed its own handlers — in
+        # that case the level was the library's filter on its own log path
+        # (which we just removed) and resetting to NOTSET delegates filtering
+        # to root. If the library *didn't* install handlers but we got here
+        # via ``propagate=False`` (intentional library suppression that we're
+        # flipping), leave the level alone so the operator's filter intent is
+        # preserved.
+        if had_own_handlers:
+            lg.setLevel(logging.NOTSET)
+
+
 def _reset_for_testing() -> None:
     """Clear the idempotency guard so tests can reconfigure with new settings.
 
@@ -261,6 +367,26 @@ def _reset_for_testing() -> None:
         # silent divergence from production behavior.
         for dep in ("httpx", "httpcore", "google.auth", "google.auth.transport"):
             logging.getLogger(dep).setLevel(logging.NOTSET)
+        # Restore third-party loggers to pre-config state from the snapshot
+        # captured by ``_route_third_party_to_root``. Best-effort: any
+        # FileHandler / SocketHandler that was closed during stripping won't
+        # actually write again, but the logger's ``handlers``, ``propagate``,
+        # and ``level`` attributes are restored to their pre-config shape so
+        # tests observing logger structure see what they would have seen
+        # before ``configure_logging`` ran.
+        for name, (
+            handlers,
+            propagate,
+            level,
+        ) in _third_party_logger_original_state.items():
+            lg = logging.getLogger(name)
+            for h in list(lg.handlers):
+                lg.removeHandler(h)
+            for h in handlers:
+                lg.addHandler(h)
+            lg.propagate = propagate
+            lg.setLevel(level)
+        _third_party_logger_original_state.clear()
         _configured = False
         _configured_environment = None
         _configured_log_level = None
@@ -312,10 +438,10 @@ def _configure_logging_impl(
 
     # Route stdlib logging (SQLAlchemy, httpx, …) through the same processor
     # chain so their output also carries GCP severity labels instead of
-    # landing as unstructured DEFAULT-severity text. Uvicorn installs its
-    # own handlers with propagate=False on `uvicorn` and `uvicorn.access`,
-    # so its lines bypass this handler — worth a follow-up if we want those
-    # in GCP format too.
+    # landing as unstructured DEFAULT-severity text. Uvicorn and FastMCP
+    # install their own handlers with ``propagate=False`` and bypass the
+    # root handler — ``_route_third_party_to_root`` (called below) reverses
+    # that so their access/error lines also flow through the formatter.
     foreign_pre_chain: list[Any] = _base_processors()
     # add_logger_name surfaces the originating stdlib logger (`sqlalchemy.engine`,
     # `httpx`, …) as the `logger` field — useful in both dev and prod. Keep
@@ -430,3 +556,5 @@ def _configure_logging_impl(
     if logging.DEBUG < min_level < logging.WARNING:
         for dep in ("httpx", "httpcore", "google.auth", "google.auth.transport"):
             logging.getLogger(dep).setLevel(logging.WARNING)
+
+    _route_third_party_to_root()
