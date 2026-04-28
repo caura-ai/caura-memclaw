@@ -19,6 +19,7 @@ retry-safe at the row level. These tests cover the new contract:
 """
 
 import asyncio
+import time
 
 import pytest
 
@@ -252,3 +253,243 @@ async def test_bulk_budget_burn_returns_504_with_retry_hint(client, monkeypatch)
     )
     assert resp.status_code == 504
     assert "X-Bulk-Attempt-Id" in resp.json()["detail"]
+
+
+# ── CAURA-599: per-phase storage timeout + broader exception mapping ──
+
+
+async def test_storage_phase_timeout_returns_504(client, monkeypatch):
+    """``storage_bulk_timeout_seconds`` fires before the umbrella when the
+    storage roundtrip itself is slow, raising plain ``TimeoutError`` from
+    ``asyncio.timeout``. The route maps it to the same 504 contract."""
+
+    from core_api import config as cfg
+    from core_api.clients import storage_client as sc_mod
+
+    # Squeeze only the storage-phase cap; leave the umbrella generous so
+    # we know the storage timeout — not the umbrella — is what fired.
+    monkeypatch.setattr(cfg.settings, "storage_bulk_timeout_seconds", 0.05)
+    monkeypatch.setattr(cfg.settings, "bulk_request_timeout_seconds", 30.0)
+
+    async def slow_create_memories(self, data):
+        # Sleep just past the 50ms cap so the timeout fires; no need to
+        # waste a full second of test time.
+        await asyncio.sleep(0.1)
+        return [
+            {
+                "client_request_id": d["client_request_id"],
+                "id": "x",
+                "was_inserted": True,
+            }
+            for d in data
+        ]
+
+    monkeypatch.setattr(
+        sc_mod.CoreStorageClient, "create_memories", slow_create_memories
+    )
+
+    tenant_id, headers = get_test_auth()
+    body = {
+        "tenant_id": tenant_id,
+        "agent_id": f"phase-{uid()}",
+        "items": [{"content": f"phase-content-{uid()}"}],
+    }
+    resp = await client.post(
+        "/api/v1/memories/bulk",
+        json=body,
+        headers={**headers, "X-Bulk-Attempt-Id": _attempt_id("phase")},
+    )
+    assert resp.status_code == 504
+    assert "X-Bulk-Attempt-Id" in resp.json()["detail"]
+
+
+async def test_storage_phase_timeout_covers_slot_acquire_wait(client, monkeypatch):
+    """Regression for the compound-context-manager ordering: the storage
+    timeout must arm BEFORE ``per_tenant_storage_slot`` calls
+    ``Semaphore.acquire()``. Otherwise a tenant whose storage-write slots
+    are exhausted (other in-flight bulk writes) would queue indefinitely
+    and the 40s cap would never fire. Test by holding the only slot via
+    a permanently-pending external task; the bulk write should then 504
+    inside the timeout window, not hang."""
+    import core_api.middleware.per_tenant_concurrency as concurrency_mod
+    from core_api import config as cfg
+
+    monkeypatch.setattr(cfg.settings, "storage_bulk_timeout_seconds", 0.1)
+    monkeypatch.setattr(cfg.settings, "bulk_request_timeout_seconds", 30.0)
+
+    tenant_id, headers = get_test_auth()
+    # Drain every slot for this tenant on the storage_write semaphore so
+    # the route's acquire blocks. Cap is read at semaphore-creation time,
+    # so populate the dict directly with a Semaphore(0) — guaranteed to
+    # block on acquire — for the (scope, tenant_id) key the route uses.
+    saturated = asyncio.Semaphore(0)
+    concurrency_mod._TENANT_SEMAPHORES[("storage_write", tenant_id)] = saturated
+
+    try:
+        body = {
+            "tenant_id": tenant_id,
+            "agent_id": f"slot-{uid()}",
+            "items": [{"content": f"slot-content-{uid()}"}],
+        }
+        # Cap the test-side budget at 2x the storage timeout — if the
+        # regression returns and the timeout sits INSIDE the semaphore,
+        # the request would block until the 30s umbrella fires (still
+        # 504, but the test would spend 30s confirming the wrong path).
+        # Failing fast at <1s makes the regression unmistakable.
+        t0 = time.perf_counter()
+        resp = await asyncio.wait_for(
+            client.post(
+                "/api/v1/memories/bulk",
+                json=body,
+                headers={**headers, "X-Bulk-Attempt-Id": _attempt_id("slot")},
+            ),
+            timeout=2.0,
+        )
+        elapsed = time.perf_counter() - t0
+        assert resp.status_code == 504, (
+            "storage_bulk_timeout must cover the per_tenant_storage_slot "
+            "acquire wait — if it returns 200/207 here, the timeout context "
+            "manager is layered INSIDE the semaphore acquire, not outside."
+        )
+        assert elapsed < 1.0, (
+            f"storage_bulk_timeout (0.1s) failed to fire fast — took {elapsed:.2f}s. "
+            "Likely regression: timeout context manager is INSIDE the semaphore "
+            "acquire, so the umbrella (30s) is what fired instead."
+        )
+        assert "X-Bulk-Attempt-Id" in resp.json()["detail"]
+    finally:
+        # Pop the saturated semaphore so subsequent tests see a fresh
+        # cap-sized one on next access.
+        concurrency_mod._TENANT_SEMAPHORES.pop(("storage_write", tenant_id), None)
+
+
+async def test_storage_5xx_returns_504_not_500(client, monkeypatch):
+    """Storage 5xx (raised by ``raise_for_status``) used to surface as 500
+    from core-api. CAURA-599 maps it to 504 so the same retry contract
+    applies — the call may have committed without the response landing."""
+    import httpx
+
+    from core_api.clients import storage_client as sc_mod
+
+    async def boom_create_memories(self, data):
+        # Synthesize what ``resp.raise_for_status()`` produces on 503.
+        request = httpx.Request("POST", "https://storage.local/memories/bulk")
+        response = httpx.Response(503, request=request)
+        raise httpx.HTTPStatusError("503", request=request, response=response)
+
+    monkeypatch.setattr(
+        sc_mod.CoreStorageClient, "create_memories", boom_create_memories
+    )
+
+    tenant_id, headers = get_test_auth()
+    body = {
+        "tenant_id": tenant_id,
+        "agent_id": f"5xx-{uid()}",
+        "items": [{"content": f"5xx-content-{uid()}"}],
+    }
+    resp = await client.post(
+        "/api/v1/memories/bulk",
+        json=body,
+        headers={**headers, "X-Bulk-Attempt-Id": _attempt_id("5xx")},
+    )
+    assert resp.status_code == 504
+    assert "X-Bulk-Attempt-Id" in resp.json()["detail"]
+
+
+async def test_storage_4xx_does_not_get_5xx_recovery_hint(client, monkeypatch):
+    """4xx from storage is a request-shape problem the client must fix —
+    don't paper over it with a 504/503 retry hint. The handler's
+    ``HTTPStatusError`` branch only swallows 5xx; 4xx must escape so the
+    bug stays visible. In production FastAPI converts the uncaught
+    exception to 500; under TestClient it propagates as a Python
+    exception, which is the cleanest portable assertion."""
+    import httpx
+
+    from core_api.clients import storage_client as sc_mod
+
+    async def four_oh_four(self, data):
+        request = httpx.Request("POST", "https://storage.local/memories/bulk")
+        response = httpx.Response(404, request=request)
+        raise httpx.HTTPStatusError("404", request=request, response=response)
+
+    monkeypatch.setattr(sc_mod.CoreStorageClient, "create_memories", four_oh_four)
+
+    tenant_id, headers = get_test_auth()
+    body = {
+        "tenant_id": tenant_id,
+        "agent_id": f"4xx-{uid()}",
+        "items": [{"content": f"4xx-content-{uid()}"}],
+    }
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await client.post(
+            "/api/v1/memories/bulk",
+            json=body,
+            headers={**headers, "X-Bulk-Attempt-Id": _attempt_id("4xx")},
+        )
+    assert exc_info.value.response.status_code == 404
+
+
+async def test_storage_network_error_returns_503_with_retry_after(client, monkeypatch):
+    """A network-level error reaching storage (DNS, connect refused, broken
+    pipe) maps to 503 + ``Retry-After`` for clean client backoff."""
+    import httpx
+
+    from core_api.clients import storage_client as sc_mod
+
+    async def network_error(self, data):
+        request = httpx.Request("POST", "https://storage.local/memories/bulk")
+        raise httpx.ConnectError("Connection refused", request=request)
+
+    monkeypatch.setattr(sc_mod.CoreStorageClient, "create_memories", network_error)
+
+    tenant_id, headers = get_test_auth()
+    body = {
+        "tenant_id": tenant_id,
+        "agent_id": f"net-{uid()}",
+        "items": [{"content": f"net-content-{uid()}"}],
+    }
+    resp = await client.post(
+        "/api/v1/memories/bulk",
+        json=body,
+        headers={**headers, "X-Bulk-Attempt-Id": _attempt_id("net")},
+    )
+    assert resp.status_code == 503
+    # Default ``storage_network_error_retry_after_seconds`` is 5 (config.py).
+    assert resp.headers.get("Retry-After") == "5"
+    assert "X-Bulk-Attempt-Id" in resp.json()["detail"]
+
+
+async def test_storage_504_carries_attempt_id_retry_hint(client, monkeypatch):
+    """Same recovery contract as the umbrella-timeout path (CAURA-602): the
+    storage 5xx → 504 branch surfaces the ``X-Bulk-Attempt-Id`` retry hint
+    in the detail message so the client knows the per-attempt unique index
+    will resolve any committed rows on retry. (The same-Idempotency-Key
+    retry behaviour is governed by the idempotency middleware's pending
+    claim window, not the bulk-write recovery contract — covered by the
+    middleware's own tests.)"""
+    import httpx
+
+    from core_api.clients import storage_client as sc_mod
+
+    async def boom_503(self, data):
+        request = httpx.Request("POST", "https://storage.local/memories/bulk")
+        response = httpx.Response(503, request=request)
+        raise httpx.HTTPStatusError("503", request=request, response=response)
+
+    monkeypatch.setattr(sc_mod.CoreStorageClient, "create_memories", boom_503)
+
+    tenant_id, headers = get_test_auth()
+    body = {
+        "tenant_id": tenant_id,
+        "agent_id": f"hint-{uid()}",
+        "items": [{"content": f"hint-content-{uid()}"}],
+    }
+    resp = await client.post(
+        "/api/v1/memories/bulk",
+        json=body,
+        headers={**headers, "X-Bulk-Attempt-Id": _attempt_id("hint")},
+    )
+    assert resp.status_code == 504
+    detail = resp.json()["detail"]
+    assert "X-Bulk-Attempt-Id" in detail
+    assert "recover" in detail.lower()

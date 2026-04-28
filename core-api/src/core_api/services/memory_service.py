@@ -37,6 +37,7 @@ except ImportError:
 from common.embedding import get_embedding, get_embeddings_batch
 from common.events import publish_memory_embed_request, publish_memory_enrich_request
 from core_api.constants import (
+    BULK_EMBEDDING_TIMEOUT_SECONDS,
     BULK_ENRICHMENT_CONCURRENCY,
     BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS,
     CHUNKING_THRESHOLD_CHARS,
@@ -979,10 +980,10 @@ async def create_memories_bulk(
     embeddings: list = [None] * n
     if valid_indices and settings.embed_on_hot_path:
         try:
-            valid_embeddings = await asyncio.wait_for(
-                get_embeddings_batch([items[i].content for i in valid_indices], tenant_config),
-                timeout=30.0,
-            )
+            async with asyncio.timeout(BULK_EMBEDDING_TIMEOUT_SECONDS):
+                valid_embeddings = await get_embeddings_batch(
+                    [items[i].content for i in valid_indices], tenant_config
+                )
         except TimeoutError:
             raise HTTPException(status_code=504, detail="Bulk embedding timed out")
         for emb_pos, item_idx in enumerate(valid_indices):
@@ -1216,7 +1217,24 @@ async def create_memories_bulk(
     # fire-and-forget tasks, so the slot's grip on storage stays tight
     # even for long-tail batches.
     if pending:
-        async with per_tenant_storage_slot("storage_write", data.tenant_id):
+        # Per-phase deadline on the storage roundtrip itself (CAURA-599).
+        # Without this the only deadline on this phase is the outer
+        # ``bulk_request_timeout_seconds`` umbrella in the route handler;
+        # a hung storage call would consume any unused embed/enrich slack
+        # before the 504 path fires.
+        #
+        # Order matters: ``asyncio.timeout`` is the OUTER context manager
+        # so the deadline arms before ``per_tenant_storage_slot`` calls
+        # ``asyncio.Semaphore.acquire()`` (which blocks indefinitely under
+        # contention). Compound ``async with (A, B):`` enters left-to-right,
+        # so swapping the order would leave the slot wait outside the
+        # deadline. Cancellation during a queued acquire raises cleanly
+        # from inside the semaphore's __aenter__ — no slot is held, so
+        # no release is needed on the timeout path.
+        async with (
+            asyncio.timeout(settings.storage_bulk_timeout_seconds),
+            per_tenant_storage_slot("storage_write", data.tenant_id),
+        ):
             storage_results = await sc.create_memories([d for _, d in pending])
 
         # Map each storage result back to its source item via
