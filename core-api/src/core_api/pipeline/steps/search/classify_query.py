@@ -12,14 +12,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import string
 import types
 from uuid import UUID
 
 from core_api.clients.storage_client import get_storage_client
 from core_api.constants import (
-    ENTITY_STOPWORDS,
-    ENTITY_TOKEN_MIN_LENGTH,
     FTS_WEIGHT_BOOSTED,
     GRAPH_HOP_BOOST,
     GRAPH_MAX_BOOSTED_MEMORIES,
@@ -33,6 +30,7 @@ from core_api.pipeline.steps.search.retrieval_types import (
     RetrievalStrategy,
 )
 from core_api.schemas import EntityLinkOut
+from core_api.services.entity_tokens import extract_entity_tokens
 
 _GRAPH_HOP_BOOST_FALLBACK = GRAPH_HOP_BOOST[max(GRAPH_HOP_BOOST)]
 
@@ -70,14 +68,7 @@ class ClassifyQuery:
         graph_max_hops: int = sp["graph_max_hops"]
         top_k: int = sp["top_k"]
 
-        # Tokenize, strip punctuation, and filter to meaningful tokens.
-        tokens = [
-            stripped
-            for t in query.split()
-            if (stripped := t.strip(string.punctuation))
-            and len(stripped) >= ENTITY_TOKEN_MIN_LENGTH
-            and stripped.lower() not in ENTITY_STOPWORDS
-        ]
+        tokens = extract_entity_tokens(query)
 
         if tokens:
             try:

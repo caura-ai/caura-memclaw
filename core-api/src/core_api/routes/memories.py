@@ -8,7 +8,7 @@ from uuid import UUID
 import httpx
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, select, tuple_
+from sqlalchemy import func, select, tuple_, update
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as SQLATimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -439,8 +439,6 @@ async def bulk_delete_by_ids(
     db: AsyncSession = Depends(get_db),
 ):
     """Soft-delete memories by a list of IDs."""
-    from sqlalchemy import update
-
     tenant_id = body.get("tenant_id")
     ids = body.get("ids", [])
     if not tenant_id:

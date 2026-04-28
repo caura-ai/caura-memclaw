@@ -14,14 +14,13 @@ from fastapi import HTTPException
 
 from core_api.clients.storage_client import get_storage_client
 from core_api.constants import (
-    ENTITY_STOPWORDS,
-    ENTITY_TOKEN_MIN_LENGTH,
     GRAPH_HOP_BOOST,
     GRAPH_MAX_BOOSTED_MEMORIES,
     RECALL_BOOST_CAP,
 )
 from core_api.pipeline.context import PipelineContext
 from core_api.pipeline.step import StepOutcome, StepResult
+from core_api.services.entity_tokens import extract_entity_tokens
 from core_api.services.memory_service import _get_or_cache_embedding
 
 logger = logging.getLogger(__name__)
@@ -49,11 +48,7 @@ async def _entity_boost_via_storage(
             entity_hops = precomputed_hops
             matched_entity_ids = [eid for eid, (hop, _w) in entity_hops.items() if hop == 0]
         else:
-            tokens = [
-                t.lower()
-                for t in query.split()
-                if len(t) >= ENTITY_TOKEN_MIN_LENGTH and t.lower() not in ENTITY_STOPWORDS
-            ]
+            tokens = extract_entity_tokens(query)
             if not tokens:
                 return boosted_memory_ids, memory_boost_factor
 
