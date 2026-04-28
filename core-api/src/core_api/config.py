@@ -128,6 +128,29 @@ class Settings(BaseSettings):
     # 90s is roughly 2x headroom while staying well under the 300s
     # Cloud Run platform ceiling.
     bulk_request_timeout_seconds: float = 90.0
+    # Per-phase cap on the storage roundtrip inside
+    # ``create_memories_bulk`` (CAURA-599). Embedding and enrichment
+    # already enforce their own 30s caps; storage was the only phase
+    # without one, so a hung storage call ate the full
+    # ``bulk_request_timeout_seconds`` umbrella before the 504 path
+    # fired. The bulk path runs embed and enrich SEQUENTIALLY (embed
+    # at memory_service.py:984, then enrich at the gather a few lines
+    # below), so worst-case time before storage starts is
+    # ``BULK_EMBEDDING_TIMEOUT + BULK_ENRICHMENT_TOTAL_TIMEOUT`` = 60s.
+    # With a 90s umbrella that leaves 30s for storage, so 25s here
+    # gives a 5s slack the validator enforces. Sized to fit the
+    # observed p99 storage roundtrip (~3-5s under load) with ~5x
+    # headroom for slow tails. The ``per_tenant_storage_slot`` acquire
+    # is unbounded — this is the only deadline on the storage phase
+    # itself.
+    storage_bulk_timeout_seconds: float = 25.0
+    # ``Retry-After`` header value (in seconds) on the 503 returned when
+    # the storage call hits a network-level error (DNS, connect refused,
+    # pool exhaustion not surfaced as TimeoutException). 5s is a balance
+    # between letting the upstream recover and not stalling the client
+    # for too long; tunable via env var so an operator can widen it
+    # during a sustained outage to avoid thundering-herd retries.
+    storage_network_error_retry_after_seconds: int = 5
     # Rate limits applied per-route via slowapi decorators
     # (middleware/rate_limit.py). Syntax: "<count>/<period>" where period
     # is second | minute | hour | day.
@@ -260,7 +283,10 @@ class Settings(BaseSettings):
     def _validate_timeout_ordering(self) -> "Settings":
         # Local import avoids a circular: constants → common.constants,
         # but this file is imported by constants.py's dependents.
-        from core_api.constants import BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS
+        from core_api.constants import (
+            BULK_EMBEDDING_TIMEOUT_SECONDS,
+            BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS,
+        )
 
         if self.request_timeout_seconds < BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS:
             raise ValueError(
@@ -283,6 +309,31 @@ class Settings(BaseSettings):
                 f"bulk_request_timeout_seconds ({self.bulk_request_timeout_seconds}s) "
                 f"must be >= BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS "
                 f"({BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS}s)."
+            )
+        if (
+            self.storage_bulk_timeout_seconds
+            + BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS
+            + BULK_EMBEDDING_TIMEOUT_SECONDS
+            >= self.bulk_request_timeout_seconds
+        ):
+            # The per-phase storage cap (CAURA-599) must fire before the
+            # umbrella. The bulk path runs embed (line 984 in
+            # memory_service.py) THEN enrich (line 1018) THEN storage
+            # SEQUENTIALLY, so worst-case wall-clock before storage even
+            # starts is ``embed + enrich``. Checking ``storage <
+            # bulk_request`` alone would admit configs where
+            # ``embed + enrich + storage > bulk_request`` and the
+            # umbrella silently fires first, defeating the per-phase
+            # cleanup.
+            raise ValueError(
+                f"storage_bulk_timeout_seconds ({self.storage_bulk_timeout_seconds}s) "
+                f"+ BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS "
+                f"({BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS}s) "
+                f"+ BULK_EMBEDDING_TIMEOUT_SECONDS "
+                f"({BULK_EMBEDDING_TIMEOUT_SECONDS}s) must be < "
+                f"bulk_request_timeout_seconds "
+                f"({self.bulk_request_timeout_seconds}s) so the storage-phase "
+                f"cap fires before the umbrella."
             )
         return self
 

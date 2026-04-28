@@ -531,6 +531,13 @@ BULK_ENRICHMENT_CONCURRENCY = 10  # max parallel enrichment calls in bulk mode
 # stay below `settings.request_timeout_seconds` in config.py so this fires
 # before the outer request budget.
 BULK_ENRICHMENT_TOTAL_TIMEOUT_SECONDS = 30.0
+# Outer cap on the embedding-batch call in the bulk path. Embed runs
+# *before* enrichment in ``create_memories_bulk`` (CAURA-595 sequencing),
+# so the worst-case time-to-storage is ``embed + enrich``. The validator
+# in config.py uses both this and the enrichment cap to prove the
+# ``storage_bulk_timeout_seconds`` per-phase deadline can fire before the
+# umbrella ``bulk_request_timeout_seconds``.
+BULK_EMBEDDING_TIMEOUT_SECONDS = 30.0
 
 # ── Lifecycle automation ──
 LIFECYCLE_INTERVAL_HOURS = 24  # run lifecycle cycle every N hours

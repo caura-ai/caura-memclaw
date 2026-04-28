@@ -995,8 +995,17 @@ async def _write_memories_bulk_inner(
         # as a defence-in-depth fallback. Either path means the storage
         # call may have committed without surfacing an id; the
         # ``X-Bulk-Attempt-Id`` retry contract recovers it.
+        #
+        # The per-phase ``storage_bulk_timeout_seconds`` deadline (raised
+        # from ``asyncio.timeout`` inside ``create_memories_bulk``) also
+        # lands here as a plain ``TimeoutError`` — same recovery contract.
+        # Both caps are logged as static config values so the access-log
+        # entry is self-explanatory; the actual elapsed time on the
+        # request line distinguishes which timer fired (storage cap at
+        # ~25s elapsed vs umbrella at ~90s elapsed).
         logger.warning(
-            "bulk write exceeded %ss budget; client should retry with same %s",
+            "bulk write timed out (storage cap %ss / request cap %ss); client should retry with same %s",
+            app_settings.storage_bulk_timeout_seconds,
             app_settings.bulk_request_timeout_seconds,
             BULK_ATTEMPT_ID_HEADER,
         )
@@ -1013,6 +1022,60 @@ async def _write_memories_bulk_inner(
                 f"the same {BULK_ATTEMPT_ID_HEADER} to recover any "
                 "committed items."
             ),
+        )
+    except httpx.HTTPStatusError as exc:
+        # Storage 5xx (raised by ``resp.raise_for_status()`` in the storage
+        # client) may have committed rows before failing — same shape as
+        # the timeout branch — so map to 504 to keep the
+        # ``X-Bulk-Attempt-Id`` retry contract intact. 4xx escapes here
+        # intentionally: it signals a request-shape problem the client
+        # must fix, not transient noise the retry path can recover from.
+        if not (500 <= exc.response.status_code < 600):
+            # Log so the 4xx path is observable in structured logs;
+            # without this, only FastAPI's generic unhandled-exception
+            # log surfaces and it has no bulk context.
+            logger.warning(
+                "bulk write got unexpected %s from storage; this is a request-shape bug",
+                exc.response.status_code,
+                exc_info=True,
+            )
+            raise
+        logger.warning(
+            "bulk write got %s from storage; client should retry with same %s",
+            exc.response.status_code,
+            BULK_ATTEMPT_ID_HEADER,
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "bulk write upstream error before completing; retry with "
+                f"the same {BULK_ATTEMPT_ID_HEADER} to recover any "
+                "committed items."
+            ),
+        )
+    except httpx.RequestError:
+        # Network-level error reaching storage (DNS failure, connect
+        # refused, broken pipe). Note that ``httpx.PoolTimeout`` IS a
+        # ``TimeoutException`` and is already handled by the earlier
+        # ``except (TimeoutError, httpx.TimeoutException)`` clause —
+        # it never reaches this branch.
+        #
+        # Surface as 503 with ``Retry-After`` so the client can back off
+        # cleanly. Same recovery shape as the timeout/5xx branches: no
+        # idempotency receipt, attempt-id resolves any committed rows.
+        logger.warning(
+            "bulk write got network error reaching storage; client should retry with same %s",
+            BULK_ATTEMPT_ID_HEADER,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "bulk write upstream unreachable; retry with the same "
+                f"{BULK_ATTEMPT_ID_HEADER} to recover any committed items."
+            ),
+            headers={
+                "Retry-After": str(app_settings.storage_network_error_retry_after_seconds),
+            },
         )
 
     bulk_resp = _bulk_response(result)
