@@ -142,9 +142,11 @@ class Settings(BaseSettings):
     # Per-tenant in-flight concurrency caps (see
     # ``middleware/per_tenant_concurrency.py`` for full rationale).
     # Per-instance state — fleet-wide cap is roughly
-    # ``cap * max_instances``.
-    per_tenant_search_concurrency: int = 8
-    per_tenant_write_concurrency: int = 4
+    # ``cap * max_instances``. Sized to absorb routine per-tenant
+    # fan-out (the harness's microbench phase issues ~10-30 concurrent
+    # search/list ops) while still tripping under a genuine storm.
+    per_tenant_search_concurrency: int = 32
+    per_tenant_write_concurrency: int = 16
     # Deeper bulkhead at the storage roundtrip itself
     # (CAURA-602 follow-up). Smaller than the route-entry caps above
     # because each request only holds the storage slot for the actual
