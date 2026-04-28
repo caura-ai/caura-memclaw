@@ -588,14 +588,49 @@ async def get_contradictions(
     auth: AuthContext = Depends(get_auth_context),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return memories that this memory superseded (marked outdated/conflicted)."""
+    """Return contradiction detector findings for this memory.
+
+    The contradiction detector (services/contradiction_detector.py) runs
+    fire-and-forget post-commit on writes and persists its findings via
+    two side-effects on the memories table:
+
+    1. Conflicted/outdated rows get ``status`` set to ``"conflicted"`` or
+       ``"outdated"``.
+    2. The newer (winning) row's ``supersedes_id`` is set to the older
+       (losing) row's id.
+
+    There is no separate ``contradictions`` table — the supersedes chain
+    + status fields ARE the persisted detector output (CAURA-604).
+
+    Response fields (``superseded_by``, ``superseded_memories``) are kept
+    intact for back-compat. New fields added in CAURA-604:
+
+    - ``detection_status``: ``"completed"`` if any contradiction evidence
+      exists for this memory (it has ``supersedes_id`` set, or another
+      row supersedes it, or its own status is outdated/conflicted),
+      otherwise ``"pending"``. ``"pending"`` means "no contradictions
+      have been recorded" — it covers both "detector ran and found
+      nothing" and "detector hasn't run yet"; the API has no way to
+      distinguish those without re-running detection synchronously,
+      which would side-effect from a GET. We chose the cheap, no-side-
+      effect path (return pending) over an inline re-run.
+    - ``contradictions``: detector-shaped findings derived from the
+      persisted chain (id, status, reason, content_preview, direction,
+      created_at). ``reason`` is inferred from the status of the
+      conflicting row: ``outdated`` -> ``rdf_conflict``,
+      ``conflicted`` -> ``semantic_conflict``. ``direction`` is
+      ``superseded_by`` (this memory was replaced by a newer row) or
+      ``supersedes`` (this memory replaced an older row).
+    """
     auth.enforce_tenant(tenant_id)
 
     memory = await db.get(Memory, memory_id)
     if not memory or memory.tenant_id != tenant_id or memory.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Memory not found")
 
-    # Find memories whose supersedes_id points to this memory
+    # Newer rows that point at this one as the row they replace
+    # (i.e. detector found a contradiction and this memory was the
+    # losing side). These are the "supersessors".
     stmt = (
         select(Memory)
         .where(
@@ -606,19 +641,79 @@ async def get_contradictions(
         .order_by(Memory.created_at.desc())
     )
     result = await db.execute(stmt)
-    superseded = result.scalars().all()
+    supersessors = result.scalars().all()
 
-    # Also check if this memory itself was superseded by another
+    # The older row this memory replaced (if any). Despite the field
+    # name, ``memory.supersedes_id`` points at the OLDER memory (the
+    # detector's loser); this memory was the winner. The variable name
+    # ``superseded_by`` in the response is preserved as-is for
+    # back-compat; ``contradictions`` below uses unambiguous direction
+    # labels.
     superseded_by = None
+    older = None
     if memory.supersedes_id:
-        newer = await db.get(Memory, memory.supersedes_id)
-        if newer and newer.deleted_at is None:
+        older = await db.get(Memory, memory.supersedes_id)
+        # ``db.get`` is a bare PK lookup — guard against a corrupted
+        # cross-tenant ``supersedes_id`` leaking another tenant's content
+        # into ``superseded_by`` / ``contradictions``.
+        if older and older.tenant_id != tenant_id:
+            older = None
+        if older and older.deleted_at is None:
             superseded_by = {
-                "id": str(newer.id),
-                "content_preview": newer.content[:200],
-                "status": newer.status,
-                "created_at": newer.created_at.isoformat() if newer.created_at else None,
+                "id": str(older.id),
+                "content_preview": older.content[:200],
+                "status": older.status,
+                "created_at": older.created_at.isoformat() if older.created_at else None,
             }
+
+    def _reason_for(status: str | None) -> str:
+        if status == "outdated":
+            return "rdf_conflict"
+        if status == "conflicted":
+            return "semantic_conflict"
+        return "unknown"
+
+    contradictions: list[dict] = []
+    # Direction "superseded_by": newer rows that supersede THIS memory.
+    # ``reason`` derives from ``memory.status`` (the loser's status carries
+    # the conflict label), with ``m.status`` as fallback for the async-lag
+    # window where the supersessor exists but ``memory.status`` hasn't been
+    # updated yet.
+    for m in supersessors:
+        primary = _reason_for(memory.status)
+        reason = primary if primary != "unknown" else _reason_for(m.status)
+        contradictions.append(
+            {
+                "memory_id": str(m.id),
+                "status": m.status,
+                "reason": reason,
+                "content_preview": m.content[:200],
+                "direction": "superseded_by",
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
+        )
+    # Direction "supersedes": the older row THIS memory replaced.
+    if older is not None and older.deleted_at is None:
+        contradictions.append(
+            {
+                "memory_id": str(older.id),
+                "status": older.status,
+                "reason": _reason_for(older.status),
+                "content_preview": older.content[:200],
+                "direction": "supersedes",
+                "created_at": older.created_at.isoformat() if older.created_at else None,
+            }
+        )
+
+    # ``detection_status="completed"`` iff the response carries actionable
+    # contradiction evidence. ``contradictions`` is appended above for both
+    # supersessor rows AND the older row (when ``older`` survived the
+    # cross-tenant + soft-deleted guards), so ``bool(contradictions)`` is
+    # the single authoritative signal. The earlier ``memory.status`` and
+    # ``supersedes_id`` arms could fire when every related row was excluded
+    # from ``contradictions``, yielding the ``{completed, []}`` ambiguous
+    # state — collapse to the single check.
+    detection_status = "completed" if contradictions else "pending"
 
     return {
         "memory_id": str(memory_id),
@@ -631,8 +726,11 @@ async def get_contradictions(
                 "status": m.status,
                 "created_at": m.created_at.isoformat() if m.created_at else None,
             }
-            for m in superseded
+            for m in supersessors
         ],
+        # CAURA-604: detector-result fields. See docstring above for semantics.
+        "detection_status": detection_status,
+        "contradictions": contradictions,
     }
 
 
