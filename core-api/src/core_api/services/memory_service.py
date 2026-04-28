@@ -73,6 +73,7 @@ from core_api.schemas import (
     MemoryUpdate,
 )
 from core_api.services.entity_extraction_worker import process_entity_extraction
+from core_api.services.entity_tokens import extract_entity_tokens
 from core_api.services.hooks import get_hooks
 from core_api.services.task_tracker import tracked_task
 
@@ -2599,11 +2600,7 @@ async def _entity_boost_pipeline(
             entity_hops = precomputed_hops
             matched_entity_ids = [eid for eid, (hop, _w) in entity_hops.items() if hop == 0]
         else:
-            tokens = [
-                t.lower()
-                for t in query.split()
-                if len(t) >= ENTITY_TOKEN_MIN_LENGTH and t.lower() not in ENTITY_STOPWORDS
-            ]
+            tokens = extract_entity_tokens(query)
             if not tokens:
                 return boosted_memory_ids, memory_boost_factor
 

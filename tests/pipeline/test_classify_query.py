@@ -107,13 +107,19 @@ async def test_entity_lookup_with_match(mock_get_sc):
     sc = _mock_sc()
     sc.fts_search_entities = AsyncMock(return_value=[eid_str])
     sc.expand_graph = AsyncMock(return_value={eid_str: [0, 1.0]})
-    sc.get_memory_ids_by_entity_ids = AsyncMock(return_value=[{"memory_id": mid_str, "entity_id": eid_str, "role": "subject"}])
-    sc.scored_search = AsyncMock(return_value=[{
-        "id": mid_str,
-        "tenant_id": "t1",
-        "content": "Alice test memory",
-        "memory_type": "fact",
-    }])
+    sc.get_memory_ids_by_entity_ids = AsyncMock(
+        return_value=[{"memory_id": mid_str, "entity_id": eid_str, "role": "subject"}]
+    )
+    sc.scored_search = AsyncMock(
+        return_value=[
+            {
+                "id": mid_str,
+                "tenant_id": "t1",
+                "content": "Alice test memory",
+                "memory_type": "fact",
+            }
+        ]
+    )
     mock_get_sc.return_value = sc
 
     step = ClassifyQuery()
@@ -177,6 +183,66 @@ async def test_empty_query():
     assert plan.strategy == RetrievalStrategy.SEMANTIC_SEARCH
 
 
+@pytest.mark.asyncio
+@patch("core_api.pipeline.steps.search.classify_query.get_storage_client")
+async def test_uuid_laden_gibberish_drops_hex_fragments(mock_get_sc):
+    """Hex chunks inside hyphenated tokens must not reach entity FTS."""
+    sc = _mock_sc()
+    mock_get_sc.return_value = sc
+
+    hex_chunk = "deadbeefcafe1234deadbeefcafe1234"
+    ctx = _make_ctx(f"xyzzyzombie-{hex_chunk}-FLIBBERTYJIBBET")
+
+    step = ClassifyQuery()
+    await step.execute(ctx)
+
+    sent_tokens = sc.fts_search_entities.await_args.args[0]["tokens"]
+    assert hex_chunk not in sent_tokens
+    assert "xyzzyzombie" in sent_tokens
+    assert "flibbertyjibbet" in sent_tokens
+
+
+@pytest.mark.asyncio
+@patch("core_api.pipeline.steps.search.classify_query.get_storage_client")
+async def test_internal_punctuation_splits_tokens(mock_get_sc):
+    """Hyphenated phrases split client-side, not via storage FTS re-tokenisation."""
+    sc = _mock_sc()
+    mock_get_sc.return_value = sc
+
+    ctx = _make_ctx("USA-based,research/scribe")
+
+    step = ClassifyQuery()
+    await step.execute(ctx)
+
+    sent_tokens = sc.fts_search_entities.await_args.args[0]["tokens"]
+    assert "usa" in sent_tokens
+    assert "based" in sent_tokens
+    assert "research" in sent_tokens
+    assert "scribe" in sent_tokens
+
+
+@pytest.mark.asyncio
+@patch("core_api.pipeline.steps.search.classify_query.get_storage_client")
+async def test_uuid_query_long_hex_segments_dropped(mock_get_sc):
+    """A pasted UUID — segments ≥8 chars are dropped (UUID-shaped), shorter
+    segments survive (collide with real English words like ``cafe``).
+    With no entity match the query falls through to SEMANTIC_SEARCH."""
+    sc = _mock_sc()
+    mock_get_sc.return_value = sc
+
+    ctx = _make_ctx("550e8400-e29b-41d4-a716-446655440000")
+
+    step = ClassifyQuery()
+    await step.execute(ctx)
+
+    sent_tokens = sc.fts_search_entities.await_args.args[0]["tokens"]
+    assert "550e8400" not in sent_tokens
+    assert "446655440000" not in sent_tokens
+    assert sent_tokens == ["e29b", "41d4", "a716"]
+    plan: RetrievalPlan = ctx.data["retrieval_plan"]
+    assert plan.strategy == RetrievalStrategy.SEMANTIC_SEARCH
+
+
 # ---------------------------------------------------------------------------
 # TEMPORAL routing tests
 # ---------------------------------------------------------------------------
@@ -226,13 +292,19 @@ async def test_entity_lookup_takes_priority_over_temporal(mock_get_sc):
     sc = _mock_sc()
     sc.fts_search_entities = AsyncMock(return_value=[eid_str])
     sc.expand_graph = AsyncMock(return_value={eid_str: [0, 1.0]})
-    sc.get_memory_ids_by_entity_ids = AsyncMock(return_value=[{"memory_id": mid_str, "entity_id": eid_str, "role": "subject"}])
-    sc.scored_search = AsyncMock(return_value=[{
-        "id": mid_str,
-        "tenant_id": "t1",
-        "content": "Alice temporal test",
-        "memory_type": "fact",
-    }])
+    sc.get_memory_ids_by_entity_ids = AsyncMock(
+        return_value=[{"memory_id": mid_str, "entity_id": eid_str, "role": "subject"}]
+    )
+    sc.scored_search = AsyncMock(
+        return_value=[
+            {
+                "id": mid_str,
+                "tenant_id": "t1",
+                "content": "Alice temporal test",
+                "memory_type": "fact",
+            }
+        ]
+    )
     mock_get_sc.return_value = sc
 
     ctx = _make_ctx("Alice", temporal_window=timedelta(days=7))
@@ -324,13 +396,19 @@ async def test_entity_lookup_takes_priority_over_recent(mock_get_sc):
     sc = _mock_sc()
     sc.fts_search_entities = AsyncMock(return_value=[eid_str])
     sc.expand_graph = AsyncMock(return_value={eid_str: [0, 1.0]})
-    sc.get_memory_ids_by_entity_ids = AsyncMock(return_value=[{"memory_id": mid_str, "entity_id": eid_str, "role": "subject"}])
-    sc.scored_search = AsyncMock(return_value=[{
-        "id": mid_str,
-        "tenant_id": "t1",
-        "content": "Alice recent test",
-        "memory_type": "fact",
-    }])
+    sc.get_memory_ids_by_entity_ids = AsyncMock(
+        return_value=[{"memory_id": mid_str, "entity_id": eid_str, "role": "subject"}]
+    )
+    sc.scored_search = AsyncMock(
+        return_value=[
+            {
+                "id": mid_str,
+                "tenant_id": "t1",
+                "content": "Alice recent test",
+                "memory_type": "fact",
+            }
+        ]
+    )
     mock_get_sc.return_value = sc
 
     ctx = _make_ctx("what was I doing with Alice")
@@ -371,10 +449,12 @@ async def test_expand_per_fleet_parallel_merges_correctly():
     eid_c = uuid.uuid4()
 
     sc = AsyncMock()
-    sc.expand_graph = AsyncMock(side_effect=[
-        {str(eid_a): [0, 1.0], str(eid_b): [2, 0.5]},
-        {str(eid_a): [1, 0.8], str(eid_b): [1, 0.9], str(eid_c): [0, 1.0]},
-    ])
+    sc.expand_graph = AsyncMock(
+        side_effect=[
+            {str(eid_a): [0, 1.0], str(eid_b): [2, 0.5]},
+            {str(eid_a): [1, 0.8], str(eid_b): [1, 0.9], str(eid_c): [0, 1.0]},
+        ]
+    )
 
     result = await ClassifyQuery._expand_per_fleet(
         sc=sc,
@@ -396,10 +476,12 @@ async def test_expand_per_fleet_partial_failure():
     eid_a = uuid.uuid4()
 
     sc = AsyncMock()
-    sc.expand_graph = AsyncMock(side_effect=[
-        {str(eid_a): [0, 1.0]},  # fleet 1 succeeds
-        RuntimeError("DB connection lost"),  # fleet 2 fails
-    ])
+    sc.expand_graph = AsyncMock(
+        side_effect=[
+            {str(eid_a): [0, 1.0]},  # fleet 1 succeeds
+            RuntimeError("DB connection lost"),  # fleet 2 fails
+        ]
+    )
 
     result = await ClassifyQuery._expand_per_fleet(
         sc=sc,
@@ -429,7 +511,10 @@ async def test_collect_memories_caps_entity_ids():
     sc.scored_search = AsyncMock(return_value=[])
 
     result = await ClassifyQuery._collect_memories(
-        sc=sc, entity_hops=entity_hops, tenant_id="t1", top_k=10,
+        sc=sc,
+        entity_hops=entity_hops,
+        tenant_id="t1",
+        top_k=10,
     )
 
     sc.get_memory_ids_by_entity_ids.assert_called_once()
