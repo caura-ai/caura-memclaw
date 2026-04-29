@@ -1,0 +1,88 @@
+name: retag-ar-on-release
+
+# When release-please cuts a GitHub Release, this workflow re-tags the
+# already-built staging AR image with the new :vX.Y.Z tag — giving the
+# prod runbook a stable promote-this-tag handle.
+#
+# Done as a separate workflow (rather than inline in release-please.yml)
+# because release-please-action creates the GitHub Release tag via
+# GITHUB_TOKEN, which DOES trigger `on: release: published` even though
+# it does NOT trigger `on: push: tags`. Two-step "cut release then
+# retag" stays loosely coupled and survives a retag failure without
+# blocking the release-please run.
+#
+# Manual workflow_dispatch is provided for re-tagging a specific
+# version after a registry hiccup or to bootstrap a release that
+# pre-dates this workflow.
+#
+# Mirrors the enterprise pattern in caura-memclaw-enterprise/.github/
+# workflows/release-please.yml retag-images job (CAURA-630, PR #194).
+# CAURA-634.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version to (re-)tag (e.g. v1.0.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AR_REPO: us-central1-docker.pkg.dev/alpine-theory-469016-c8/staging-memclaw
+
+jobs:
+  retag:
+    name: Promote staging digest to :vX.Y.Z
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve target version
+        id: vars
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${{ github.event.release.tag_name }}"
+          fi
+          # Strip leading "v" so we always store the bare semver, then
+          # re-add it on the AR tag for consistency with the enterprise
+          # pattern (:v1.0.0).
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@ba79af03959ebeac9769e648f473a284504d9193 # v2.1.10
+        with:
+          workload_identity_provider: projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: github-actions-sa@alpine-theory-469016-c8.iam.gserviceaccount.com
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@77e7a554d41e2ee56fc945c52dfd3f33d12def9a # v2.1.4
+
+      - name: Tag core-api at v${{ steps.vars.outputs.version }}
+        run: |
+          # Source = whatever :latest currently points to in AR. The
+          # staging deploy workflow on caura-memclaw-enterprise pushes
+          # both :sha and :latest on every dev push, so :latest tracks
+          # whichever OSS commit was last built into staging — which
+          # is what release-please just cut a version for.
+          SOURCE="${{ env.AR_REPO }}/core-api:latest"
+          DEST="${{ env.AR_REPO }}/core-api:v${{ steps.vars.outputs.version }}"
+          gcloud artifacts docker tags add "$SOURCE" "$DEST"
+
+      - name: Tag core-storage-api at v${{ steps.vars.outputs.version }}
+        run: |
+          SOURCE="${{ env.AR_REPO }}/core-storage-api:latest"
+          DEST="${{ env.AR_REPO }}/core-storage-api:v${{ steps.vars.outputs.version }}"
+          gcloud artifacts docker tags add "$SOURCE" "$DEST"
+
+      - name: Tag core-worker at v${{ steps.vars.outputs.version }}
+        run: |
+          SOURCE="${{ env.AR_REPO }}/core-worker:latest"
+          DEST="${{ env.AR_REPO }}/core-worker:v${{ steps.vars.outputs.version }}"
+          gcloud artifacts docker tags add "$SOURCE" "$DEST"
