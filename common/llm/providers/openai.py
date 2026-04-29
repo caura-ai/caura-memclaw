@@ -19,9 +19,15 @@ import json
 import logging
 import time
 
+import httpx
 import openai
 
-from common.llm.constants import OPENAI_CHAT_BASE_URL, OPENAI_REQUEST_TIMEOUT_SECONDS
+from common.llm.constants import (
+    OPENAI_CHAT_BASE_URL,
+    OPENAI_HTTPX_MAX_CONNECTIONS,
+    OPENAI_HTTPX_MAX_KEEPALIVE_CONNECTIONS,
+    OPENAI_REQUEST_TIMEOUT_SECONDS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +54,25 @@ class OpenAILLMProvider:
         # Explicit per-call timeout — without this the SDK rides httpx's
         # default and a single hung upstream call would eat the whole
         # enrichment budget silently.
+        #
+        # Explicit ``http_client`` with ``httpx.Limits`` sized for our
+        # bulk-write fan-out (CAURA-627). The SDK's default httpx pool
+        # (100 max / 20 keepalive) saturates under storm load — 16
+        # concurrent writes × 10 enrichment calls per request = 160
+        # concurrent LLM calls per worker process, with the next
+        # tenant's traffic queueing at the pool layer. Sizing the pool
+        # 2x the worst-case fan-out keeps headroom; values are env-
+        # tunable for incident-time adjustment.
         self._client = openai.AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
             timeout=request_timeout_seconds,
+            http_client=httpx.AsyncClient(
+                limits=httpx.Limits(
+                    max_connections=OPENAI_HTTPX_MAX_CONNECTIONS,
+                    max_keepalive_connections=OPENAI_HTTPX_MAX_KEEPALIVE_CONNECTIONS,
+                ),
+            ),
         )
 
     @property
@@ -61,6 +82,16 @@ class OpenAILLMProvider:
     @property
     def model(self) -> str:
         return self._model
+
+    async def aclose(self) -> None:
+        """Close the underlying httpx pool cleanly.
+
+        Without this, ``asyncio`` debug mode emits ``ResourceWarning:
+        Unclosed <httpx.AsyncClient>`` when the provider is GC'd —
+        noisy in tests and a leak in long-lived processes that rotate
+        client instances. Idempotent; safe to call multiple times.
+        """
+        await self._client.close()
 
     async def complete_json(
         self,

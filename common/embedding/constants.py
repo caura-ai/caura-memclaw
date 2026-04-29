@@ -43,3 +43,20 @@ OPENAI_REQUEST_TIMEOUT_SECONDS: float = float(
 # meaningfully extending the hot-path tail.
 EMBEDDING_RETRY_ATTEMPTS: int = int(os.environ.get("EMBEDDING_RETRY_ATTEMPTS", "2"))
 EMBEDDING_RETRY_DELAY_S: float = float(os.environ.get("EMBEDDING_RETRY_DELAY_S", "1.0"))
+
+
+# httpx pool sizing for the embedding-side OpenAI client (CAURA-627).
+# Same env var names as ``common/llm/constants.py`` so a single env
+# tunable controls both the LLM and the embedding pools. Without an
+# explicit limits arg the SDK rides httpx's default (100 max / 20
+# keepalive) which saturates under bulk-write storm fan-out (16
+# concurrent writes × 10 enrichment calls = 160 concurrent LLM
+# requests per process, well over the keepalive budget). See
+# ``common/llm/constants.py`` for full rationale.
+from common.env_utils import clamp_keepalive, read_int_env  # noqa: E402
+
+OPENAI_HTTPX_MAX_CONNECTIONS: int = read_int_env("OPENAI_HTTPX_MAX_CONNECTIONS", 200)
+OPENAI_HTTPX_MAX_KEEPALIVE_CONNECTIONS: int = clamp_keepalive(
+    OPENAI_HTTPX_MAX_CONNECTIONS,
+    read_int_env("OPENAI_HTTPX_MAX_KEEPALIVE_CONNECTIONS", 50),
+)
