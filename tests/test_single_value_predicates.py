@@ -169,6 +169,7 @@ def _make_memory(**kwargs):
         "deleted_at": None,
         "visibility": kwargs.get("visibility", "scope_team"),
         "supersedes_id": None,
+        "created_at": kwargs.get("created_at", "2026-04-29T12:00:00+00:00"),
     }
 
 
@@ -190,6 +191,7 @@ class TestRdfPathGating:
             predicate="lives_in",
             object_value="Tel Aviv",
             subject_entity_id=subject_id,
+            created_at="2026-04-29T11:00:00+00:00",
         )
 
         mock_sc = AsyncMock()
@@ -249,6 +251,7 @@ class TestRdfPathGating:
             predicate="Lives_In",
             object_value="Tel Aviv",
             subject_entity_id=subject_id,
+            created_at="2026-04-29T11:00:00+00:00",
         )
 
         mock_sc = AsyncMock()
@@ -305,6 +308,7 @@ class TestRdfPathGating:
             predicate="scored",
             object_value="6.2",
             subject_entity_id=subject_id,
+            created_at="2026-04-29T11:00:00+00:00",
         )
 
         mock_sc = AsyncMock()
