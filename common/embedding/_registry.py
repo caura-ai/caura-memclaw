@@ -11,6 +11,7 @@ and core-worker (platform-only) can use it.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from collections import OrderedDict
@@ -37,13 +38,29 @@ logger = logging.getLogger(__name__)
 # instead of pinning a 401-returning client forever. ``OrderedDict``
 # semantics: ``move_to_end`` on hit, ``popitem(last=False)`` on miss
 # when full. 256 is well above any realistic tenant count for a single
-# process; raise if that proves wrong. ``AsyncOpenAI`` doesn't require
-# explicit ``aclose`` — the GC drops the underlying httpx pool when
-# the evicted instance has no remaining refs.
+# process; raise if that proves wrong.
+#
+# Eviction must explicitly close the evicted provider's httpx pool
+# (CAURA-627). The OpenAI SDK now gets a user-provided ``http_client``
+# (set in ``OpenAIEmbeddingProvider.__init__`` so we control pool
+# sizing); per the SDK contract, user-provided clients are NOT closed
+# on SDK teardown — caller owns cleanup. ``_get_or_create_openai_provider``
+# below schedules ``aclose()`` on the evicted instance via
+# ``asyncio.create_task`` so the pool drains in the background instead
+# of leaking ``ResourceWarning`` and held connections under long-lived
+# processes that rotate keys past the cache cap.
 _OPENAI_CACHE_MAX = 256
 _openai_provider_cache: OrderedDict[tuple[str, str], OpenAIEmbeddingProvider] = (
     OrderedDict()
 )
+
+# Strong references to in-flight ``aclose()`` cleanup tasks so the GC
+# doesn't reap them mid-execution. ``asyncio.create_task`` returns a
+# task that's kept alive only by user references; without this set the
+# task could be collected before its coroutine finishes draining the
+# httpx pool. The ``add_done_callback`` removes the task from the set
+# once it completes so this doesn't grow unboundedly.
+_background_tasks: set[asyncio.Task[None]] = set()
 
 
 def _get_or_create_openai_provider(api_key: str, model: str) -> OpenAIEmbeddingProvider:
@@ -65,7 +82,21 @@ def _get_or_create_openai_provider(api_key: str, model: str) -> OpenAIEmbeddingP
     provider = OpenAIEmbeddingProvider(api_key=api_key, model=model)
     _openai_provider_cache[cache_key] = provider
     if len(_openai_provider_cache) > _OPENAI_CACHE_MAX:
-        _openai_provider_cache.popitem(last=False)
+        _, evicted = _openai_provider_cache.popitem(last=False)
+        # Schedule cleanup of the evicted provider's httpx pool. The
+        # SDK won't do it for us (we pass an explicit ``http_client``).
+        # Best-effort — bare ``except RuntimeError`` covers the rare
+        # case where the registry is exercised outside a running event
+        # loop (e.g. early startup); GC will reclaim the connections
+        # eventually but with the ``ResourceWarning`` we'd see in
+        # asyncio debug mode.
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(evicted.aclose())
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
+        except RuntimeError:
+            pass
     return provider
 
 

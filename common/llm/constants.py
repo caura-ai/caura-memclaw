@@ -47,6 +47,7 @@ LLM_RETRY_DELAY_S = 1.0
 # a cheaper / different family without a redeploy.
 LLM_FALLBACK_MODEL_OPENAI = os.environ.get("LLM_FALLBACK_MODEL_OPENAI", "gpt-5.4-nano")
 
+
 # Per-call timeout passed to the OpenAI/Anthropic/Openrouter SDK.
 # Without an explicit value the SDK rides httpx's default — long
 # enough that a single hung upstream call eats the whole enrichment
@@ -79,3 +80,26 @@ def _read_openai_request_timeout_seconds() -> float:
 
 
 OPENAI_REQUEST_TIMEOUT_SECONDS = _read_openai_request_timeout_seconds()
+
+
+# ── httpx pool sizing for OpenAI-compatible providers ────────────────
+#
+# CAURA-627: the SDK rides httpx's default (100 max_connections / 20
+# keepalive). Under bulk-write storms — 100-item batches with
+# ``BULK_ENRICHMENT_CONCURRENCY=10`` × ``per_tenant_write_concurrency=16``
+# in flight per worker — the pool saturates and queues subsequent
+# requests, including other tenants'. The defaults were sized for
+# request/response patterns where one user's bursty fan-out doesn't
+# sit on top of another tenant's traffic; our hot-path enrichment is
+# exactly that pattern.
+#
+# Sized for headroom over the worst-case fan-out per process. Env-
+# tunable so an operator can adjust during an incident (e.g. if the
+# upstream provider's per-IP cap is hit) without a redeploy.
+from common.env_utils import clamp_keepalive, read_int_env  # noqa: E402
+
+OPENAI_HTTPX_MAX_CONNECTIONS = read_int_env("OPENAI_HTTPX_MAX_CONNECTIONS", 200)
+OPENAI_HTTPX_MAX_KEEPALIVE_CONNECTIONS = clamp_keepalive(
+    OPENAI_HTTPX_MAX_CONNECTIONS,
+    read_int_env("OPENAI_HTTPX_MAX_KEEPALIVE_CONNECTIONS", 50),
+)
