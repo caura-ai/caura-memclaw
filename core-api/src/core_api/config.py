@@ -151,6 +151,35 @@ class Settings(BaseSettings):
     # for too long; tunable via env var so an operator can widen it
     # during a sustained outage to avoid thundering-herd retries.
     storage_network_error_retry_after_seconds: int = 5
+    # Audit-event queue tunables (CAURA-628). The queue replaces the
+    # legacy per-event audit POST with batched flushes, removing the
+    # cross-tenant table-lock contention that surfaced as the residual
+    # noisy-neighbor-write signal after the LLM-pool fix in #34 and
+    # the dead-index drop in #35.
+    #
+    # ``audit_queue_max_size``: per-process queue cap. With ~200 bytes
+    # per event, 10000 events fits in ~2 MiB. Sized well over realistic
+    # storm rate so the queue only fills if storage-api is degraded;
+    # overflow triggers a structured warning + drop counter rather
+    # than blocking the request hot path.
+    #
+    # ``audit_queue_flush_threshold``: events accumulated → flush
+    # immediately. 50 keeps the average batch comfortable for one
+    # multi-row INSERT without stalling steady-state low-volume
+    # tenants behind a long flush cadence.
+    #
+    # ``audit_queue_flush_interval_seconds``: maximum staleness for
+    # any single event before it lands in storage. 1s matches the
+    # CAURA-627 scoping recommendation; the audit_list endpoint may
+    # see up to that delay for the most recent events, which is
+    # acceptable for the post-hoc analysis paths that consume it.
+    #
+    # Setting ``audit_queue_max_size = 0`` disables the queue entirely
+    # — ``log_action`` then falls through to the legacy synchronous
+    # POST. Useful as an incident-time kill-switch without a redeploy.
+    audit_queue_max_size: int = 10000
+    audit_queue_flush_threshold: int = 50
+    audit_queue_flush_interval_seconds: float = 1.0
     # Rate limits applied per-route via slowapi decorators
     # (middleware/rate_limit.py). Syntax: "<count>/<period>" where period
     # is second | minute | hour | day.

@@ -2953,6 +2953,37 @@ class PostgresService:
                 )
             )
 
+    async def audit_add_batch(self, events: list[dict]) -> None:
+        """Persist N audit events in one transaction with one INSERT
+        statement (CAURA-628).
+
+        ``session.add_all`` issues a single multi-row INSERT to
+        Postgres, vs ``audit_add`` which opens one transaction +
+        acquires the table write lock once per event. Reducing N
+        per-event lock acquisitions to one batched acquisition is the
+        whole point of the CAURA-628 refactor; the per-event legacy
+        path is preserved for the synchronous-fallback case in
+        core-api's ``log_action``.
+
+        Empty ``events`` short-circuits without touching the
+        database — saves a no-op session open under the audit
+        flusher's interval-driven empty ticks.
+        """
+        if not events:
+            return
+        async with get_session() as session:
+            session.add_all(
+                AuditLog(
+                    tenant_id=event["tenant_id"],
+                    agent_id=event.get("agent_id"),
+                    action=event["action"],
+                    resource_type=event["resource_type"],
+                    resource_id=event.get("resource_id"),
+                    detail=event.get("detail"),
+                )
+                for event in events
+            )
+
     async def audit_list_by_tenant(
         self,
         tenant_id: str,
