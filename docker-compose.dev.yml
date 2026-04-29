@@ -38,7 +38,7 @@ services:
   core-storage-api:
     build:
       context: .
-      dockerfile: Dockerfile.dev
+      dockerfile: core-storage-api/Dockerfile
     command: >
       uvicorn core_storage_api.app:app
       --host 0.0.0.0 --port 8002 --reload
@@ -74,7 +74,7 @@ services:
   core-api:
     build:
       context: .
-      dockerfile: Dockerfile.dev
+      dockerfile: core-api/Dockerfile
     command: >
       uvicorn core_api.app:app
       --host 0.0.0.0 --port 8000 --reload
