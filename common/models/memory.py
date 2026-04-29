@@ -103,8 +103,6 @@ class Memory(Base):
                 "deleted_at IS NULL AND client_request_id IS NOT NULL"
             ),
         ),
-        Index("ix_memories_status", "status"),
-        Index("ix_memories_visibility", "visibility"),
         Index("ix_memories_valid_range", "ts_valid_start", "ts_valid_end"),
         Index("ix_memories_subject_entity", "subject_entity_id"),
         Index("ix_memories_recall_count", "recall_count"),
