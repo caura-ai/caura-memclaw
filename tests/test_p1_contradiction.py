@@ -119,6 +119,7 @@ class TestSupersessionSemantics:
             "content": "Alice lives in Tel Aviv",
             "status": "active",
             "object_value": "Tel Aviv",
+            "created_at": "2026-04-29T11:00:00+00:00",
         }
 
         new_memory = {
@@ -131,6 +132,7 @@ class TestSupersessionSemantics:
             "content": "Alice lives in Haifa",
             "supersedes_id": None,
             "status": "active",
+            "created_at": "2026-04-29T12:00:00+00:00",
         }
 
         mock_sc = AsyncMock()
@@ -165,12 +167,14 @@ class TestSupersessionSemantics:
             "content": "Alice lives in Tel Aviv",
             "status": "active",
             "object_value": "Tel Aviv",
+            "created_at": "2026-04-29T10:00:00+00:00",
         }
         old_mem_2 = {
             "id": old_id_2,
             "content": "Alice lives in Jerusalem",
             "status": "active",
             "object_value": "Jerusalem",
+            "created_at": "2026-04-29T11:00:00+00:00",
         }
 
         new_memory = {
@@ -183,6 +187,7 @@ class TestSupersessionSemantics:
             "content": "Alice lives in Haifa",
             "supersedes_id": None,
             "status": "active",
+            "created_at": "2026-04-29T12:00:00+00:00",
         }
 
         mock_sc = AsyncMock()
@@ -219,6 +224,7 @@ class TestSupersessionSemantics:
             "id": old_id,
             "content": "Redis cache hit ratio is 95%",
             "status": "active",
+            "created_at": "2026-04-29T11:00:00+00:00",
         }
 
         new_memory = {
@@ -231,6 +237,7 @@ class TestSupersessionSemantics:
             "content": "Redis cache hit ratio is not 95% anymore",
             "supersedes_id": None,
             "status": "active",
+            "created_at": "2026-04-29T12:00:00+00:00",
         }
 
         mock_sc = AsyncMock()
@@ -266,11 +273,13 @@ class TestSupersessionSemantics:
             "id": old_id_1,
             "content": "The project deadline is Friday",
             "status": "active",
+            "created_at": "2026-04-29T10:00:00+00:00",
         }
         old_mem_2 = {
             "id": old_id_2,
             "content": "The project deadline is Thursday",
             "status": "active",
+            "created_at": "2026-04-29T11:00:00+00:00",
         }
 
         new_memory = {
@@ -283,6 +292,7 @@ class TestSupersessionSemantics:
             "content": "The project deadline is Monday",
             "supersedes_id": None,
             "status": "active",
+            "created_at": "2026-04-29T12:00:00+00:00",
         }
 
         mock_sc = AsyncMock()

@@ -259,12 +259,14 @@ class TestSupersessionFirstMatchOnly:
             "content": "X lives in Tel Aviv",
             "status": "active",
             "object_value": "Tel Aviv",
+            "created_at": "2026-04-29T10:00:00+00:00",
         }
         old_mem_2 = {
             "id": old_id_2,
             "content": "X lives in Jerusalem",
             "status": "active",
             "object_value": "Jerusalem",
+            "created_at": "2026-04-29T11:00:00+00:00",
         }
 
         new_memory = {
@@ -279,6 +281,7 @@ class TestSupersessionFirstMatchOnly:
             "status": "active",
             "visibility": "scope_team",
             "supersedes_id": None,
+            "created_at": "2026-04-29T12:00:00+00:00",
         }
 
         mock_sc = AsyncMock()
@@ -326,11 +329,13 @@ class TestSupersessionFirstMatchOnly:
             "id": old_id_1,
             "content": "The project deadline is Friday",
             "status": "active",
+            "created_at": "2026-04-29T10:00:00+00:00",
         }
         old_mem_2 = {
             "id": old_id_2,
             "content": "The project deadline is Thursday",
             "status": "active",
+            "created_at": "2026-04-29T11:00:00+00:00",
         }
 
         new_memory = {
@@ -345,6 +350,7 @@ class TestSupersessionFirstMatchOnly:
             "status": "active",
             "visibility": "scope_team",
             "supersedes_id": None,
+            "created_at": "2026-04-29T12:00:00+00:00",
         }
 
         mock_sc = AsyncMock()
