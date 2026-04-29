@@ -57,7 +57,7 @@ class WriteMemoryRow:
             "metadata_": metadata,
             "content_hash": ch,
             "expires_at": str(data.expires_at) if data.expires_at else None,
-            "subject_entity_id": data.subject_entity_id,
+            "subject_entity_id": str(data.subject_entity_id) if data.subject_entity_id else None,
             "predicate": data.predicate,
             "object_value": data.object_value,
             "ts_valid_start": str(fields["ts_valid_start"]) if fields.get("ts_valid_start") else None,
