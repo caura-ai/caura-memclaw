@@ -1041,12 +1041,15 @@ class PostgresService:
         memory_id: UUID,
         tenant_id: str,
         fleet_id: str | None = None,
+        visibility: str = "scope_team",
         limit: int = CONTRADICTION_CANDIDATE_MAX,
     ) -> list[Memory]:
         """Find active memories sharing entities with the given memory by entity name.
 
         Joins through Entity.canonical_name to find overlap. When fleet_id is
-        provided, candidates are scoped to the same fleet.
+        provided, candidates are scoped to the same fleet. ``visibility``
+        scopes candidates to the writer's visibility tier so a scope_org
+        write can't be linked into a scope_team chain (and vice versa).
         """
         async with get_session() as session:
             # Subquery: canonical names of entities linked to the target memory
@@ -1079,6 +1082,7 @@ class PostgresService:
                     Memory.id != memory_id,
                     Memory.deleted_at.is_(None),
                     Memory.status.in_(("active", "confirmed", "pending")),
+                    Memory.visibility == visibility,
                     *([Memory.fleet_id == fleet_id] if fleet_id else []),
                 )
                 .group_by(Memory.id)
