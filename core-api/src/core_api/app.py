@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os as _os
 from contextlib import asynccontextmanager
@@ -33,6 +34,7 @@ from core_api.clients.storage_client import get_storage_client
 from core_api.constants import VERSION, is_mcp_path
 from core_api.consumer import register_consumers
 from core_api.mcp_server import get_mcp_app, mcp_lifespan
+from core_api.middleware.per_tenant_concurrency import per_tenant_storage_slot
 from core_api.middleware.rate_limit import limiter
 from core_api.middleware.request_timeout import (
     _TIMEOUT_OPT_OUT_PATHS,
@@ -205,22 +207,63 @@ async def lifespan(app):
                 set_audit_queue,
             )
 
-            async def _flush_audit_batch(events: list[dict]) -> None:
+            async def _flush_one_tenant(tid: str, tevs: list[dict]) -> None:
+                # Sentinel bucket for events without a tenant_id — log + skip
+                # rather than failing the whole batch (CAURA-631 review).
+                if tid == "_UNKNOWN_TENANT_":
+                    logger.warning(
+                        "audit batch contained %d events with no tenant_id; "
+                        "skipping write (events unattributable)",
+                        len(tevs),
+                    )
+                    return
                 try:
-                    await get_storage_client().create_audit_logs_bulk(events)
+                    async with per_tenant_storage_slot("storage_write", tid):
+                        await get_storage_client().create_audit_logs_bulk(tevs)
                 except Exception:
-                    # Log the rich detail (event count, storage-api
-                    # correlation context) here, then re-raise so
-                    # ``_drain_and_flush`` can bump ``_failed_count``
-                    # for the dashboard. The flusher loop's outer
-                    # ``except`` will emit a generic "iteration failed;
-                    # continuing" line on top of this — slight log
-                    # noise but worth it for the failure metric.
                     logger.exception(
-                        "audit batch flush failed (events=%d); events lost from this batch",
-                        len(events),
+                        "audit batch flush failed for tenant=%s (events=%d); "
+                        "events lost from this tenant's slice",
+                        tid,
+                        len(tevs),
                     )
                     raise
+
+            async def _flush_audit_batch(events: list[dict]) -> None:
+                # Group by tenant + flush concurrently with per-tenant storage
+                # slot (cap=2) gating each group. Without the slot the flusher
+                # hoards storage-writer pool slots while ``/memories/bulk``
+                # requests queue, producing the 72% bulk_write 429 spike from
+                # loadtest 1777462612 (CAURA-631). Concurrent fan-out keeps
+                # flush latency bounded to the slowest tenant rather than
+                # serialising over them.
+                #
+                # Per-tenant failures don't abort sibling tenants;
+                # ``return_exceptions=True`` lets every group's outcome land,
+                # then we re-raise the last error so ``_drain_and_flush`` can
+                # bump ``_failed_count``. Slightly over-reports failures when
+                # one tenant succeeds and another fails in the same chunk —
+                # acceptable vs silently swallowing errors. Per-tenant detail
+                # is logged inside ``_flush_one_tenant`` either way.
+                by_tenant: dict[str, list[dict]] = {}
+                for ev in events:
+                    # ``.get()`` so a malformed event missing tenant_id can't
+                    # KeyError out the whole batch — bucket it under the
+                    # sentinel and skip the storage write for that bucket.
+                    tenant_id = ev.get("tenant_id") or "_UNKNOWN_TENANT_"
+                    by_tenant.setdefault(tenant_id, []).append(ev)
+
+                results = await asyncio.gather(
+                    *(_flush_one_tenant(tid, tevs) for tid, tevs in by_tenant.items()),
+                    return_exceptions=True,
+                )
+                errors = [r for r in results if isinstance(r, BaseException)]
+                if errors:
+                    # ``with_traceback`` preserves the original failure stack
+                    # so APM / Sentry shows the storage-call frame, not just
+                    # the re-raise site.
+                    last_error = errors[-1]
+                    raise last_error.with_traceback(last_error.__traceback__)
 
             audit_queue = AuditEventQueue(
                 max_queue_size=app_settings.audit_queue_max_size,
