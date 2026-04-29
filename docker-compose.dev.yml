@@ -38,7 +38,16 @@ services:
   core-storage-api:
     build:
       context: .
-      dockerfile: Dockerfile.dev
+      dockerfile: core-storage-api/Dockerfile
+    # Run as the host user so __pycache__ files written next to
+    # bind-mounted source land with host-matching ownership. Without
+    # this, on Linux hosts where id -u != 1000 (the appuser uid baked
+    # into the production Dockerfile) Python hits PermissionError on
+    # every reload. Defaults to 1000:1000, which matches the image's
+    # appuser and keeps current behaviour on hosts where it already
+    # works (macOS Docker Desktop, Linux at uid 1000). Override via
+    # ``UID=$(id -u) GID=$(id -g) docker compose up`` or .env entries.
+    user: "${UID:-1000}:${GID:-1000}"
     command: >
       uvicorn core_storage_api.app:app
       --host 0.0.0.0 --port 8002 --reload
@@ -74,7 +83,9 @@ services:
   core-api:
     build:
       context: .
-      dockerfile: Dockerfile.dev
+      dockerfile: core-api/Dockerfile
+    # See core-storage-api above for the rationale on user mapping.
+    user: "${UID:-1000}:${GID:-1000}"
     command: >
       uvicorn core_api.app:app
       --host 0.0.0.0 --port 8000 --reload
