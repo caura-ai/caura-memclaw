@@ -210,6 +210,7 @@ async def find_entity_overlap_candidates(request: Request) -> list[dict]:
         memory_id=UUID(body["memory_id"]),
         tenant_id=body["tenant_id"],
         fleet_id=body.get("fleet_id"),
+        visibility=body.get("visibility", "scope_team"),
         limit=body.get("limit", 8),
     )
     return [orm_to_dict(m, MEMORY_FIELDS) for m in memories]

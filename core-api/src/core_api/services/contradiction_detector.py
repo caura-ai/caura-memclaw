@@ -188,6 +188,10 @@ async def _detect(
                 "tenant_id": tenant_id,
                 "fleet_id": new_memory.get("fleet_id"),
                 "embedding": embedding,
+                # Scope candidates to the writer's visibility tier — prevents
+                # scope_org/scope_agent writes from being marked as superseding
+                # scope_team memories (cross-scope chain pollution).
+                "visibility": new_memory.get("visibility", "scope_team"),
             }
         )
         if candidates:
@@ -359,6 +363,8 @@ async def detect_contradictions_by_entities_async(
                 "memory_id": str(memory_id),
                 "tenant_id": tenant_id,
                 "fleet_id": fleet_id,
+                # Same visibility scoping as the semantic path above.
+                "visibility": new_memory.get("visibility", "scope_team"),
             }
         )
         if not candidates:
