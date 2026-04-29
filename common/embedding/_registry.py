@@ -41,28 +41,57 @@ logger = logging.getLogger(__name__)
 # explicit ``aclose`` — the GC drops the underlying httpx pool when
 # the evicted instance has no remaining refs.
 _OPENAI_CACHE_MAX = 256
-_openai_provider_cache: OrderedDict[tuple[str, str], OpenAIEmbeddingProvider] = (
-    OrderedDict()
-)
+_openai_provider_cache: OrderedDict[
+    tuple[str, str, str | None, bool, str | None, int | None],
+    OpenAIEmbeddingProvider,
+] = OrderedDict()
 
 
-def _get_or_create_openai_provider(api_key: str, model: str) -> OpenAIEmbeddingProvider:
-    """LRU-bounded ``OpenAIEmbeddingProvider`` lookup keyed on (api_key, model).
+def _get_or_create_openai_provider(
+    api_key: str,
+    model: str,
+    base_url: str | None,
+    send_dimensions: bool,
+    query_instruction: str | None,
+    truncate_to_dim: int | None,
+) -> OpenAIEmbeddingProvider:
+    """LRU-bounded ``OpenAIEmbeddingProvider`` lookup keyed on the full client
+    config tuple.
+
+    Cache key includes ``base_url`` / ``send_dimensions`` / ``query_instruction``
+    / ``truncate_to_dim`` so the same api_key can host multiple simultaneous
+    providers — e.g. real OpenAI for one tenant and a local TEI sidecar with
+    a Qwen3 instruction prefix for another — without the second silently
+    aliasing to the first cached client.
 
     Not strictly async-safe across concurrent cache misses for the same
     key — two coroutines can both observe a miss before either inserts.
     The race is harmless: the later insert overwrites the earlier with
-    a functionally identical client (same api_key + model, no per-call
-    state), and the earlier instance gets dropped on the next GC. Not
-    worth an asyncio.Lock for the cost of a duplicated TLS handshake
-    on the first concurrent miss.
+    a functionally identical client (same key tuple, no per-call state),
+    and the earlier instance gets dropped on the next GC. Not worth an
+    asyncio.Lock for the cost of a duplicated TLS handshake on the
+    first concurrent miss.
     """
-    cache_key = (api_key, model)
+    cache_key = (
+        api_key,
+        model,
+        base_url,
+        send_dimensions,
+        query_instruction,
+        truncate_to_dim,
+    )
     cached = _openai_provider_cache.get(cache_key)
     if cached is not None:
         _openai_provider_cache.move_to_end(cache_key)
         return cached
-    provider = OpenAIEmbeddingProvider(api_key=api_key, model=model)
+    provider = OpenAIEmbeddingProvider(
+        api_key=api_key,
+        model=model,
+        base_url=base_url,
+        send_dimensions=send_dimensions,
+        query_instruction=query_instruction,
+        truncate_to_dim=truncate_to_dim,
+    )
     _openai_provider_cache[cache_key] = provider
     if len(_openai_provider_cache) > _OPENAI_CACHE_MAX:
         _openai_provider_cache.popitem(last=False)
@@ -130,7 +159,31 @@ def get_embedding_provider(
             if tenant_config is not None
             else None
         ) or OPENAI_EMBEDDING_MODEL
-        return _get_or_create_openai_provider(api_key, embed_model)
+        base_url = os.environ.get("OPENAI_EMBEDDING_BASE_URL") or None
+        send_dimensions = (
+            os.environ.get("OPENAI_EMBEDDING_SEND_DIMENSIONS", "true").lower()
+            != "false"
+        )
+        # Option B: instruction-aware query encoding. Default applied to all
+        # /api/v1/search calls; documents (writes) embed unmodified text.
+        query_instruction = (
+            os.environ.get("EMBEDDING_QUERY_INSTRUCTION") or None
+        )
+        # Matryoshka truncation: lets us run instruction-aware models with
+        # native dim > VECTOR_DIM (Qwen3-Embedding-0.6B is 1024-d, 4B is
+        # 2560-d, 8B is 4096-d) against an unchanged 768-d schema. The
+        # ``OpenAIEmbeddingProvider._postprocess`` slices and L2-renormalizes
+        # so cosine sim correctness is preserved.
+        truncate_raw = os.environ.get("OPENAI_EMBEDDING_TRUNCATE_TO_DIM")
+        truncate_to_dim = int(truncate_raw) if truncate_raw else None
+        return _get_or_create_openai_provider(
+            api_key,
+            embed_model,
+            base_url,
+            send_dimensions,
+            query_instruction,
+            truncate_to_dim,
+        )
 
     if name == ProviderName.LOCAL:
         return LocalEmbedding()

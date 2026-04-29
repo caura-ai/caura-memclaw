@@ -31,3 +31,26 @@ class EmbeddingProvider(Protocol):
         Same dimensionality contract as :meth:`embed`.
         """
         ...
+
+    async def embed_query(
+        self, text: str, instruction: str | None = None
+    ) -> list[float]:
+        """Generate an embedding vector for a search-side query.
+
+        Instruction-aware embedders (Qwen3-Embedding, KaLM-Gemma3, e5-instruct,
+        ...) train query-side and document-side encoders to expect different
+        inputs — typically a task-description prefix on queries only. This
+        method is the asymmetric counterpart to :meth:`embed` (which is the
+        document/ingest path).
+
+        Providers that don't have an instruction-aware mode should fall back
+        to ``embed(text)`` and ignore *instruction*. The default registered
+        in :class:`OpenAIEmbeddingProvider` does exactly that when
+        ``instruction`` resolves to a falsy value (no env-configured default
+        and no per-call override), so this method is always safe to call —
+        callers that don't need instructions can leave both arguments at
+        their defaults.
+
+        Same dimensionality contract as :meth:`embed`.
+        """
+        ...
