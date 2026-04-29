@@ -571,6 +571,7 @@ async def get_memory(
             "ts_valid_start": memory.ts_valid_start.isoformat() if memory.ts_valid_start else None,
             "ts_valid_end": memory.ts_valid_end.isoformat() if memory.ts_valid_end else None,
             "status": memory.status,
+            "visibility": memory.visibility,
             "recall_count": memory.recall_count,
             "last_recalled_at": memory.last_recalled_at.isoformat() if memory.last_recalled_at else None,
             "supersedes_id": str(memory.supersedes_id) if memory.supersedes_id else None,
