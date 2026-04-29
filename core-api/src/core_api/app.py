@@ -194,6 +194,43 @@ async def lifespan(app):
             )
         )
 
+        # CAURA-628: bind + start the audit batch flusher. ``log_action``
+        # checks for an active queue and falls back to a synchronous
+        # POST when ``audit_queue_max_size = 0`` (kill-switch) or the
+        # queue isn't bound (early startup, tests).
+        audit_queue = None
+        if app_settings.audit_queue_max_size > 0:
+            from core_api.services.audit_queue import (
+                AuditEventQueue,
+                set_audit_queue,
+            )
+
+            async def _flush_audit_batch(events: list[dict]) -> None:
+                try:
+                    await get_storage_client().create_audit_logs_bulk(events)
+                except Exception:
+                    # Log the rich detail (event count, storage-api
+                    # correlation context) here, then re-raise so
+                    # ``_drain_and_flush`` can bump ``_failed_count``
+                    # for the dashboard. The flusher loop's outer
+                    # ``except`` will emit a generic "iteration failed;
+                    # continuing" line on top of this — slight log
+                    # noise but worth it for the failure metric.
+                    logger.exception(
+                        "audit batch flush failed (events=%d); events lost from this batch",
+                        len(events),
+                    )
+                    raise
+
+            audit_queue = AuditEventQueue(
+                max_queue_size=app_settings.audit_queue_max_size,
+                flush_threshold=app_settings.audit_queue_flush_threshold,
+                flush_interval_seconds=app_settings.audit_queue_flush_interval_seconds,
+                flush_callable=_flush_audit_batch,
+            )
+            set_audit_queue(audit_queue)
+            await audit_queue.start()
+
         # Start lifecycle automation scheduler
         from core_api.services.lifecycle_service import lifecycle_scheduler
         from core_api.tasks import cancel_all_tasks, track_task
@@ -219,11 +256,23 @@ async def lifespan(app):
         # we leak the resources the later steps would have freed.
         # Wrap each in its own try/except and continue; the
         # executor.shutdown at the end always runs.
-        for coro in [
-            event_bus.stop(),
-            cancel_all_tasks(),
-            get_storage_client().close(),
-        ]:
+        #
+        # Order matters: drain the audit queue BEFORE closing the
+        # storage client — the final flush goes through that client.
+        # Bus stop also happens before storage-client close because
+        # the bus's pull-loops may still be issuing storage calls
+        # mid-cancel.
+        shutdown_steps: list = []
+        if audit_queue is not None:
+            shutdown_steps.append(audit_queue.stop(timeout=5.0))
+        shutdown_steps.extend(
+            [
+                event_bus.stop(),
+                cancel_all_tasks(),
+                get_storage_client().close(),
+            ]
+        )
+        for coro in shutdown_steps:
             try:
                 await coro
             except Exception:

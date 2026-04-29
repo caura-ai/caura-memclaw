@@ -902,6 +902,12 @@ class CoreStorageClient:
     async def create_audit_log(self, data: dict) -> dict:
         return await self._post("/audit-logs", data)  # type: ignore[return-value]
 
+    async def create_audit_logs_bulk(self, events: list[dict]) -> dict:
+        """Batched audit insert (CAURA-628). One HTTP POST + one
+        multi-row INSERT regardless of batch size, vs N round-trips +
+        N table-lock acquisitions on the legacy single-event path."""
+        return await self._post("/audit-logs/bulk", {"events": events})  # type: ignore[return-value]
+
     async def list_audit_logs(
         self,
         tenant_id: str,
