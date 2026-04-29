@@ -12,6 +12,7 @@ Multi-provider support:
 
 import asyncio
 import logging
+from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,6 +24,39 @@ from core_api.providers._retry import call_with_fallback
 from core_api.schemas import ContradictionInfo
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_dt(value) -> datetime | None:
+    """Best-effort parse of an ISO datetime string or pass-through datetime."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _candidate_is_older(candidate: dict, new_memory: dict) -> bool:
+    """Return True only if ``candidate`` was created strictly before ``new_memory``.
+
+    Enforces the supersession-direction invariant: ``NEW.supersedes_id = OLD.id``
+    (CAURA-000). Detection has four call sites, two of them event-driven
+    (``MemoryEnriched`` / ``MemoryEmbedded`` consumers), so it can fire on a row
+    long after that row was written — by which time newer contradicting rows
+    may exist. Without this guard, the detector would happily mark the newer
+    candidate as ``outdated`` and write ``older.supersedes_id = newer.id``,
+    inverting the chain and producing cycles like ``A → B → A``.
+
+    If either timestamp is missing or unparseable we conservatively return
+    False — a missed detection is cheaper than a corrupted chain.
+    """
+    cand_dt = _parse_dt(candidate.get("created_at"))
+    new_dt = _parse_dt(new_memory.get("created_at"))
+    if cand_dt is None or new_dt is None:
+        return False
+    return cand_dt < new_dt
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +184,10 @@ async def _detect(
             exclude_id=str(memory_id),
         )
         for old in rdf_conflicts:
+            if not _candidate_is_older(old, new_memory):
+                # Skip: candidate is newer than us. Marking it outdated and
+                # writing our supersedes_id at it would invert direction.
+                continue
             old_id = old.get("id")
             # Mark old memory as outdated via storage client
             await sc.update_memory_status(str(old_id), "outdated")
@@ -214,6 +252,9 @@ async def _detect(
                     )
                     continue
                 if result:
+                    if not _candidate_is_older(candidate, new_memory):
+                        # Same direction-invariant guard as path 1.
+                        continue
                     cand_id = candidate.get("id")
                     # Mark candidate as conflicted via storage client
                     await sc.update_memory_status(str(cand_id), "conflicted")
@@ -389,6 +430,9 @@ async def detect_contradictions_by_entities_async(
                 )
                 continue
             if result:
+                if not _candidate_is_older(candidate, new_memory):
+                    # Same direction-invariant guard as paths 1 and 2.
+                    continue
                 cand_id = candidate.get("id")
                 await sc.update_memory_status(str(cand_id), "conflicted")
                 if not found:
