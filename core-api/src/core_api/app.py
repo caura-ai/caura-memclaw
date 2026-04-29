@@ -57,6 +57,15 @@ from core_api.routes.settings import router as settings_router
 from core_api.routes.stats import router as stats_router
 from core_api.routes.stm import router as stm_router
 
+# CAURA-631: sentinel bucket for audit events that arrive without a
+# ``tenant_id`` field. Routed through the per-tenant flusher's
+# group-by step then explicitly skipped (events are unattributable, so
+# we'd be writing them to the wrong tenant's audit log otherwise).
+# Identity sentinel (``object()``) rather than a string so a tenant
+# whose actual ID happens to be a debug-style label can't accidentally
+# match it and get its events silently dropped.
+_UNKNOWN_TENANT_SENTINEL: object = object()
+
 _SECURITY_HEADERS = {
     "strict-transport-security": "max-age=63072000; includeSubDomains; preload",
     "x-content-type-options": "nosniff",
@@ -208,15 +217,9 @@ async def lifespan(app):
             )
 
             async def _flush_one_tenant(tid: str, tevs: list[dict]) -> None:
-                # Sentinel bucket for events without a tenant_id — log + skip
-                # rather than failing the whole batch (CAURA-631 review).
-                if tid == "_UNKNOWN_TENANT_":
-                    logger.warning(
-                        "audit batch contained %d events with no tenant_id; "
-                        "skipping write (events unattributable)",
-                        len(tevs),
-                    )
-                    return
+                # Caller separates the sentinel bucket out before scheduling
+                # ``_flush_one_tenant`` over real tenants only, so ``tid`` is
+                # always a real tenant ID here — no sentinel branch needed.
                 try:
                     async with per_tenant_storage_slot("storage_write", tid):
                         await get_storage_client().create_audit_logs_bulk(tevs)
@@ -240,30 +243,117 @@ async def lifespan(app):
                 #
                 # Per-tenant failures don't abort sibling tenants;
                 # ``return_exceptions=True`` lets every group's outcome land,
-                # then we re-raise the last error so ``_drain_and_flush`` can
-                # bump ``_failed_count``. Slightly over-reports failures when
-                # one tenant succeeds and another fails in the same chunk —
-                # acceptable vs silently swallowing errors. Per-tenant detail
-                # is logged inside ``_flush_one_tenant`` either way.
-                by_tenant: dict[str, list[dict]] = {}
+                # then we re-raise the last error and attach the actually-failed
+                # event count via ``failed_event_count`` so ``_drain_and_flush``
+                # can credit the surviving tenants to ``_flushed_count`` instead
+                # of marking the whole chunk lost.
+                by_tenant: dict[str | object, list[dict]] = {}
                 for ev in events:
                     # ``.get()`` so a malformed event missing tenant_id can't
                     # KeyError out the whole batch — bucket it under the
                     # sentinel and skip the storage write for that bucket.
-                    tenant_id = ev.get("tenant_id") or "_UNKNOWN_TENANT_"
+                    tenant_id = ev.get("tenant_id") or _UNKNOWN_TENANT_SENTINEL
                     by_tenant.setdefault(tenant_id, []).append(ev)
 
+                # Pop sentinel events (no tenant_id) before fan-out: log them
+                # once + skip the storage write, but don't include them in the
+                # gather. Removes the dead sentinel branch from
+                # ``_flush_one_tenant`` and keeps ``total_failed_events`` /
+                # ``len(tasks)`` accurate to "events that were actually
+                # attempted to write."
+                #
+                # Stash the count on the closure so ``_drain_and_flush`` can
+                # subtract it from ``_flushed_count`` after the call —
+                # otherwise dropped sentinel events would be silently
+                # credited as flushed, inflating the dashboard. Assigned
+                # unconditionally on every entry so a stale value from a
+                # previous call can't bleed through.
+                sentinel_evs = by_tenant.pop(_UNKNOWN_TENANT_SENTINEL, [])
+                _flush_audit_batch._sentinel_count = len(sentinel_evs)  # type: ignore[attr-defined]
+                if sentinel_evs:
+                    logger.warning(
+                        "audit batch contained %d events with no tenant_id; "
+                        "skipping write (events unattributable)",
+                        len(sentinel_evs),
+                    )
+
+                # Sentinel was already popped above, so every remaining
+                # key is a real tenant string. Runtime check (not
+                # ``assert``) so the guard fires under ``python -O`` too —
+                # surfaces a future bug that lets a non-string key sneak
+                # in instead of silently dropping that group's events.
+                if not all(isinstance(tid, str) for tid in by_tenant):
+                    raise RuntimeError("unexpected non-string tenant key in by_tenant after sentinel pop")
+                tasks: list[tuple[str, list[dict]]] = list(by_tenant.items())  # type: ignore[arg-type]
                 results = await asyncio.gather(
-                    *(_flush_one_tenant(tid, tevs) for tid, tevs in by_tenant.items()),
+                    *(_flush_one_tenant(tid, tevs) for tid, tevs in tasks),
                     return_exceptions=True,
                 )
-                errors = [r for r in results if isinstance(r, BaseException)]
+
+                # Three buckets to handle every BaseException class without
+                # silent drops:
+                #   - ``cancel_errors``: ``asyncio.CancelledError`` (BaseException,
+                #     not Exception). Asyncio cancellation MUST propagate with
+                #     highest priority — silencing it under a co-occurring
+                #     regular exception breaks shutdown semantics.
+                #   - ``other_base``: ``SystemExit`` / ``KeyboardInterrupt`` /
+                #     future ``BaseExceptionGroup`` etc. Re-raise as-is for the
+                #     queue's outer handler — never silently drop.
+                #   - ``errors``: regular ``Exception`` subclasses. Carry the
+                #     actionable Sentry-grade traceback. Raised last.
+                cancel_errors = [r for r in results if isinstance(r, asyncio.CancelledError)]
+                errors = [r for r in results if isinstance(r, Exception)]
+                other_base = [
+                    r
+                    for r in results
+                    if isinstance(r, BaseException)
+                    and not isinstance(r, Exception)
+                    and not isinstance(r, asyncio.CancelledError)
+                ]
+
+                # Count actually-lost events across all failure buckets.
+                # ``_drain_and_flush`` reads ``failed_event_count`` from the
+                # raised exception to keep ``_flushed_count`` /
+                # ``_failed_count`` accounting accurate when only some
+                # tenants in the chunk fail.
+                total_failed_events = sum(
+                    len(tevs)
+                    for (_tid, tevs), r in zip(tasks, results, strict=True)
+                    if isinstance(r, BaseException)
+                )
+
+                # Priority order: cancel → other_base → errors. Cancellation
+                # wins so shutdown signals propagate even if a co-occurring
+                # storage error tries to mask them. ``failed_event_count`` is
+                # attached to every raise path so ``_drain_and_flush``'s
+                # accounting stays accurate regardless of which path fires.
+                if cancel_errors:
+                    e_cancel = cancel_errors[-1]
+                    e_cancel.failed_event_count = total_failed_events  # type: ignore[attr-defined]
+                    raise e_cancel
+                if other_base:
+                    e_base = other_base[-1]
+                    e_base.failed_event_count = total_failed_events  # type: ignore[attr-defined]
+                    raise e_base
                 if errors:
-                    # ``with_traceback`` preserves the original failure stack
-                    # so APM / Sentry shows the storage-call frame, not just
-                    # the re-raise site.
-                    last_error = errors[-1]
-                    raise last_error.with_traceback(last_error.__traceback__)
+                    # Single-tenant failure: re-raise the underlying error
+                    # directly so callers see the original storage-call
+                    # frame in Sentry without an extra wrapping layer.
+                    # Multi-tenant failure: wrap in ``ExceptionGroup`` so
+                    # every tenant's traceback is preserved (Sentry groups
+                    # them, incident replay sees them all). Without the
+                    # group the ``errors[-1]``-only path silently dropped
+                    # all but the last tenant's stack.
+                    if len(errors) == 1:
+                        last_error = errors[-1]
+                        last_error.failed_event_count = total_failed_events  # type: ignore[attr-defined]
+                        raise last_error
+                    eg = ExceptionGroup(
+                        f"audit batch flush failed for {len(errors)} tenants",
+                        errors,
+                    )
+                    eg.failed_event_count = total_failed_events  # type: ignore[attr-defined]
+                    raise eg
 
             audit_queue = AuditEventQueue(
                 max_queue_size=app_settings.audit_queue_max_size,

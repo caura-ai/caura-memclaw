@@ -247,19 +247,71 @@ class AuditEventQueue:
             try:
                 await self._flush_callable(chunk)
                 self._flushed_count += len(chunk)
-            except Exception:
-                self._failed_count += len(chunk)
-                # Per-chunk failure logged here (in addition to the
-                # closure's rich-detail log) so a partial drain of N
-                # chunks shows N independent log lines, each naming
-                # the chunk size — a bare ``logger.exception`` from
-                # the loop's outer ``except`` would only fire once
-                # for the first failing chunk and obscure how many
-                # chunks total were lost.
-                logger.exception(
-                    "audit chunk flush failed (chunk_size=%d); events lost",
-                    len(chunk),
-                )
+                # CAURA-631: callables that drop sentinel events (e.g. audit
+                # events without ``tenant_id``) stash the dropped count on
+                # themselves so we don't silently credit them as flushed.
+                # Defaults to 0 for callables that don't use this protocol.
+                self._flushed_count -= getattr(self._flush_callable, "_sentinel_count", 0)
+            except BaseException as exc:
+                # CAURA-631: when the callable handles per-tenant flushes
+                # and only some sub-groups fail, it sets ``failed_event_count``
+                # on the raised exception so we credit the actually-failed
+                # events to ``_failed_count`` and the rest to
+                # ``_flushed_count``. Falls back to ``len(chunk)`` for
+                # legacy callables that don't carry the attribute, matching
+                # the original whole-chunk-failed accounting.
+                #
+                # ``BaseException`` (not ``Exception``) so the accounting
+                # block runs for ``CancelledError`` / ``SystemExit`` /
+                # ``BaseExceptionGroup`` paths too — the per-tenant flusher
+                # explicitly attaches ``failed_event_count`` on those raises
+                # and we'd otherwise bypass them entirely. We re-raise after
+                # accounting so propagation semantics are preserved (the
+                # outer flusher loop's ``except Exception`` then handles
+                # regular errors and lets BaseExceptions escape unchanged).
+                if isinstance(exc, Exception):
+                    failed = getattr(exc, "failed_event_count", len(chunk))
+                else:
+                    # External CancelledError / SystemExit injected at the
+                    # ``await self._flush_callable(chunk)`` suspension point
+                    # has no ``failed_event_count`` attribute — the per-
+                    # tenant flusher's raises always do, but a cancellation
+                    # delivered before the flusher returns doesn't. Default
+                    # to 0 instead of ``len(chunk)`` so a clean shutdown
+                    # doesn't produce a spurious failure-spike on the
+                    # dashboard. The events themselves stay in the queue
+                    # (or are silently lost depending on shutdown ordering),
+                    # but their disposition is "unknown", not "failed".
+                    failed = getattr(exc, "failed_event_count", 0)
+                self._failed_count += failed
+                self._flushed_count += len(chunk) - failed
+                # Same sentinel correction as the success path: dropped
+                # sentinel events were neither flushed nor failed, so back
+                # them out of the surviving-events credit.
+                self._flushed_count -= getattr(self._flush_callable, "_sentinel_count", 0)
+                if isinstance(exc, Exception):
+                    # Per-chunk failure logged here (in addition to the
+                    # closure's rich-detail log) so a partial drain of N
+                    # chunks shows N independent log lines, each naming
+                    # the chunk size — a bare ``logger.exception`` from
+                    # the loop's outer ``except`` would only fire once
+                    # for the first failing chunk and obscure how many
+                    # chunks total were lost. Per-chunk failure isolation
+                    # contract: regular ``Exception`` is caught here and
+                    # the loop continues to the next chunk (covered by
+                    # ``test_chunk_failure_does_not_drop_other_chunks``).
+                    logger.exception(
+                        "audit chunk flush failed (chunk_size=%d, failed_events=%d); events lost",
+                        len(chunk),
+                        failed,
+                    )
+                else:
+                    # ``CancelledError`` / ``SystemExit`` /
+                    # ``BaseExceptionGroup`` etc — re-raise so shutdown
+                    # signals propagate. Per-chunk isolation only applies
+                    # to regular ``Exception``; a cancellation pre-empts
+                    # the whole drain loop intentionally.
+                    raise
 
 
 # Module-level singleton bound at lifespan startup. Tests that need a
