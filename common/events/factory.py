@@ -36,7 +36,9 @@ def get_event_bus() -> EventBus:
         if backend == "inprocess":
             _bus = InProcessEventBus()
         elif backend == "pubsub":
-            project_id = os.getenv("GCP_PROJECT_ID") or os.getenv("EVENT_BUS_PROJECT_ID")
+            project_id = os.getenv("GCP_PROJECT_ID") or os.getenv(
+                "EVENT_BUS_PROJECT_ID"
+            )
             sub_prefix = os.getenv("EVENT_BUS_SUBSCRIPTION_PREFIX")
             if not project_id or not sub_prefix:
                 raise RuntimeError(
@@ -48,7 +50,21 @@ def get_event_bus() -> EventBus:
             # Pub/Sub SDK surfaces immediately instead of after the first
             # real event.
             PubSubEventBus._ensure_pubsub_sdk()
-            _bus = PubSubEventBus(project_id, sub_prefix)
+            raw_max = os.getenv("EVENT_BUS_PUBSUB_MAX_MESSAGES")
+            if raw_max:
+                try:
+                    max_messages = int(raw_max)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"EVENT_BUS_PUBSUB_MAX_MESSAGES must be a positive int, got {raw_max!r}"
+                    ) from exc
+                if max_messages <= 0:
+                    raise RuntimeError(
+                        f"EVENT_BUS_PUBSUB_MAX_MESSAGES must be a positive int, got {max_messages}"
+                    )
+                _bus = PubSubEventBus(project_id, sub_prefix, max_messages=max_messages)
+            else:
+                _bus = PubSubEventBus(project_id, sub_prefix)
         else:
             raise ValueError(
                 f"Unknown EVENT_BUS_BACKEND {backend!r}; expected inprocess or pubsub"
