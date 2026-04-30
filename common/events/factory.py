@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import threading
+from typing import Any
 
 from common.events.base import EventBus
 from common.events.inprocess import InProcessEventBus
@@ -36,19 +37,39 @@ def get_event_bus() -> EventBus:
         if backend == "inprocess":
             _bus = InProcessEventBus()
         elif backend == "pubsub":
-            project_id = os.getenv("GCP_PROJECT_ID") or os.getenv("EVENT_BUS_PROJECT_ID")
+            project_id = os.getenv("GCP_PROJECT_ID") or os.getenv(
+                "EVENT_BUS_PROJECT_ID"
+            )
             sub_prefix = os.getenv("EVENT_BUS_SUBSCRIPTION_PREFIX")
             if not project_id or not sub_prefix:
                 raise RuntimeError(
                     "EVENT_BUS_BACKEND=pubsub requires GCP_PROJECT_ID (or "
                     "EVENT_BUS_PROJECT_ID) and EVENT_BUS_SUBSCRIPTION_PREFIX"
                 )
+            kwargs: dict[str, Any] = {}
+            raw_max = os.getenv("EVENT_BUS_PUBSUB_MAX_MESSAGES")
+            if raw_max:
+                try:
+                    max_messages = int(raw_max)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"EVENT_BUS_PUBSUB_MAX_MESSAGES must be a positive int <= 1000, got {raw_max!r}"
+                    ) from exc
+                # Pub/Sub's ``pull()`` API rejects ``max_messages > 1000`` with
+                # INVALID_ARGUMENT at first pull. Fail fast at boot instead so
+                # a typo in the env var doesn't surface as a runtime error
+                # mid-traffic.
+                if not 1 <= max_messages <= 1000:
+                    raise RuntimeError(
+                        f"EVENT_BUS_PUBSUB_MAX_MESSAGES must be a positive int <= 1000, got {raw_max!r}"
+                    )
+                kwargs["max_messages"] = max_messages
             # Fail fast at factory resolution (service boot) rather than on
             # first publish, so a misconfigured deploy that's missing the
             # Pub/Sub SDK surfaces immediately instead of after the first
             # real event.
             PubSubEventBus._ensure_pubsub_sdk()
-            _bus = PubSubEventBus(project_id, sub_prefix)
+            _bus = PubSubEventBus(project_id, sub_prefix, **kwargs)
         else:
             raise ValueError(
                 f"Unknown EVENT_BUS_BACKEND {backend!r}; expected inprocess or pubsub"

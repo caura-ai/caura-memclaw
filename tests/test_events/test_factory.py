@@ -24,7 +24,9 @@ async def test_explicit_inprocess(monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(bus, InProcessEventBus)
 
 
-async def test_pubsub_backend_requires_project_id(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_pubsub_backend_requires_project_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     await reset_event_bus_for_testing()
     monkeypatch.setenv("EVENT_BUS_BACKEND", "pubsub")
     monkeypatch.delenv("GCP_PROJECT_ID", raising=False)
@@ -77,6 +79,58 @@ async def test_pubsub_backend_fails_fast_when_sdk_missing(
     monkeypatch.setattr(builtins, "__import__", blocked)
 
     with pytest.raises(RuntimeError, match="google-cloud-pubsub"):
+        get_event_bus()
+
+
+async def test_pubsub_backend_honors_max_messages_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await reset_event_bus_for_testing()
+    monkeypatch.setenv("EVENT_BUS_BACKEND", "pubsub")
+    monkeypatch.setenv("GCP_PROJECT_ID", "proj")
+    monkeypatch.setenv("EVENT_BUS_SUBSCRIPTION_PREFIX", "core-api")
+    monkeypatch.setenv("EVENT_BUS_PUBSUB_MAX_MESSAGES", "10")
+    bus = get_event_bus()
+    assert isinstance(bus, PubSubEventBus)
+    assert bus._max_messages == 10
+
+
+async def test_pubsub_backend_default_max_messages_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await reset_event_bus_for_testing()
+    monkeypatch.setenv("EVENT_BUS_BACKEND", "pubsub")
+    monkeypatch.setenv("GCP_PROJECT_ID", "proj")
+    monkeypatch.setenv("EVENT_BUS_SUBSCRIPTION_PREFIX", "core-api")
+    monkeypatch.delenv("EVENT_BUS_PUBSUB_MAX_MESSAGES", raising=False)
+    bus = get_event_bus()
+    assert isinstance(bus, PubSubEventBus)
+    assert bus._max_messages == 25
+
+
+async def test_pubsub_backend_accepts_max_messages_upper_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await reset_event_bus_for_testing()
+    monkeypatch.setenv("EVENT_BUS_BACKEND", "pubsub")
+    monkeypatch.setenv("GCP_PROJECT_ID", "proj")
+    monkeypatch.setenv("EVENT_BUS_SUBSCRIPTION_PREFIX", "core-api")
+    monkeypatch.setenv("EVENT_BUS_PUBSUB_MAX_MESSAGES", "1000")
+    bus = get_event_bus()
+    assert isinstance(bus, PubSubEventBus)
+    assert bus._max_messages == 1000
+
+
+@pytest.mark.parametrize("bad", ["abc", "0", "-3", "1.5", "1001"])
+async def test_pubsub_backend_rejects_invalid_max_messages(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    await reset_event_bus_for_testing()
+    monkeypatch.setenv("EVENT_BUS_BACKEND", "pubsub")
+    monkeypatch.setenv("GCP_PROJECT_ID", "proj")
+    monkeypatch.setenv("EVENT_BUS_SUBSCRIPTION_PREFIX", "core-api")
+    monkeypatch.setenv("EVENT_BUS_PUBSUB_MAX_MESSAGES", bad)
+    with pytest.raises(RuntimeError, match="EVENT_BUS_PUBSUB_MAX_MESSAGES"):
         get_event_bus()
 
 
