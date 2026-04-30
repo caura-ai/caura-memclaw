@@ -3,10 +3,12 @@
   "name": "MemClaw",
   "kind": "memory",
   "type": "memory",
-  "version": "1.0.1",
-  "description": "Central persistent memory for OpenClaw agents \u2014 write, search, and entity lookup tools.",
+  "version": "1.1.0",
+  "description": "Central persistent memory for OpenClaw agents — write, search, and entity lookup tools.",
   "entry": "dist/index.js",
-  "skills": ["skills"],
+  "skills": [
+    "skills"
+  ],
   "configSchema": {
     "type": "object",
     "properties": {},
