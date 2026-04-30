@@ -135,6 +135,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      tei:
+        condition: service_healthy
+        required: false  # only enforced when --profile embed-local is active
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
       interval: 15s
@@ -142,6 +145,31 @@ services:
       retries: 3
       start_period: 15s
 
+  # ── Local Embedder (opt-in via ``--profile embed-local``) ───────
+  # See docker-compose.yml for the full block + comments. This dev
+  # variant is identical so that ``--profile embed-local`` works the
+  # same way against the hot-reload stack.
+
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:${TEI_IMAGE_TAG:-cpu-1.7}
+    profiles: ["embed-local"]
+    command:
+      - --model-id
+      - "${TEI_MODEL_ID:-BAAI/bge-m3}"
+      - --auto-truncate
+    environment:
+      HUGGINGFACE_HUB_CACHE: /data
+    volumes:
+      - tei_cache:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    # See docker-compose.yml for the optional GPU deploy block.
+
 volumes:
   pgdata:
   redis_data:
+  tei_cache:
