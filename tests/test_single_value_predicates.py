@@ -14,6 +14,7 @@ import pytest
 
 from core_api.constants import (
     SINGLE_VALUE_PREDICATES,
+    VECTOR_DIM,
 )
 
 
@@ -202,7 +203,7 @@ class TestRdfPathGating:
             "core_api.services.contradiction_detector.get_storage_client",
             return_value=mock_sc,
         ):
-            contradictions = await _detect(new_mem, [0.1] * 768)
+            contradictions = await _detect(new_mem, [0.1] * VECTOR_DIM)
 
         # RDF found conflict, semantic skipped
         mock_sc.find_rdf_conflicts.assert_called_once()
@@ -231,7 +232,7 @@ class TestRdfPathGating:
             "core_api.services.contradiction_detector.get_storage_client",
             return_value=mock_sc,
         ):
-            contradictions = await _detect(new_mem, [0.1] * 768)
+            contradictions = await _detect(new_mem, [0.1] * VECTOR_DIM)
 
         # RDF should NOT run for multi-value predicates; only semantic path
         mock_sc.find_rdf_conflicts.assert_not_called()
@@ -262,7 +263,7 @@ class TestRdfPathGating:
             "core_api.services.contradiction_detector.get_storage_client",
             return_value=mock_sc,
         ):
-            contradictions = await _detect(new_mem, [0.1] * 768)
+            contradictions = await _detect(new_mem, [0.1] * VECTOR_DIM)
 
         mock_sc.find_rdf_conflicts.assert_called_once()
         mock_sc.find_similar_candidates.assert_not_called()
@@ -288,7 +289,7 @@ class TestRdfPathGating:
             "core_api.services.contradiction_detector.get_storage_client",
             return_value=mock_sc,
         ):
-            contradictions = await _detect(new_mem, [0.1] * 768)
+            contradictions = await _detect(new_mem, [0.1] * VECTOR_DIM)
 
         # Only semantic path runs (no RDF triple)
         mock_sc.find_rdf_conflicts.assert_not_called()
@@ -319,7 +320,7 @@ class TestRdfPathGating:
             "core_api.services.contradiction_detector.get_storage_client",
             return_value=mock_sc,
         ):
-            contradictions = await _detect(new_mem, [0.1] * 768)
+            contradictions = await _detect(new_mem, [0.1] * VECTOR_DIM)
 
         # Only RDF query should have run — semantic skipped
         mock_sc.find_rdf_conflicts.assert_called_once()

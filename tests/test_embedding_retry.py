@@ -16,6 +16,7 @@ from core_api.constants import (
     EMBEDDING_REEMBED_DELAY_S,
     EMBEDDING_RETRY_ATTEMPTS,
     EMBEDDING_RETRY_DELAY_S,
+    VECTOR_DIM,
 )
 
 
@@ -87,7 +88,7 @@ async def test_success_on_second_attempt():
     """get_embedding returns a valid embedding when the second attempt succeeds."""
     from common.embedding import get_embedding
 
-    fake_vec = [0.1] * 768
+    fake_vec = [0.1] * VECTOR_DIM
     mock_provider = AsyncMock()
     mock_provider.embed = AsyncMock(side_effect=[RuntimeError("transient"), fake_vec])
     with (

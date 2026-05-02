@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from core_api import mcp_server
+from core_api.constants import VECTOR_DIM
 from tests._mcp_test_helpers import parse_envelope, strip_latency
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
@@ -278,7 +279,7 @@ async def test_doc_write_with_embed_field_embeds_and_forwards(mcp_env, monkeypat
 
     async def fake_embed(text):
         captured["embed_text"] = text
-        return [0.1] * 768
+        return [0.1] * VECTOR_DIM
 
     monkeypatch.setattr(
         "core_api.repositories.document_repo.upsert_returning_xmax", fake_upsert
@@ -296,7 +297,7 @@ async def test_doc_write_with_embed_field_embeds_and_forwards(mcp_env, monkeypat
     assert payload["ok"] is True
     assert payload["indexed"] is True
     assert captured["embed_text"] == "Some markdown body"
-    assert len(captured["embedding"]) == 768
+    assert len(captured["embedding"]) == VECTOR_DIM
 
 
 async def test_doc_write_embed_field_missing_from_data(mcp_env, monkeypatch):
@@ -306,7 +307,7 @@ async def test_doc_write_embed_field_missing_from_data(mcp_env, monkeypatch):
 
     async def should_not_embed(text):  # noqa: ARG001
         called["hit"] = True
-        return [0.0] * 768
+        return [0.0] * VECTOR_DIM
 
     monkeypatch.setattr("common.embedding.get_embedding", should_not_embed)
 
@@ -324,7 +325,7 @@ async def test_doc_write_embed_field_missing_from_data(mcp_env, monkeypatch):
 async def test_doc_write_embed_field_empty_string_is_rejected(mcp_env, monkeypatch):
     """Empty-string source is treated as missing (embedding would be noise)."""
     monkeypatch.setattr(
-        "common.embedding.get_embedding", _async_return([0.0] * 768)
+        "common.embedding.get_embedding", _async_return([0.0] * VECTOR_DIM)
     )
     out = await mcp_server.memclaw_doc(
         op="write",
@@ -368,7 +369,7 @@ async def test_doc_search_without_collection_spans_all(mcp_env, monkeypatch):
         return []
 
     monkeypatch.setattr(
-        "common.embedding.get_embedding", _async_return([0.1] * 768)
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
     )
     monkeypatch.setattr("core_api.repositories.document_repo.search", fake_search)
 
@@ -383,7 +384,7 @@ async def test_doc_search_broad_results_include_per_row_collection(mcp_env, monk
     """Each result row must include its own `collection` so the caller can
     follow up with op=read across mixed collections."""
     monkeypatch.setattr(
-        "common.embedding.get_embedding", _async_return([0.1] * 768)
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
     )
     pairs = [
         (_DocRow("acme", collection="customers"), 0.9),
@@ -413,7 +414,7 @@ async def test_doc_search_empty_query_rejected(mcp_env):
 async def test_doc_search_happy_path(mcp_env, monkeypatch):
     """Happy path: embedding → repo.search → results sorted by similarity."""
     monkeypatch.setattr(
-        "common.embedding.get_embedding", _async_return([0.1] * 768)
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
     )
     pairs = [(_DocRow("acme"), 0.92), (_DocRow("initech"), 0.81)]
     monkeypatch.setattr(
@@ -435,7 +436,7 @@ async def test_doc_search_happy_path(mcp_env, monkeypatch):
 async def test_doc_search_empty_results(mcp_env, monkeypatch):
     """No indexed docs / no matches → empty list, not error."""
     monkeypatch.setattr(
-        "common.embedding.get_embedding", _async_return([0.1] * 768)
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
     )
     monkeypatch.setattr(
         "core_api.repositories.document_repo.search", _async_return([])
@@ -455,7 +456,7 @@ async def test_doc_search_top_k_capped_at_50(mcp_env, monkeypatch):
         return []
 
     monkeypatch.setattr(
-        "common.embedding.get_embedding", _async_return([0.1] * 768)
+        "common.embedding.get_embedding", _async_return([0.1] * VECTOR_DIM)
     )
     monkeypatch.setattr("core_api.repositories.document_repo.search", fake_search)
 
