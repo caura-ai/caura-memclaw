@@ -106,8 +106,10 @@ class Settings(BaseSettings):
     db_max_overflow: int = 50
     cors_origins: str = "http://localhost:3000"
     # Request-wide budget enforced by RequestTimeoutMiddleware. 45s fits
-    # comfortably under the 60s LB cap and 300s Cloud Run platform ceiling,
-    # so a hung handler cannot keep a request slot past this.
+    # comfortably under the 120s gateway/Cloud Run cap (CAURA-623 raised
+    # the nginx ``proxy_read_timeout`` from 60s to 120s; the staging
+    # core-api Cloud Run service is also pinned to 120s at the platform
+    # level), so a hung handler cannot keep a request slot past this.
     #
     # Residual risk: asyncio.timeout cancels the coroutine task but cannot
     # cancel sync threads started via asyncio.to_thread (Vertex / Gemini
@@ -125,8 +127,10 @@ class Settings(BaseSettings):
     # enforce this longer budget themselves; the per-attempt unique
     # constraint on ``memories.client_request_id`` makes a 504-here
     # retry-safe at the row level. p95 today is ~42s under load, so
-    # 90s is roughly 2x headroom while staying well under the 300s
-    # Cloud Run platform ceiling.
+    # 90s is roughly 2x headroom while staying 30s below the 120s
+    # Cloud Run platform timeout (CAURA-623 — earlier comment cited
+    # the 300s unconfigured default before the platform service was
+    # pinned at 120s).
     bulk_request_timeout_seconds: float = 90.0
     # Per-phase cap on the storage roundtrip inside
     # ``create_memories_bulk`` (CAURA-599). Embedding and enrichment

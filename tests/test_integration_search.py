@@ -314,3 +314,36 @@ class TestSearchPipelineEndToEnd:
         assert len(results) >= 1
         # Memory 2 should win: fresher, recently recalled, entity-boosted
         # Memory 1's high weight and stale recall count shouldn't dominate
+
+    async def test_scored_search_excludes_soft_deleted(self, db, tenant_id):
+        # Regression guard for the parallel ``deleted_at IS NULL`` filter
+        # sites in core-storage-api/services/postgres_service.py
+        # (memory_scored_search at line 857 today). The semantic-dedup
+        # path already has its own deleted-row test in
+        # tests/test_p2_semantic_dedup.py::test_deleted_memory_doesnt_block;
+        # this closes the parallel gap on the scored-search read path.
+        from core_api.services.memory_service import search_memories
+
+        deleted_mem = await _insert_memory(
+            db, tenant_id, "kubernetes pod restart troubleshooting guide", weight=0.7
+        )
+        live_mem = await _insert_memory(
+            db, tenant_id, "kubernetes pod restart common causes summary", weight=0.7
+        )
+
+        await db.execute(
+            update(Memory)
+            .where(Memory.id == deleted_mem["id"])
+            .values(deleted_at=datetime.now(timezone.utc))
+        )
+        await db.commit()
+
+        results = await search_memories(db, tenant_id, "kubernetes pod restart")
+
+        result_ids = {str(r.id) for r in results}
+        assert str(deleted_mem["id"]) not in result_ids, (
+            "soft-deleted memory leaked into scored search results"
+        )
+        assert str(live_mem["id"]) in result_ids, (
+            "live memory was not returned by scored search"
+        )
