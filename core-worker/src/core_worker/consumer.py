@@ -64,6 +64,7 @@ from core_worker.clients.storage_client import (
     update_memory_embedding,
     update_memory_enrichment,
 )
+from core_worker.per_tenant_concurrency import per_tenant_storage_slot
 
 logger = logging.getLogger(__name__)
 
@@ -157,12 +158,18 @@ async def handle_embed_request(event: Event) -> None:
         embedding = await provider.embed(request.content)
 
     # Step 3 — persist. Raises on non-2xx → nacks → redelivers.
-    await update_memory_embedding(
-        storage,
-        memory_id=request.memory_id,
-        tenant_id=request.tenant_id,
-        embedding=embedding,
-    )
+    # Per-tenant slot scoped to the PATCH roundtrip only, so a
+    # tenant-A storm can't park every storage-writer connection here
+    # while tenant B's lone PATCH queues behind. Provider call above
+    # stays unguarded — that's the expensive step and it doesn't
+    # touch the storage-writer pool.
+    async with per_tenant_storage_slot(request.tenant_id):
+        await update_memory_embedding(
+            storage,
+            memory_id=request.memory_id,
+            tenant_id=request.tenant_id,
+            embedding=embedding,
+        )
 
     # Back-channel: announce successful embed so core-api can fire
     # post-embed contradiction detection. Closes the documented
@@ -529,12 +536,16 @@ async def handle_enrich_request(event: Event) -> None:
             len(result.atomic_facts),
         )
 
-    await update_memory_enrichment(
-        storage,
-        memory_id=request.memory_id,
-        tenant_id=request.tenant_id,
-        fields=patch,
-    )
+    # Per-tenant slot scoped to the PATCH only; matches the embed
+    # consumer above. The LLM enrichment call upstream is the
+    # expensive step but doesn't touch the storage-writer pool.
+    async with per_tenant_storage_slot(request.tenant_id):
+        await update_memory_enrichment(
+            storage,
+            memory_id=request.memory_id,
+            tenant_id=request.tenant_id,
+            fields=patch,
+        )
 
     # Back-channel: announce successful enrichment so core-api (or any
     # other subscriber) can react. Best-effort — a publish failure
