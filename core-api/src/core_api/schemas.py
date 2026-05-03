@@ -31,9 +31,7 @@ class MemoryCreate(BaseModel):
     tenant_id: str
     fleet_id: str | None = None
     agent_id: str
-    memory_type: MemoryType | None = Field(
-        default=None, description=MEMORY_TYPES_DESCRIPTION
-    )
+    memory_type: MemoryType | None = Field(default=None, description=MEMORY_TYPES_DESCRIPTION)
     content: str = Field(min_length=1, max_length=MAX_CONTENT_LENGTH)
     weight: float | None = Field(default=None, ge=0.0, le=1.0)
     source_uri: str | None = None
@@ -63,9 +61,7 @@ class MemoryCreate(BaseModel):
 class BulkMemoryItem(BaseModel):
     """Single item in a bulk write request. tenant_id/fleet_id/agent_id inherited from parent."""
 
-    memory_type: MemoryType | None = Field(
-        default=None, description=MEMORY_TYPES_DESCRIPTION
-    )
+    memory_type: MemoryType | None = Field(default=None, description=MEMORY_TYPES_DESCRIPTION)
     content: str = Field(min_length=1, max_length=MAX_CONTENT_LENGTH)
     weight: float | None = Field(default=None, ge=0.0, le=1.0)
     source_uri: str | None = None
@@ -154,9 +150,7 @@ class RedistributeResponse(BaseModel):
 
 class MemoryUpdate(BaseModel):
     content: str | None = Field(default=None, min_length=1, max_length=MAX_CONTENT_LENGTH)
-    memory_type: MemoryType | None = Field(
-        default=None, description=MEMORY_TYPES_DESCRIPTION
-    )
+    memory_type: MemoryType | None = Field(default=None, description=MEMORY_TYPES_DESCRIPTION)
     weight: float | None = Field(default=None, ge=0.0, le=1.0)
     title: str | None = None
     status: str | None = Field(default=None, pattern=MEMORY_STATUSES_PATTERN)
