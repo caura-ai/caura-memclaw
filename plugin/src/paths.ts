@@ -25,3 +25,8 @@ export function getPluginEnvPath(): string {
 export function getSecretsPath(): string {
   return join(getPluginDir(), ".agent-keys.json");
 }
+
+/** ~/.openclaw/plugins/memclaw/install.json — per-install opaque id. */
+export function getInstallStatePath(): string {
+  return join(getPluginDir(), "install.json");
+}

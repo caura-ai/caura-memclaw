@@ -9,7 +9,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env")
+    # ``extra="ignore"`` mirrors core-api/core-worker so a shared monorepo
+    # ``.env`` file (e.g. with OPENAI_API_KEY for core-api) doesn't fail
+    # this service's ``Settings()`` construction at import time. Without
+    # the flag, every unit-test run that touches a module which
+    # transitively imports this config crashes on
+    # ``extra_forbidden`` for keys this service doesn't own.
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     environment: Literal["development", "production", "sandbox"] = "development"
 

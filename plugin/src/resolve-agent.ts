@@ -6,10 +6,15 @@
  *   2. Session key parsing — "agent:AGENT_NAME:CHANNEL:TARGET"
  *   3. Config agent name (config.agentName, config.agent?.name)
  *   4. MEMCLAW_AGENT_ID env var
- *   5. "unknown-agent" — obvious signal that resolution failed
+ *   5. ``main-${installId}`` — install-disambiguated default so two
+ *      OpenClaw installs sharing one tenant don't merge their memories
+ *      into a single ``(tenant_id, agent_id="main")`` row. Pre-Task6
+ *      this was ``"unknown-agent"``, which is the same collision risk
+ *      with worse semantics.
  */
 
 import { MEMCLAW_AGENT_ID } from "./env.js";
+import { getInstallId } from "./install-id.js";
 
 export function resolveAgentId(
   ...sources: Array<Record<string, unknown> | undefined | null>
@@ -42,8 +47,12 @@ export function resolveAgentId(
     return MEMCLAW_AGENT_ID;
   }
 
+  // Per-install fallback. Was ``"unknown-agent"`` pre-Task6 — every
+  // install collided on a single row.
+  const fallback = `main-${getInstallId()}`;
   console.warn(
-    "[memclaw] Could not resolve agent ID — using 'unknown-agent'",
+    `[memclaw] Could not resolve agent ID — using install-default '${fallback}'. ` +
+      `Pass agent_id explicitly (or set MEMCLAW_AGENT_ID) for clarity.`,
   );
-  return "unknown-agent";
+  return fallback;
 }

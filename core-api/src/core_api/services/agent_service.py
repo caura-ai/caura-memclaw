@@ -21,37 +21,85 @@ async def get_or_create_agent(
     fleet_id: str | None = None,
     *,
     require_approval: bool = False,
+    display_name: str | None = None,
+    install_id: str | None = None,
 ) -> dict:
     """Return the agent dict, creating it on first encounter.
 
     The storage API handles upsert semantics and race-condition safety.
+
+    ``display_name`` and ``install_id`` (Task 6) are accepted optionally
+    on every call. On creation they're persisted; on lookup of an
+    existing row, ``display_name`` is refreshed if the new value
+    differs (so a renamed machine propagates) and ``install_id`` is
+    backfilled when previously NULL but never overwritten — the
+    install identity is stable for the row's lifetime.
     """
     sc = get_storage_client()
     agent = await sc.get_agent(agent_id, tenant_id)
     if agent:
-        # Backfill fleet_id if the agent was registered without one
+        # Backfill fleet_id if the agent was registered without one,
+        # refresh display_name when it differs (hostname change), and
+        # stamp install_id on first contact post-plugin-upgrade.
+        backfill: dict = {}
         if agent.get("fleet_id") is None and fleet_id is not None:
-            agent["fleet_id"] = fleet_id
+            backfill["fleet_id"] = fleet_id
+        if display_name is not None and agent.get("display_name") != display_name:
+            backfill["display_name"] = display_name
+        if install_id is not None and agent.get("install_id") is None:
+            backfill["install_id"] = install_id
+        if backfill:
+            agent.update(backfill)
             agent["updated_at"] = datetime.now(UTC)
-            sc = get_storage_client()
-            await sc.create_or_update_agent(
-                {
-                    "tenant_id": tenant_id,
-                    "agent_id": agent_id,
-                    "fleet_id": fleet_id,
-                }
-            )
+            await sc.create_or_update_agent({"tenant_id": tenant_id, "agent_id": agent_id, **backfill})
         return agent
 
-    initial_trust = 0 if require_approval else DEFAULT_TRUST_LEVEL
-    agent = await sc.create_or_update_agent(
-        {
-            "tenant_id": tenant_id,
-            "agent_id": agent_id,
-            "fleet_id": fleet_id,
-            "trust_level": initial_trust,
-        }
+    # Legacy-main carryover: pre-Task6 plugins all defaulted to
+    # ``agent_id="main"``, so an upgrade from those creates a brand-new
+    # ``main-{install_id}`` row and orphans the old "main" row's
+    # tuning state. When this is a fresh ``main-{install_id}`` create
+    # for a tenant/fleet that has a legacy "main" row, copy
+    # ``trust_level`` and ``search_profile`` forward so the upgraded
+    # plugin keeps the operator's prior calibration. Bounded scope:
+    #   - only triggers for ``main-{install_id}`` ids (not arbitrary
+    #     custom agents) so a deliberate new agent doesn't accidentally
+    #     inherit
+    #   - skipped when ``require_approval=True`` (the explicit
+    #     "start at 0" path)
+    #   - leaves the legacy row intact so its memories stay queryable
+    #     under ``agent_id="main"`` for admin recovery; operators
+    #     decide later whether to delete or keep as archive
+    inherited_trust: int | None = None
+    inherited_search_profile: dict[str, Any] | None = None
+    if not require_approval and install_id is not None and agent_id == f"main-{install_id}":
+        legacy = await sc.get_agent("main", tenant_id)
+        if legacy and (fleet_id is None or legacy.get("fleet_id") == fleet_id):
+            inherited_trust = legacy.get("trust_level")
+            inherited_search_profile = legacy.get("search_profile")
+            logger.info(
+                "carrying forward legacy 'main' agent state to install-scoped id",
+                extra={
+                    "tenant_id": tenant_id,
+                    "fleet_id": fleet_id,
+                    "new_agent_id": agent_id,
+                    "inherited_trust": inherited_trust,
+                },
+            )
+
+    initial_trust = (
+        inherited_trust if inherited_trust is not None else (0 if require_approval else DEFAULT_TRUST_LEVEL)
     )
+    create_payload: dict[str, Any] = {
+        "tenant_id": tenant_id,
+        "agent_id": agent_id,
+        "fleet_id": fleet_id,
+        "display_name": display_name,
+        "install_id": install_id,
+        "trust_level": initial_trust,
+    }
+    if inherited_search_profile is not None:
+        create_payload["search_profile"] = inherited_search_profile
+    agent = await sc.create_or_update_agent(create_payload)
     await log_action(
         db,
         tenant_id=tenant_id,
@@ -59,7 +107,13 @@ async def get_or_create_agent(
         action="agent_registered",
         resource_type="agent",
         resource_id=agent.get("id"),
-        detail={"fleet_id": fleet_id, "trust_level": initial_trust},
+        detail={
+            "fleet_id": fleet_id,
+            "trust_level": initial_trust,
+            "display_name": display_name,
+            "install_id": install_id,
+            "carried_from_legacy_main": inherited_trust is not None,
+        },
     )
     return agent
 

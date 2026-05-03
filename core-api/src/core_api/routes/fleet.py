@@ -1,11 +1,14 @@
 """Fleet heartbeat and command channel — replaces WebSocket/SSH gateway model."""
 
+import logging
 from datetime import UTC, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
 
 from core_api.auth import AuthContext, get_auth_context
 from core_api.clients.storage_client import get_storage_client
@@ -50,6 +53,20 @@ class HeartbeatIn(BaseModel):
     tools: list | None = None
     channels: list | None = None
     metadata: dict | None = None
+    # ``install_id`` is the per-OpenClaw-install opaque suffix the plugin
+    # generates once at first heartbeat and persists locally. Used to
+    # disambiguate the default ``"main"`` agent across fleet installs
+    # so memories from different machines stop colliding on a single
+    # ``(tenant_id, agent_id="main")`` row. Optional — older plugin
+    # versions don't send it.
+    #
+    # ``max_length=32`` matches the ``agents.install_id`` column
+    # (``String(32)``); without this Pydantic constraint, an oversized
+    # value silently 422s at the storage layer in a per-agent
+    # exception handler that swallows the failure, leaving the row
+    # without an ``install_id`` and recreating the very collision
+    # this feature exists to fix. Reject at the API boundary instead.
+    install_id: str | None = Field(None, max_length=32)
 
 
 class CommandIn(BaseModel):
@@ -173,6 +190,7 @@ async def delete_fleet(
 async def heartbeat(
     body: HeartbeatIn,
     auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
 ):
     """Plugin pushes status; receives pending commands in response."""
     auth.enforce_tenant(body.tenant_id)
@@ -197,6 +215,106 @@ async def heartbeat(
             "last_heartbeat": now.isoformat(),
         }
     )
+
+    # Materialise / refresh per-agent rows on every heartbeat so the
+    # admin UI sees agents the moment they appear (not only after their
+    # first write) and ``display_name`` tracks the current hostname when
+    # operators rename their machines. Old plugin versions that don't
+    # send ``display_name`` / ``install_id`` simply pass NULL — the
+    # diff-merge in ``get_or_create_agent`` only overwrites when the
+    # value is not None, so prior data is preserved.
+    #
+    # ``get_or_create_agent`` (rather than a direct
+    # ``sc.create_or_update_agent``) is load-bearing here: it does
+    # ``GET /agents/{id}`` first and only POSTs an update when the
+    # diff is non-empty. The bare POST hits storage's ``agent_add``
+    # which catches ``IntegrityError`` from the unique-key conflict,
+    # rolls back, and re-selects — but the rollback closes the
+    # outer ``session.begin()`` transaction, so the re-select 500s.
+    # The pre-Task6 only-on-write callers always pre-checked, so the
+    # path was never live; the heartbeat upsert exercises it on the
+    # second tick.
+    if body.agents:
+        from core_api.services.agent_service import get_or_create_agent
+
+        failed_agents: list[str] = []
+        for a in body.agents:
+            if not isinstance(a, dict):
+                continue
+            agent_key = a.get("agentId") or a.get("agent_id")
+            if not agent_key:
+                continue
+            # Bound ``display_name`` at the API boundary. Storage column
+            # is ``Text`` (unlimited) and ``MEMCLAW_DISPLAY_NAME_OVERRIDE``
+            # passes verbatim from the plugin, so a hostile or buggy
+            # client could push an oversized blob into audit logs and UI
+            # rendering. 255 chars is comfortably above any real
+            # hostname-derived label.
+            raw_dn = a.get("display_name") or a.get("displayName")
+            display_name = raw_dn[:255] if isinstance(raw_dn, str) else None
+            try:
+                await get_or_create_agent(
+                    db,
+                    tenant_id=body.tenant_id,
+                    agent_id=agent_key,
+                    fleet_id=body.fleet_id,
+                    display_name=display_name,
+                    install_id=body.install_id,
+                )
+            except Exception:
+                # A single agent upsert failure mustn't drop the heartbeat
+                # — the node + commands path is the contract; the row
+                # refresh is best-effort observability.
+                logger.warning(
+                    "fleet.heartbeat: agent upsert failed for agent_id=%s in tenant=%s",
+                    agent_key,
+                    body.tenant_id,
+                    exc_info=True,
+                )
+                failed_agents.append(str(agent_key))
+                # Clear any ``PendingRollbackError`` left on the session
+                # by the failed call (e.g. a flush that hit
+                # IntegrityError) so subsequent iterations of the loop
+                # can use the session normally instead of cascading
+                # rollback errors. Best-effort — if the rollback itself
+                # fails the session is still poisoned, but we can't do
+                # better than swallow and continue.
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+        # Persist any audit rows (``agent_registered``) that
+        # ``get_or_create_agent`` queued on the local session. The
+        # storage-api's agent row was already committed by the HTTP
+        # call inside the loop; this is just for the audit side-effect.
+        # Guarded because a per-agent failure inside the loop above can
+        # leave the SQLAlchemy session in an error state — without the
+        # try/except, a ``PendingRollbackError`` here would 500 the
+        # heartbeat and drop the pending-commands response, which is
+        # the route's actual contract. Same posture as the per-agent
+        # exception swallow: best-effort observability, never break
+        # the heartbeat.
+        try:
+            await db.commit()
+        except Exception:
+            logger.warning(
+                "fleet.heartbeat: failed to commit audit rows for tenant=%s",
+                body.tenant_id,
+                exc_info=True,
+            )
+        # Summary log so the committed audit trail is recoverable: the
+        # individual per-agent warnings above are stack-traced but not
+        # easy to correlate; this single line tells the on-call exactly
+        # how many agents in the batch failed and which ones, with the
+        # tenant pivot for dashboard filters.
+        if failed_agents:
+            logger.warning(
+                "fleet.heartbeat: agent upsert failed for %d/%d agents in tenant=%s: %s",
+                len(failed_agents),
+                len(body.agents),
+                body.tenant_id,
+                failed_agents,
+            )
 
     node_id = node.get("id", "")
     node_name = node.get("node_name", body.node_name)
