@@ -6,6 +6,55 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Subsequent releases are produced by [release-please](https://github.com/googleapis/release-please-action)
 from [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [2.0.0](https://github.com/caura-ai/caura-memclaw/compare/v1.0.1...v2.0.0) (2026-05-03)
+
+
+### Features
+
+* **agents:** split agent_id (opaque, stable) from display_name + plugin install_id (CAURA-000) ([#55](https://github.com/caura-ai/caura-memclaw/issues/55)) ([edc79e3](https://github.com/caura-ai/caura-memclaw/commit/edc79e3b7eff6a5040259b49661fd25e93ee7c22))
+* **enrichment:** consolidate memory-type vocabulary as single source of truth (CAURA-000) ([#60](https://github.com/caura-ai/caura-memclaw/issues/60)) ([223601a](https://github.com/caura-ai/caura-memclaw/commit/223601a49c9d87344b06f3a162d05061d64ef7ed))
+* **errors:** standardize error contract across REST and MCP ([#58](https://github.com/caura-ai/caura-memclaw/issues/58)) ([6d33caf](https://github.com/caura-ai/caura-memclaw/commit/6d33caf686a207e7cafdff8ce8f77e7ba6614e26))
+* **events:** EVENT_BUS_PUBSUB_MAX_MESSAGES override (CAURA-636) — v2 ([#48](https://github.com/caura-ai/caura-memclaw/issues/48)) ([5fb90a1](https://github.com/caura-ai/caura-memclaw/commit/5fb90a175971d4b1113c13686114cf0503e7205b))
+* **events:** EVENT_BUS_PUBSUB_MAX_MESSAGES override (CAURA-636) ([#46](https://github.com/caura-ai/caura-memclaw/issues/46)) ([fb0104a](https://github.com/caura-ai/caura-memclaw/commit/fb0104a71a805471f1cbe2eb4046fe23f602ca1a))
+* **infra:** docker-compose pulls published images by default ([#28](https://github.com/caura-ai/caura-memclaw/issues/28)) ([3d30d97](https://github.com/caura-ai/caura-memclaw/commit/3d30d97b3044430377825ba8c3ae7e8727a6ecbd))
+* **scripts:** preflight_012 — DB readout before migration 012 ([#59](https://github.com/caura-ai/caura-memclaw/issues/59)) ([049ee0c](https://github.com/caura-ai/caura-memclaw/commit/049ee0cc3916669240b367babaf38b3f27f9a88b))
+* standardize on POSTGRES_* env vars + README/CONTRIBUTING pre-launch cleanup ([#26](https://github.com/caura-ai/caura-memclaw/issues/26)) ([8a9d017](https://github.com/caura-ai/caura-memclaw/commit/8a9d017edb6a8873e3c3cb825e31738b68aa21d9))
+* **stats:** real public counters + /api/v1/status + trust soft-pass (CAURA-000) ([#54](https://github.com/caura-ai/caura-memclaw/issues/54)) ([075aefc](https://github.com/caura-ai/caura-memclaw/commit/075aefc28219d35a2a231944aae7ebd855eb5c64))
+
+
+### Bug Fixes
+
+* **api:** include visibility in GET /memories/{memory_id} response ([#40](https://github.com/caura-ai/caura-memclaw/issues/40)) ([9562a79](https://github.com/caura-ai/caura-memclaw/commit/9562a799411264e71d64d5669a196486d46bbc5b))
+* **audit:** batch + async ingest via in-memory queue (CAURA-628) ([#36](https://github.com/caura-ai/caura-memclaw/issues/36)) ([404f064](https://github.com/caura-ai/caura-memclaw/commit/404f0640bb3fbd40263e03a2f9bc6bd3ad7ac9bb))
+* **audit:** per-tenant slot in batch flusher to stop bulk_write contention (CAURA-631) ([#44](https://github.com/caura-ai/caura-memclaw/issues/44)) ([dde839a](https://github.com/caura-ai/caura-memclaw/commit/dde839a4f4a8cb84e8ca11cec220300498556303))
+* **bulk:** per-attempt idempotency + 207 Multi-Status (CAURA-602) ([#23](https://github.com/caura-ai/caura-memclaw/issues/23)) ([d2e7c1c](https://github.com/caura-ai/caura-memclaw/commit/d2e7c1c95e60eb67d228bf5b08c5ede241e7af15))
+* **contradiction:** preserve direction invariant on re-fired detection ([#41](https://github.com/caura-ai/caura-memclaw/issues/41)) ([78a993b](https://github.com/caura-ai/caura-memclaw/commit/78a993bf12e415fe14bd8aeccc483ca840cc6c49))
+* **contradiction:** scope candidate fetch by writer visibility ([#38](https://github.com/caura-ai/caura-memclaw/issues/38)) ([6e31348](https://github.com/caura-ai/caura-memclaw/commit/6e31348203377af2b6a54418c4149371604c312d))
+* **core-storage:** exclude soft-deleted from public /stats counters ([#27](https://github.com/caura-ai/caura-memclaw/issues/27)) ([f1581a8](https://github.com/caura-ai/caura-memclaw/commit/f1581a821bdb310ec735f38398c1e26cf7ef90c2))
+* **idempotency:** close concurrent-claim race with pending-row pattern ([#32](https://github.com/caura-ai/caura-memclaw/issues/32)) ([a58a719](https://github.com/caura-ai/caura-memclaw/commit/a58a7195b701b5191dfff405b8e33f9ff0a6f5e2))
+* **infra:** point docker-compose.dev at per-service Dockerfiles (CAURA-111) ([#37](https://github.com/caura-ai/caura-memclaw/issues/37)) ([b093536](https://github.com/caura-ai/caura-memclaw/commit/b0935368624a41e126b8bda4d934f141b26a7f8f))
+* **llm,embedding:** explicit httpx.Limits on OpenAI-compatible providers (CAURA-627) ([#34](https://github.com/caura-ai/caura-memclaw/issues/34)) ([1e2e799](https://github.com/caura-ai/caura-memclaw/commit/1e2e799fbeb05117e33998f340b1c320c5925779))
+* **logging:** route uvicorn / fastmcp / mcp / slowapi to root formatter (CAURA-588) ([#32](https://github.com/caura-ai/caura-memclaw/issues/32)) ([f4cc494](https://github.com/caura-ai/caura-memclaw/commit/f4cc4942676e0cca409c9c1aa6eda6c65a537e2d))
+* **memories:** apply visibility scoping to memory count endpoints (CAURA-000) ([#42](https://github.com/caura-ai/caura-memclaw/issues/42)) ([6e26dcb](https://github.com/caura-ai/caura-memclaw/commit/6e26dcb360d5dcce91877f59a6aaf7fe4e4cd9c6))
+* **memories:** per-phase storage timeout for bulk-create (CAURA-599) ([#33](https://github.com/caura-ai/caura-memclaw/issues/33)) ([6ac1ca5](https://github.com/caura-ai/caura-memclaw/commit/6ac1ca5f4b868925ebfe7cd1244320e1d0f2f07d))
+* **memories:** wire GET /memories/:id/contradictions to detector results (CAURA-604) ([#31](https://github.com/caura-ai/caura-memclaw/issues/31)) ([85b4a54](https://github.com/caura-ai/caura-memclaw/commit/85b4a54794d3afc86bb37c6ac49022d1c0fee08c))
+* **memory:** drop unused unscoped indexes ix_memories_status + ix_memories_visibility (CAURA-629) ([#35](https://github.com/caura-ai/caura-memclaw/issues/35)) ([9b2e071](https://github.com/caura-ai/caura-memclaw/commit/9b2e07111d38d7f9b3d6e1a50102658e986a73c1))
+* **memory:** restore ix_memories_status + ix_memories_visibility (CAURA-632) ([#45](https://github.com/caura-ai/caura-memclaw/issues/45)) ([4be9017](https://github.com/caura-ai/caura-memclaw/commit/4be90175ebb520b6752d6b23642b3e05b92a2c10))
+* **noisy-neighbor:** per-tenant asyncio.Semaphore on /search + writes ([#33](https://github.com/caura-ai/caura-memclaw/issues/33)) ([1ce87b5](https://github.com/caura-ai/caura-memclaw/commit/1ce87b5d1e95d825178c8bd0fc98c5ae72d430b4))
+* **noisy-neighbor:** per-tenant storage-roundtrip bulkhead (draft, gated on [#23](https://github.com/caura-ai/caura-memclaw/issues/23) loadtest) ([#24](https://github.com/caura-ai/caura-memclaw/issues/24)) ([f934d73](https://github.com/caura-ai/caura-memclaw/commit/f934d735e0f0281c339f00e2ea9666e58f537b2a))
+* **noisy-neighbor:** widen per-tenant Semaphore caps so bench loop fits ([#30](https://github.com/caura-ai/caura-memclaw/issues/30)) ([f52d4b5](https://github.com/caura-ai/caura-memclaw/commit/f52d4b57f99f66a41139d664addf3a58bcfac454))
+* **search:** drop UUID/hex fragments before entity FTS roundtrip ([#29](https://github.com/caura-ai/caura-memclaw/issues/29)) ([320d9ac](https://github.com/caura-ai/caura-memclaw/commit/320d9accc7219a0e4eaab2f2c5894033b6e8f1cc))
+* **stats:** defensive fallback to storage-api on DB pool exhaustion ([#31](https://github.com/caura-ai/caura-memclaw/issues/31)) ([293bd42](https://github.com/caura-ai/caura-memclaw/commit/293bd422b00e5f2aa9a32cd2a0071e0cb5652db3))
+* **storage:** align core-storage-api DB pool defaults with platform-storage (5+5) ([#25](https://github.com/caura-ai/caura-memclaw/issues/25)) ([061155e](https://github.com/caura-ai/caura-memclaw/commit/061155e4773a0359bac8e72a668aa96bff2e1fb3))
+* **storage:** unblock migrations that use `autocommit_block` ([#27](https://github.com/caura-ai/caura-memclaw/issues/27)) ([835e1a7](https://github.com/caura-ai/caura-memclaw/commit/835e1a78e950c71c44e8ddd2d11a2eeb003dc60f))
+* **worker:** per-tenant storage slot to stop noisy-neighbor PATCH-back contention (CAURA-636) ([#53](https://github.com/caura-ai/caura-memclaw/issues/53)) ([98ae9d9](https://github.com/caura-ai/caura-memclaw/commit/98ae9d9aa27d2c29b379e81840344128180cb0e9))
+* **write:** str() subject_entity_id before storage POST ([#39](https://github.com/caura-ai/caura-memclaw/issues/39)) ([7b232f5](https://github.com/caura-ai/caura-memclaw/commit/7b232f5acab1a0cda9307eb23f42c5207f1e4205))
+
+
+### Documentation
+
+* add Discord community link to README + SUPPORT ([#29](https://github.com/caura-ai/caura-memclaw/issues/29)) ([45e55bf](https://github.com/caura-ai/caura-memclaw/commit/45e55bf9df57dc99237dd408d338c206b1ddf193))
+
 ## [1.0.0] - 2026-04-26
 
 Initial public release. The public API surface and stability scope are
