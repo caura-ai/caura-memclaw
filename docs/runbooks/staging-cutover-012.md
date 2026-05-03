@@ -1,4 +1,4 @@
-# Staging cutover — alembic 010 (vector_dim 768 → 1024)
+# Staging cutover — alembic 012 (vector_dim 768 → 1024)
 
 **Owner:** Platform Eng (TBD)  **Last reviewed:** 2026-05-03  **Estimated wall-clock:** 1–2 h (plus 7-day soak)
 
@@ -7,19 +7,26 @@
 >
 > This runbook migrates **staging** from the 768-dim OpenAI baseline to the
 > 1024-dim `BAAI/bge-m3` (or hosted-OpenAI-with-`dimensions=1024`) configuration.
-> Migration 010 is **destructive**: every existing `embedding` value on
+> Migration 012 is **destructive**: every existing `embedding` value on
 > `memories`, `entities.name_embedding`, and `documents.embedding` is set to
 > NULL before the column is widened. Search returns nothing for affected rows
 > until the backfill (section 4) re-embeds them.
 >
 > Production cutover is a separate runbook (Spec F). Do not run this against
 > prod.
+>
+> **Note on revision numbers.** During PR #51's review cycle, `main` shipped
+> two unrelated migrations (`010_agent_display_name_install_id`,
+> `011_memory_distinct_count_indexes`). The destructive vector-dim migration
+> was renumbered accordingly: it is now **`012_vector_dim_1024`** and chains
+> after `011`. The pre-cutover alembic head therefore reads `011`, not `009`
+> as in earlier drafts of this runbook.
 
 ## Pre-flight checklist
 
 - [ ] PR #51 (`CAURA-444-local-embed-infra`) is merged to `caura-memclaw:main` (includes Spec A safety gate and Spec B release notes).
 - [ ] Spec C's backfill task PR is merged to `caura-memclaw:main` and the `core-worker` image with `python -m core_worker.cli backfill-embeddings` has been built.
-- [ ] Spec D's pre-flight script PR is merged to `caura-memclaw:main` (`core_storage_api.scripts.preflight_010`).
+- [ ] Spec D's pre-flight script PR is merged to `caura-memclaw:main` (`core_storage_api.scripts.preflight_012`).
 - [ ] Enterprise-side PR adding the `destructive` input to `migrate-db.yml` is merged on `caura-memclaw-enterprise:dev`.
 - [ ] Staging AlloyDB has a verified backup taken in the last 24 h. Cloud SQL automated backups are normally enough; confirm the most-recent point-in-time recovery target in the GCP console.
 - [ ] You have `gcloud` auth on `alpine-theory-469016-c8` and `gh` auth on `caura-ai/caura-memclaw-enterprise`.
@@ -36,27 +43,27 @@ the destructive UPDATEs, and the exact opt-in workflow_dispatch invocation.
 # (use the Cloud SQL Auth Proxy or a bastion if direct connection is blocked).
 
 gcloud sql connect alpine-theory-469016-c8-staging-pg --user=memclaw --quiet \
-  -- -t -c "\\!python -m core_storage_api.scripts.preflight_010 --dsn $DATABASE_URL"
+  -- -t -c "\\!python -m core_storage_api.scripts.preflight_012 --dsn $DATABASE_URL"
 ```
 
 Capture the output. **Stop here and read it carefully:**
 
 - "Rows to NULL" total: should be a number you recognize as roughly the count of memories in staging.
 - "Est. UPDATE": rough ETA. If it's >10 minutes, plan accordingly (announce a quiet window in Slack).
-- "Alembic head": should read `009`. If it already says `010`, the migration has been applied; skip section 2 and re-run section 4 (backfill) only.
+- "Alembic head": should read `011`. If it already says `012`, the migration has been applied; skip section 2 and re-run section 4 (backfill) only.
 
 ## 2. Trigger migration via Cloud Run Job
 
 Manual dispatch of `migrate-db.yml` with `destructive=true`. The `destructive`
 input is propagated to the OSS migration job as
 `MEMCLAW_RUN_DESTRUCTIVE_MIGRATIONS=true`, satisfying the Spec A safety gate
-in migration 010.
+in migration 012.
 
 ```bash
 gh workflow run migrate-db.yml \
   --repo caura-ai/caura-memclaw-enterprise \
   --ref dev \
-  -f target_revision=010 \
+  -f target_revision=012 \
   -f destructive=true
 ```
 
@@ -69,22 +76,22 @@ gh run watch --repo caura-ai/caura-memclaw-enterprise
 **Verification:**
 
 ```bash
-# After job completes, the alembic_version table on staging should show 010.
+# After job completes, the alembic_version table on staging should show 012.
 gcloud sql connect alpine-theory-469016-c8-staging-pg --user=memclaw --quiet \
   -- -c "SELECT version_num FROM alembic_version;"
 ```
 
-Expect: `010`.
+Expect: `012`.
 
 **Failure modes:**
 
-- `RuntimeError: alembic 010_vector_dim_1024 is destructive...` — the
+- `RuntimeError: alembic 012_vector_dim_1024 is destructive...` — the
   `destructive=true` input wasn't propagated. Check the workflow YAML diff and
   confirm the `--set-env-vars` line in the OSS migration step includes
   `MEMCLAW_RUN_DESTRUCTIVE_MIGRATIONS=...`.
 - `lock_timeout` during `UPDATE ... SET embedding = NULL` — retry the workflow.
   The migration is idempotent: rows already NULL'd are skipped by the
-  `WHERE embedding IS NOT NULL` predicate, and the `autocommit_block` in 010
+  `WHERE embedding IS NOT NULL` predicate, and the `autocommit_block` in 012
   resumes cleanly.
 - `ALTER TYPE` fails with `expected 1024 dimensions, not 768` — a row was
   written with a 768-dim embedding between the UPDATE and the ALTER (race
@@ -202,7 +209,7 @@ python runner_memclaw_lme.py \
 - accuracy ≥ 0.90.
 
 If either drops below: **STOP**, escalate in the Slack channel, and consider
-rollback per `docs/runbooks/rollback-010.md` (Spec G).
+rollback per `docs/runbooks/rollback-012.md` (Spec G).
 
 ## 6. Cutover the embedder env (only if switching to TEI)
 
@@ -267,9 +274,9 @@ tracking issue.
 ## Rollback
 
 If at any section above the verification fails and rollback is needed, see
-`docs/runbooks/rollback-010.md` (Spec G). The short version:
+`docs/runbooks/rollback-012.md` (Spec G). The short version:
 
-1. `gh workflow run migrate-db.yml --repo caura-ai/caura-memclaw-enterprise --ref dev -f target_revision=009 -f destructive=true` — `010`'s `downgrade()` is symmetric (NULLs 1024-dim values, narrows columns back to 768).
+1. `gh workflow run migrate-db.yml --repo caura-ai/caura-memclaw-enterprise --ref dev -f target_revision=011 -f destructive=true` — `012`'s `downgrade()` is symmetric (NULLs 1024-dim values, narrows columns back to 768).
 2. Roll the core-api / core-storage-api revisions back to the pre-cutover SHA via Cloud Run revision tags.
 3. If TEI was wired in section 6, unset the three `OPENAI_EMBEDDING_*` envs to fall back to hosted OpenAI defaults.
 4. Re-run backfill against the 768-dim configuration.
