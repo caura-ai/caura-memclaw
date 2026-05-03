@@ -1260,9 +1260,7 @@ class PostgresService:
         # the number by an order of magnitude on busy environments.
         async with get_read_session() as session:
             result = await session.scalar(
-                select(func.count())
-                .select_from(Memory)
-                .where(Memory.deleted_at.is_(None))
+                select(func.count()).select_from(Memory).where(Memory.deleted_at.is_(None))
             )
             return result or 0
 
