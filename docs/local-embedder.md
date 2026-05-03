@@ -109,6 +109,11 @@ The `tei` profile assumes the 1024-dim schema. If you're upgrading an existing
 768-dim deployment:
 
 ```bash
+# Pre-flight first — read-only readout of how many rows will be NULL'd,
+# rough wall-clock estimate, and the exact opt-in command to run next.
+docker compose run --rm core-storage-api \
+  python -m core_storage_api.scripts.preflight_012
+
 # Run the migration (NULLs existing 768-dim embeddings; re-embed required)
 docker compose run --rm core-storage-api \
   python -m alembic upgrade 012
