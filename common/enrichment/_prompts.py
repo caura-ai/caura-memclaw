@@ -5,35 +5,31 @@ The prompt is the source of truth for the LLM's output schema; tests
 exercise it directly (see ``tests/services/test_memory_enrichment.py``)
 and ``EnrichmentResult`` mirrors it field-for-field.
 
-Adding a new memory type or status requires synchronised updates to:
-
-* ``common/enrichment/constants.py`` (vocabulary tuples)
-* this module (prompt vocabulary list)
-* ``common/enrichment/schema.py`` (Pydantic defaults)
-* ``core_api.constants`` re-exports + storage CHECK constraint
+The ``memory_type`` vocabulary list and per-type bullets are rendered
+from :data:`common.enrichment.constants.MEMORY_TYPE_DESCRIPTIONS` at
+import time, so adding a type there propagates here automatically.
 """
 
 from __future__ import annotations
 
-ENRICHMENT_PROMPT = """\
+from common.enrichment.constants import MEMORY_TYPE_DESCRIPTIONS, MEMORY_TYPES
+
+_TYPES_INLINE = ", ".join(f'"{name}"' for name in MEMORY_TYPES)
+_TYPE_BULLETS = "\n".join(
+    f"   - {name}: {desc}" for name, desc in MEMORY_TYPE_DESCRIPTIONS.items()
+)
+
+ENRICHMENT_PROMPT = (
+    """\
 You are a memory classifier for a business agent memory system.
 
 Analyze the following memory content and return a JSON object with these fields:
 
-1. "memory_type": one of "fact", "episode", "decision", "preference", "task", "semantic", "intention", "plan", "commitment", "action", "outcome", "cancellation", "rule"
-   - fact: durable knowledge, statements of truth, technical details
-   - episode: events that happened, deployments, meetings, incidents
-   - decision: choices made with reasoning, architecture decisions, approvals. Look for: "decided to", "chose", "going with", "agreed to", "approved", "selected", "opted for", "settled on"
-   - preference: user/org preferences, likes, dislikes, style choices
-   - task: work items, assignments, things to do
-   - semantic: conceptual/definitional knowledge, taxonomy entries
-   - intention: stated goals or aims not yet acted on
-   - plan: structured sequences of steps to achieve a goal
-   - commitment: promises or obligations made to others. Look for: "committed to", "promised", "guaranteed", "agreed to deliver", "pledged"
-   - action: concrete steps taken or being taken
-   - outcome: results of actions, tasks, or plans
-   - cancellation: explicit record that something was cancelled or abandoned
-   - rule: prescriptive directive, policy, or constraint. Look for: "always", "never", "must", "do not", "whenever", "policy", "guideline"
+1. "memory_type": one of """
+    + _TYPES_INLINE
+    + "\n"
+    + _TYPE_BULLETS
+    + """
 
 2. "weight": float 0.0-1.0 indicating importance
    - 0.9-1.0: critical decisions, key facts with evidence, high-impact events
@@ -126,3 +122,4 @@ Return ONLY valid JSON (no markdown fences):
 Content:
 {content}
 """
+)
