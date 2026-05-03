@@ -48,6 +48,8 @@ import {
   assertPromptLength,
 } from "./validation.js";
 import { logError } from "./logger.js";
+import { getInstallId } from "./install-id.js";
+import { getDisplayName } from "./identity.js";
 
 let heartbeatCount = 0;
 let bakCleanupDone = false;
@@ -120,26 +122,47 @@ export async function sendHeartbeat(): Promise<void> {
   }
 
   // Collect agents from config — hash workspace paths instead of sending them raw
+  // Per-install opaque suffix used to disambiguate the default ``"main"``
+  // agent across multiple plugin installs sharing one tenant. Generated
+  // once at first heartbeat and persisted to ``install.json``.
+  const installId = getInstallId();
+
   let agents: Array<Record<string, unknown>> | undefined;
   try {
     const config = readOpenClawConfig() as Record<string, any> | null;
     const agentList = config?.agents?.list;
     if (Array.isArray(agentList) && agentList.length > 0) {
-      agents = agentList.map((a: Record<string, any>) => ({
-        agentId: a.id || a.name || "unknown",
-        name: a.name || a.id || "unknown",
-        workspace_hash: a.workspace
-          ? createHash("sha256").update(a.workspace).digest("hex").slice(0, 12)
-          : undefined,
-        model: a.model?.primary || config?.agents?.defaults?.model?.primary || undefined,
-        tools_profile: a.tools?.profile || undefined,
-      }));
+      // Operators who configured explicit ``agents.list`` keep their
+      // chosen ids verbatim. ``display_name`` defaults to the
+      // hostname-prefixed form when the entry has no explicit
+      // ``display_name``.
+      agents = agentList.map((a: Record<string, any>) => {
+        const baseName = a.id || a.name || "unknown";
+        return {
+          agentId: baseName,
+          name: a.name || a.id || "unknown",
+          display_name:
+            typeof a.display_name === "string" && a.display_name
+              ? a.display_name
+              : getDisplayName(baseName),
+          workspace_hash: a.workspace
+            ? createHash("sha256").update(a.workspace).digest("hex").slice(0, 12)
+            : undefined,
+          model: a.model?.primary || config?.agents?.defaults?.model?.primary || undefined,
+          tools_profile: a.tools?.profile || undefined,
+        };
+      });
     } else {
+      // No explicit list — synthesize a single default agent. Pre-Task6
+      // this was hardcoded to ``"main"`` and collided with every other
+      // install. Now the internal id carries the install suffix; the
+      // human label uses the hostname.
       const defaultModel = config?.agents?.defaults?.model?.primary;
       agents = [
         {
-          agentId: "main",
-          name: "main",
+          agentId: `main-${installId}`,
+          name: getDisplayName("main"),
+          display_name: getDisplayName("main"),
           model: defaultModel || undefined,
         },
       ];
@@ -259,6 +282,7 @@ export async function sendHeartbeat(): Promise<void> {
     os_info: `${platform()} ${release()}`,
     plugin_version: PLUGIN_VERSION,
     plugin_hash: pluginHash,
+    install_id: installId,
     agents,
     tools: MEMCLAW_TOOLS,
     metadata: setupStatus ? { setup_status: setupStatus } : undefined,

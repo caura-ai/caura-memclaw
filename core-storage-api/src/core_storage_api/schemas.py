@@ -109,6 +109,8 @@ AGENT_FIELDS: list[str] = [
     "tenant_id",
     "fleet_id",
     "agent_id",
+    "display_name",
+    "install_id",
     "trust_level",
     "search_profile",
     "created_at",

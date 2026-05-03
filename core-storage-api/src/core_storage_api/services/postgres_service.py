@@ -2291,7 +2291,9 @@ class PostgresService:
             # Conflict: another caller (or a prior attempt) already
             # created the row. Re-SELECT and apply any new fields the
             # caller supplied (e.g. ``fleet_id`` backfill from a write
-            # that learned the fleet after the agent existed).
+            # that learned the fleet after the agent existed, or the
+            # heartbeat-refreshed ``display_name`` / first-contact
+            # ``install_id`` introduced by the agent identity split).
             #
             # ``.with_for_update()`` on the re-SELECT serialises against
             # an in-progress concurrent ``agent_delete`` so we either
@@ -2326,8 +2328,22 @@ class PostgresService:
             # plain idempotent re-register that just wants the
             # existing row back.
             changed = False
-            for key in ("fleet_id", "trust_level"):
+            for key in ("fleet_id", "trust_level", "display_name", "install_id"):
                 if key in data and data[key] is not None and getattr(agent, key) != data[key]:
+                    if key == "install_id" and getattr(agent, key) is not None:
+                        # ``install_id`` is the per-OpenClaw-install opaque
+                        # identity that disambiguates the default
+                        # ``agent_id="main"`` across fleet machines. Once
+                        # persisted it must be stable for the agent row's
+                        # lifetime: backfill when previously NULL but never
+                        # overwrite. ``agent_service.get_or_create_agent``
+                        # already enforces this at the application layer;
+                        # the guard is duplicated here so any future direct
+                        # caller of ``agent_add`` (REST endpoint, admin
+                        # tool) can't silently rewrite a stable identity.
+                        # ``display_name`` and ``fleet_id`` intentionally
+                        # overwrite on change (rename / reassignment).
+                        continue
                     setattr(agent, key, data[key])
                     changed = True
             if changed:
