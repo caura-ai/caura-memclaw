@@ -13,7 +13,6 @@
     ".": {
       "release-type": "simple",
       "package-name": "caura-memclaw",
-      "release-as": "2.0.0",
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
         "VERSION",
