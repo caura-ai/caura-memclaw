@@ -314,3 +314,68 @@ class TestSearchPipelineEndToEnd:
         assert len(results) >= 1
         # Memory 2 should win: fresher, recently recalled, entity-boosted
         # Memory 1's high weight and stale recall count shouldn't dominate
+
+    async def test_scored_search_excludes_soft_deleted(self, db, tenant_id):
+        # Regression guard for the parallel ``deleted_at IS NULL`` filter
+        # sites in core-storage-api/services/postgres_service.py
+        # (memory_scored_search at line 857 today). The semantic-dedup
+        # path already has its own deleted-row test in
+        # tests/test_p2_semantic_dedup.py::test_deleted_memory_doesnt_block;
+        # this closes the parallel gap on the scored-search read path.
+        #
+        # Note: the deleted row is created with ``deleted_at`` ALREADY
+        # set, matching the dedup-side test's helper. A post-insert
+        # ``UPDATE memories SET deleted_at = ...`` via the per-test
+        # ``db`` fixture is invisible to the storage-api ASGI bridge:
+        # ``db`` runs the outer transaction in
+        # ``join_transaction_mode="create_savepoint"`` (conftest
+        # ``db`` fixture), so its commits land at a savepoint inside a
+        # never-committed outer transaction — a separate connection
+        # (which the storage app's session_factory checks out from the
+        # same engine) never sees the change.
+        from core_api.clients.storage_client import get_storage_client
+        from core_api.services.memory_service import search_memories
+
+        sc = get_storage_client()
+
+        async def _seed(content: str, *, deleted: bool) -> dict:
+            payload = {
+                "tenant_id": tenant_id,
+                "fleet_id": None,
+                "agent_id": "scored-search-soft-delete",
+                "memory_type": "fact",
+                "content": content,
+                "weight": 0.7,
+                "embedding": fake_embedding(content),
+                "content_hash": _hash(tenant_id, None, content),
+                "status": "active",
+                "visibility": "scope_team",
+            }
+            if deleted:
+                payload["deleted_at"] = datetime.now(timezone.utc).isoformat()
+            mem = await sc.create_memory(payload)
+            await db.execute(
+                text(
+                    "UPDATE memories SET search_vector = to_tsvector('english', :content) WHERE id = :id"
+                ),
+                {"content": content, "id": mem["id"]},
+            )
+            await db.commit()
+            return mem
+
+        deleted_mem = await _seed(
+            "kubernetes pod restart troubleshooting guide", deleted=True
+        )
+        live_mem = await _seed(
+            "kubernetes pod restart common causes summary", deleted=False
+        )
+
+        results = await search_memories(db, tenant_id, "kubernetes pod restart")
+
+        result_ids = {str(r.id) for r in results}
+        assert str(deleted_mem["id"]) not in result_ids, (
+            "soft-deleted memory leaked into scored search results"
+        )
+        assert str(live_mem["id"]) in result_ids, (
+            "live memory was not returned by scored search"
+        )
