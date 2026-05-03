@@ -426,16 +426,24 @@
     ],
     "params": [
       {
-        "description": "read|update|transition|delete.",
+        "description": "read|update|transition|delete|bulk_delete|lineage.",
         "name": "op",
         "required": true,
         "type": "str"
       },
       {
-        "description": "UUID.",
+        "default": "",
+        "description": "UUID. Required except for op=bulk_delete.",
         "name": "memory_id",
-        "required": true,
+        "required": false,
         "type": "str"
+      },
+      {
+        "default": null,
+        "description": "op=bulk_delete: list of memory UUIDs (max 1000).",
+        "name": "memory_ids",
+        "required": false,
+        "type": "list[str] | None"
       },
       {
         "default": null,
