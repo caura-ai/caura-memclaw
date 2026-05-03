@@ -51,7 +51,7 @@ async def test_list_scope_agent_allowed_at_trust_1(mcp_env, monkeypatch):
     monkeypatch.setattr(mcp_server, "_require_trust", _trust_1)
     mcp_env["db"].execute.return_value = _mock_result([])
     out = await mcp_server.memclaw_list(agent_id="alice")  # scope='agent' by default
-    assert "Error (403)" not in out
+    assert "FORBIDDEN" not in out
     payload = parse_envelope(out)
     assert payload["scope"] == "agent"
 
@@ -66,7 +66,7 @@ async def test_list_scope_fleet_blocked_at_trust_1(mcp_env, monkeypatch):
 
     monkeypatch.setattr(mcp_server, "_require_trust", _trust_1)
     out = await mcp_server.memclaw_list(agent_id="alice", scope="fleet")
-    assert "Error (403)" in out
+    assert "FORBIDDEN" in out
     assert "trust_level=1" in out
 
 
@@ -80,19 +80,19 @@ async def test_list_scope_all_blocked_at_trust_1(mcp_env, monkeypatch):
 
     monkeypatch.setattr(mcp_server, "_require_trust", _trust_1)
     out = await mcp_server.memclaw_list(agent_id="alice", scope="all")
-    assert "Error (403)" in out
+    assert "FORBIDDEN" in out
 
 
 async def test_list_invalid_scope(mcp_env):
     out = await mcp_server.memclaw_list(scope="everywhere")
-    assert "Error (422)" in out
+    assert "INVALID_ARGUMENTS" in out
     assert "Invalid scope" in out
 
 
 async def test_list_scope_agent_rejects_foreign_written_by(mcp_env):
     """scope='agent' + written_by != caller returns 422."""
     out = await mcp_server.memclaw_list(agent_id="alice", scope="agent", written_by="bob")
-    assert "Error (422)" in out
+    assert "INVALID_ARGUMENTS" in out
     assert "written_by must be omitted" in out
 
 
@@ -112,56 +112,56 @@ async def test_list_scope_agent_forces_written_by(mcp_env, monkeypatch):
 
 async def test_list_invalid_memory_type(mcp_env):
     out = await mcp_server.memclaw_list(memory_type="chicken")
-    assert "Error (422)" in out
+    assert "INVALID_ARGUMENTS" in out
     assert "Invalid memory_type 'chicken'" in out
 
 
 async def test_list_invalid_status(mcp_env):
     out = await mcp_server.memclaw_list(status="fancy")
-    assert "Error (422)" in out
+    assert "INVALID_ARGUMENTS" in out
 
 
 async def test_list_invalid_sort(mcp_env):
     out = await mcp_server.memclaw_list(sort="content")
-    assert "Error (422)" in out
+    assert "INVALID_ARGUMENTS" in out
     assert "Invalid sort" in out
 
 
 async def test_list_invalid_order(mcp_env):
     out = await mcp_server.memclaw_list(order="sideways")
-    assert "Error (422)" in out
+    assert "INVALID_ARGUMENTS" in out
     assert "order must be 'asc' or 'desc'" in out
 
 
 async def test_list_cursor_with_non_default_sort_errors(mcp_env):
     out = await mcp_server.memclaw_list(cursor="x", sort="weight")
-    assert "Error (422)" in out
+    assert "INVALID_ARGUMENTS" in out
     assert "cursor pagination requires" in out
 
 
 async def test_list_cursor_with_asc_order_errors(mcp_env):
     out = await mcp_server.memclaw_list(cursor="x", order="asc")
-    assert "Error (422)" in out
+    assert "INVALID_ARGUMENTS" in out
 
 
 async def test_list_invalid_cursor_payload(mcp_env):
     mcp_env["db"].execute.return_value = _mock_result([])
     out = await mcp_server.memclaw_list(cursor="@@not-base64@@")
-    assert "Error (422)" in out
+    assert "INVALID_ARGUMENTS" in out
     assert "Invalid cursor" in out
 
 
 async def test_list_invalid_created_after_iso(mcp_env):
     mcp_env["db"].execute.return_value = _mock_result([])
     out = await mcp_server.memclaw_list(created_after="not-iso")
-    assert "Error (422)" in out
+    assert "INVALID_ARGUMENTS" in out
     assert "created_after must be ISO8601" in out
 
 
 async def test_list_invalid_created_before_iso(mcp_env):
     mcp_env["db"].execute.return_value = _mock_result([])
     out = await mcp_server.memclaw_list(created_before="not-iso")
-    assert "Error (422)" in out
+    assert "INVALID_ARGUMENTS" in out
     assert "created_before must be ISO8601" in out
 
 

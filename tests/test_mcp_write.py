@@ -96,7 +96,7 @@ async def test_write_service_http_exception_becomes_envelope(mcp_env):
     out = await mcp_server.memclaw_write(content="dup")
     # Service-raised HTTPException maps to `Error (…): detail` (plain string
     # plus _latency_ms), not the structured envelope above.
-    assert "Error (409)" in out
+    assert "CONFLICT" in out
     assert "duplicate memory" in out
 
 

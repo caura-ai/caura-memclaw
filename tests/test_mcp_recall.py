@@ -86,13 +86,13 @@ async def test_recall_empty_results(mcp_env, monkeypatch):
 
 async def test_recall_invalid_memory_type_returns_422(mcp_env):
     out = await mcp_server.memclaw_recall(query="x", memory_type="garbage")
-    assert "Error (422)" in out
+    assert "INVALID_ARGUMENTS" in out
     assert "Invalid memory_type 'garbage'" in out
 
 
 async def test_recall_invalid_status_returns_422(mcp_env):
     out = await mcp_server.memclaw_recall(query="x", status="badstatus")
-    assert "Error (422)" in out
+    assert "INVALID_ARGUMENTS" in out
     assert "Invalid status 'badstatus'" in out
 
 
@@ -123,7 +123,7 @@ async def test_recall_http_exception_becomes_error_envelope(mcp_env, monkeypatch
     monkeypatch.setattr("core_api.repositories.agent_repo.get_by_id", _async_none)
 
     out = await mcp_server.memclaw_recall(query="x")
-    assert "Error (429)" in out
+    assert "RATE_LIMITED" in out
     assert "rate limited" in out
 
 

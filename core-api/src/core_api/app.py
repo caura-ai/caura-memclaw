@@ -4,7 +4,8 @@ import os as _os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -430,18 +431,83 @@ app.state.limiter = limiter
 
 
 async def _json_rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
-    # Custom handler so 429 bodies match the rest of the API's
-    # `{"detail": ...}` envelope. Re-runs slowapi's header injector so
-    # X-RateLimit-* + Retry-After still land on the response.
-    response = JSONResponse(
-        {"detail": f"Rate limit exceeded: {exc.detail}. Try again later."},
-        status_code=429,
-    )
+    # Custom handler so 429 bodies match the rest of the API's error
+    # envelope: top-level `detail` for back-compat plus the canonical
+    # `error: {code, message, details?}` field. Re-runs slowapi's header
+    # injector so X-RateLimit-* + Retry-After still land on the response.
+    from core_api.errors import make_error_payload
+
+    detail_str = f"Rate limit exceeded: {exc.detail}. Try again later."
+    body = {"detail": detail_str, **make_error_payload("RATE_LIMITED", detail_str)}
+    response = JSONResponse(body, status_code=429)
     response = request.app.state.limiter._inject_headers(response, request.state.view_rate_limit)
     return response
 
 
 app.add_exception_handler(RateLimitExceeded, _json_rate_limit_handler)
+
+
+# ── Canonical error envelope ────────────────────────────────────────
+# Every error response carries a top-level ``detail`` (legacy/back-compat)
+# AND a canonical ``error: {code, message, details?}`` envelope. New
+# clients should read ``error.code`` for machine-readable dispatch;
+# existing clients reading ``detail`` keep working.
+#
+# Callers that need a specific error code can raise:
+#     raise HTTPException(status_code=404, detail={"code": "MEMORY_NOT_FOUND",
+#                                                  "message": "...",
+#                                                  "details": {...}})
+# When ``detail`` is a string, the code is auto-derived from the status
+# via core_api.errors.STATUS_TO_CODE.
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    from core_api.errors import code_for_status, make_error_payload
+
+    raw = exc.detail
+    if isinstance(raw, dict) and "code" in raw and "message" in raw:
+        code = str(raw["code"])
+        message = str(raw["message"])
+        details = raw.get("details") if isinstance(raw.get("details"), dict) else None
+        legacy_detail: object = message
+    else:
+        code = code_for_status(exc.status_code)
+        message = str(raw) if raw is not None else ""
+        details = None
+        legacy_detail = raw  # keep original shape (string, list, dict-without-code) for back-compat
+
+    body = {"detail": legacy_detail, **make_error_payload(code, message, details)}
+    return JSONResponse(body, status_code=exc.status_code, headers=exc.headers)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Replace FastAPI's default 422 body with our envelope.
+
+    FastAPI's default returns ``{"detail": [{loc, msg, type, ...}, ...]}``.
+    We keep that ``detail`` array verbatim for back-compat AND surface
+    the canonical envelope. The aggregated message joins each error's
+    ``msg`` for callers that want a single human-readable string.
+
+    ``exc.errors()`` may include non-JSON-safe values (e.g. ``ctx``
+    contains Pydantic's underlying ``ValueError`` instance for
+    ``value_error`` types). ``jsonable_encoder`` flattens those before
+    we hand off to ``JSONResponse``.
+    """
+    from fastapi.encoders import jsonable_encoder
+
+    from core_api.errors import make_error_payload
+
+    errs = jsonable_encoder(exc.errors())
+    summary = "; ".join(e.get("msg", "") for e in errs) or "validation error"
+    body = {
+        "detail": errs,  # original FastAPI shape
+        **make_error_payload("INVALID_ARGUMENTS", summary, details={"errors": errs}),
+    }
+    return JSONResponse(body, status_code=422)
+
+
 app.add_middleware(SlowAPIMiddleware)
 
 if app_settings.is_standalone:
@@ -464,11 +530,21 @@ app.add_middleware(
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    """Catch-all for non-HTTPException failures. Returns 500 with both
+    the back-compat ``detail`` field AND the canonical ``error`` envelope.
+    Includes ``path`` and ``error_type`` outside production for debugging.
+    """
+    from core_api.errors import make_error_payload
+
     logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
     detail = str(exc) if app_settings.environment != "production" else "Internal Server Error"
+    details: dict = {"path": request.url.path}
+    if app_settings.environment != "production":
+        details["error_type"] = type(exc).__name__
     content: dict = {
         "detail": detail,
         "path": request.url.path,
+        **make_error_payload("INTERNAL_ERROR", detail, details=details),
     }
     if app_settings.environment != "production":
         content["error_type"] = type(exc).__name__

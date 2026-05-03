@@ -977,7 +977,7 @@ class TestMCPHandlerTrustGating:
             outcome_type="failure",
             scope="all",
         )
-        assert "Error (403)" in out
+        assert "FORBIDDEN" in out
         assert service_spy.await_count == 0
 
 
@@ -993,7 +993,7 @@ class TestMCPHandlerScopeValidation:
             outcome_type="success",
             scope="bogus",
         )
-        assert "Error (422)" in out
+        assert "INVALID_ARGUMENTS" in out
         assert "scope" in out.lower()
 
     @pytest.mark.asyncio
@@ -1006,7 +1006,7 @@ class TestMCPHandlerScopeValidation:
             scope="fleet",
             fleet_id=None,
         )
-        assert "Error (422)" in out
+        assert "INVALID_ARGUMENTS" in out
         assert "fleet_id" in out.lower()
 
 
