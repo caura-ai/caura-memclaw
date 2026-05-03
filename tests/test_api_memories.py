@@ -485,3 +485,111 @@ async def test_memory_stats(client):
     assert "by_agent" in data
     assert data["by_type"].get("fact", 0) >= 2
     assert data["by_type"].get("episode", 0) >= 1
+
+
+async def test_memory_stats_excludes_scope_agent_when_caller_unidentified(client):
+    # Regression: ``GET /api/v1/memories/stats`` previously had no
+    # visibility predicate, so it counted ``scope_agent`` rows that
+    # ``GET /api/v1/memories`` (which mirrors
+    # ``memory_repository.list_by_filters``) excludes when no
+    # ``agent_id`` is in the URL. Result: Prism showed inflated counts
+    # alongside a list view that hid the same rows.
+    tenant_id, headers = get_test_auth()
+    tag = _uid()
+    fleet = f"stats-vis-fleet-{tag}"
+
+    async def _post(agent: str, visibility: str, content: str) -> None:
+        resp = await client.post(
+            "/api/v1/memories",
+            json={
+                "tenant_id": tenant_id,
+                "content": f"{content} [{tag}]",
+                "agent_id": agent,
+                "fleet_id": fleet,
+                "memory_type": "fact",
+                "visibility": visibility,
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 201, f"Write failed: {resp.text}"
+
+    await _post(f"alice-{tag}", "scope_agent", "alice private")
+    await _post(f"bob-{tag}", "scope_agent", "bob private")
+    await _post(f"shared-{tag}", "scope_org", "team-wide")
+
+    list_resp = await client.get(
+        f"/api/v1/memories?tenant_id={tenant_id}&fleet_id={fleet}",
+        headers=headers,
+    )
+    assert list_resp.status_code == 200
+    items = list_resp.json().get("items", [])
+
+    stats_resp = await client.get(
+        f"/api/v1/memories/stats?tenant_id={tenant_id}&fleet_id={fleet}",
+        headers=headers,
+    )
+    assert stats_resp.status_code == 200
+    stats = stats_resp.json()
+
+    assert stats["total"] == len(items), (
+        f"stats total ({stats['total']}) must match list length ({len(items)}); "
+        f"mismatch indicates /memories/stats is missing the visibility predicate "
+        f"that /memories applies via list_by_filters."
+    )
+    # Anchor the expected behavior: only the scope_org row is visible to
+    # an unidentified caller. If this assertion fires, the visibility
+    # contract itself has changed (not just stats vs list parity).
+    assert stats["total"] == 1, (
+        f"expected 1 visible memory (scope_org only) when no agent_id is passed, "
+        f"got {stats['total']}"
+    )
+
+
+async def test_memory_stats_with_agent_id_includes_own_scope_agent(client):
+    # Companion to the above: when ``agent_id`` IS passed, the caller can
+    # see their own ``scope_agent`` rows (mirrors list_by_filters lines
+    # 122-135). Stats must agree with the list under the same filter.
+    tenant_id, headers = get_test_auth()
+    tag = _uid()
+    fleet = f"stats-vis-own-fleet-{tag}"
+    alice = f"alice-{tag}"
+    bob = f"bob-{tag}"
+
+    async def _post(agent: str, visibility: str, content: str) -> None:
+        resp = await client.post(
+            "/api/v1/memories",
+            json={
+                "tenant_id": tenant_id,
+                "content": f"{content} [{tag}]",
+                "agent_id": agent,
+                "fleet_id": fleet,
+                "memory_type": "fact",
+                "visibility": visibility,
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 201, f"Write failed: {resp.text}"
+
+    await _post(alice, "scope_agent", "alice private")
+    await _post(alice, "scope_org", "alice public")
+    await _post(bob, "scope_agent", "bob private")
+
+    list_resp = await client.get(
+        f"/api/v1/memories?tenant_id={tenant_id}&fleet_id={fleet}&agent_id={alice}",
+        headers=headers,
+    )
+    assert list_resp.status_code == 200
+    items = list_resp.json().get("items", [])
+
+    stats_resp = await client.get(
+        f"/api/v1/memories/stats?tenant_id={tenant_id}&fleet_id={fleet}&agent_id={alice}",
+        headers=headers,
+    )
+    assert stats_resp.status_code == 200
+    stats = stats_resp.json()
+
+    assert stats["total"] == len(items)
+    # Both endpoints scope to "memories alice authored" (agent_id doubles
+    # as author + visibility identity), so bob's scope_agent row is
+    # excluded and alice sees both her own.
+    assert stats["total"] == 2
