@@ -495,6 +495,17 @@ async def count_distinct_agents() -> dict:
     return {"count": count}
 
 
+@router.get("/distinct-tenants")
+async def count_distinct_tenants() -> dict:
+    """Global count of distinct tenants with at least one live memory.
+
+    Used by the public landing-page Tenants counter — replaces the
+    hardcoded ``1`` previously returned by ``/api/v1/stats``.
+    """
+    count = await _svc.memory_distinct_tenant_count()
+    return {"count": count}
+
+
 # ------------------------------------------------------------------
 # Parameterised paths — MUST come last to avoid catching /count etc.
 # ------------------------------------------------------------------

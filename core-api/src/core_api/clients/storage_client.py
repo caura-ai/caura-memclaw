@@ -398,6 +398,11 @@ class CoreStorageClient:
         result = await self._get("/memories/distinct-agents")
         return (result or {}).get("count", 0)
 
+    async def count_distinct_tenants(self) -> int:
+        """Global count of distinct tenants with at least one live memory."""
+        result = await self._get("/memories/distinct-tenants")
+        return (result or {}).get("count", 0)
+
     async def update_embedding(
         self,
         memory_id: str,

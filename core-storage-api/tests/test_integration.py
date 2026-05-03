@@ -609,6 +609,55 @@ class TestMemories:
                 f"query={blank_query!r} must not admit any NULL-embedding rows"
             )
 
+    async def test_public_counters_exclude_soft_deleted(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+        fleet_id: str,
+    ) -> None:
+        """``/memories/count`` (no tenant_id), ``/memories/distinct-agents``,
+        and ``/memories/distinct-tenants`` must all filter ``deleted_at IS NULL``.
+
+        Regression for the count-inflation bug: prior to the fix these
+        endpoints reported tombstoned rows alongside live ones, so the
+        marketing-site landing-page tiles were ~10× higher than the
+        actually-queryable footprint.
+        """
+        # Use a fresh, dedicated agent_id so distinct-agent / distinct-tenant
+        # deltas around our row are observable. Two writes in case the
+        # baseline already contains tenant_id/agent_id from another test.
+        unique_agent = f"counter-soft-delete-agent-{_uid()}"
+        payload_one = _memory_payload(tenant_id, fleet_id)
+        payload_one["agent_id"] = unique_agent
+        payload_two = _memory_payload(tenant_id, fleet_id)
+        payload_two["agent_id"] = unique_agent
+
+        before_total = (await client.get(f"{PREFIX}/memories/count")).json()["count"]
+        before_agents = (await client.get(f"{PREFIX}/memories/distinct-agents")).json()["count"]
+        before_tenants = (await client.get(f"{PREFIX}/memories/distinct-tenants")).json()["count"]
+
+        m1 = (await client.post(f"{PREFIX}/memories", json=payload_one)).json()
+        m2 = (await client.post(f"{PREFIX}/memories", json=payload_two)).json()
+
+        after_write = (await client.get(f"{PREFIX}/memories/count")).json()["count"]
+        after_agents = (await client.get(f"{PREFIX}/memories/distinct-agents")).json()["count"]
+        # tenant_count delta is loose — fixture may already contribute the tenant.
+        assert after_write == before_total + 2
+        assert after_agents == before_agents + 1
+        assert (
+            await client.get(f"{PREFIX}/memories/distinct-tenants")
+        ).json()["count"] >= before_tenants
+
+        # Soft-delete both. ``deleted_at`` is set; ``status`` flips to ``"deleted"``.
+        assert (await client.delete(f"{PREFIX}/memories/{m1['id']}")).status_code == 200
+        assert (await client.delete(f"{PREFIX}/memories/{m2['id']}")).status_code == 200
+
+        # Live counters must roll back our two contributions.
+        post_total = (await client.get(f"{PREFIX}/memories/count")).json()["count"]
+        post_agents = (await client.get(f"{PREFIX}/memories/distinct-agents")).json()["count"]
+        assert post_total == before_total
+        assert post_agents == before_agents
+
 
 # =====================================================================
 # Entities

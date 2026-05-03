@@ -116,6 +116,16 @@ async def generate_insights_endpoint(
         if not caller_agent_id:
             raise HTTPException(status_code=422, detail="agent_id is required.")
         min_level = 1 if body.scope == "agent" else 2
+        # ``require_trust`` soft-passes a missing Agent row at
+        # ``DEFAULT_TRUST_LEVEL`` so read-only callers don't 403 on a
+        # brand-new agent_id. Write paths still need identity pinning,
+        # though: this endpoint persists insight memories plus an
+        # audit-log entry keyed to ``caller_agent_id``, and without a
+        # registered row backing the name, attribution becomes
+        # unverifiable. API-key admission proves authorization, not
+        # identity — re-block unregistered agents on writes
+        # specifically. The soft-pass remains useful for read-only
+        # consumers calling ``require_trust`` directly.
         _, not_found, terr = await require_trust(db, body.tenant_id, caller_agent_id, min_level=min_level)
         if not_found:
             raise HTTPException(

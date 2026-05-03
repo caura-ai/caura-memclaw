@@ -1272,10 +1272,32 @@ class PostgresService:
         whose memories have all been soft-deleted are excluded so the count
         tracks live activity, not historical churn.
         """
-        async with get_session() as session:
+        # Pure read — route via the read pool (matches the sibling
+        # ``memory_distinct_tenant_count`` below). The write pool was
+        # the original choice when ``get_read_session`` didn't exist;
+        # leaving public-stats COUNT(DISTINCT) calls on the write
+        # pool wastes a write connection on every landing-page hit.
+        async with get_read_session() as session:
             result = await session.scalar(
                 select(func.count(func.distinct(Memory.agent_id))).where(
                     Memory.agent_id.isnot(None),
+                    Memory.deleted_at.is_(None),
+                )
+            )
+            return result or 0
+
+    async def memory_distinct_tenant_count(self) -> int:
+        """Count distinct tenants that own at least one live memory.
+
+        Powers the public Tenants counter so it reflects real activity
+        instead of the previous hardcoded ``1`` returned by ``/api/v1/stats``.
+        Mirrors ``memory_distinct_agent_count`` — soft-deleted rows excluded
+        so a tenant whose memories were all tombstoned no longer inflates
+        the count.
+        """
+        async with get_read_session() as session:
+            result = await session.scalar(
+                select(func.count(func.distinct(Memory.tenant_id))).where(
                     Memory.deleted_at.is_(None),
                 )
             )

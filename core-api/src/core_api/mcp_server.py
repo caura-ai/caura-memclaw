@@ -1198,7 +1198,22 @@ async def memclaw_insights(
     min_level = 1 if scope == "agent" else 2
 
     async with _mcp_session() as db:
-        _, _, terr = await _require_trust(db, tenant_id, agent_id, min_level=min_level)
+        # Mirror the REST insights gate: ``require_trust`` soft-passes a
+        # missing Agent row at ``DEFAULT_TRUST_LEVEL`` (read-only ergonomics
+        # — see ``memclaw_list`` below for the intended consumer), but
+        # this handler persists insight memories + audit-log rows keyed
+        # to ``agent_id``. Without a registered row backing the name,
+        # attribution becomes unverifiable, so re-block unregistered
+        # agents on the write path. ``terr`` is None for the soft-pass
+        # case, so without the explicit ``not_found`` check below the
+        # fabricated id would fall through and write.
+        _, not_found, terr = await _require_trust(db, tenant_id, agent_id, min_level=min_level)
+        if not_found:
+            return _with_latency(
+                f"Error (403): Agent '{agent_id}' is not registered. "
+                "Register the agent by writing one memory first.",
+                t0,
+            )
         if terr:
             return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
         try:
@@ -1271,7 +1286,19 @@ async def memclaw_evolve(
     min_level = 1 if scope == "agent" else 2
 
     async with _mcp_session() as db:
-        _, _, terr = await _require_trust(db, tenant_id, agent_id, min_level=min_level)
+        # Mirror the REST evolve gate (and ``memclaw_insights`` above):
+        # block unregistered agents on the write path so the
+        # outcome/rule memories + audit-log rows have a real registered
+        # ``agent_id`` backing them. Soft-pass remains in
+        # ``require_trust`` itself for the read-only ``memclaw_list``
+        # below.
+        _, not_found, terr = await _require_trust(db, tenant_id, agent_id, min_level=min_level)
+        if not_found:
+            return _with_latency(
+                f"Error (403): Agent '{agent_id}' is not registered. "
+                "Register the agent by writing one memory first.",
+                t0,
+            )
         if terr:
             return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
         try:
