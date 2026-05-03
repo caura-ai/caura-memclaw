@@ -26,7 +26,9 @@ from common.enrichment.constants import (  # noqa: F401
     DEFAULT_MEMORY_TYPE,
     DEFAULT_MEMORY_WEIGHT,
     MEMORY_STATUSES,
+    MEMORY_TYPE_DESCRIPTIONS,
     MEMORY_TYPES,
+    MemoryType,
 )
 
 # Re-export LLM provider constants from common.llm (CAURA-595).
@@ -66,11 +68,9 @@ EMBEDDING_REEMBED_BATCH_SIZE = 50
 EMBEDDING_CACHE_TTL = 259200  # 3 days — embeddings are deterministic per model+query
 
 # ── Memory ──
-MEMORY_TYPES_PATTERN = (
-    r"^(fact|episode|decision|preference"
-    r"|task|semantic|intention|plan"
-    r"|commitment|action|outcome|cancellation|rule|insight)$"
-)
+# Derived from MEMORY_TYPES (the SoT) so adding a new type in
+# common/enrichment/constants.py propagates here without hand-editing.
+MEMORY_TYPES_PATTERN = "^(" + "|".join(MEMORY_TYPES) + ")$"
 MEMORY_TYPES_DESCRIPTION = (
     "Memory type. Auto-classified by LLM if omitted. Valid values: " + ", ".join(MEMORY_TYPES) + "."
 )

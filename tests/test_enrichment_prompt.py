@@ -58,6 +58,52 @@ class TestEnrichmentPromptSignalPhrases:
 
 
 @pytest.mark.unit
+class TestEnrichmentPromptVocabularySync:
+    """Prompt vocabulary must stay in lock-step with ``MEMORY_TYPES``.
+
+    Lives here because the prompt was the original drift site: ``insight``
+    was added to the tuple but missed in the prompt's hardcoded list,
+    causing the LLM to never emit that type. The renderer in
+    ``common/enrichment/_prompts.py`` now derives both the inline list
+    and the bullet descriptions from ``MEMORY_TYPE_DESCRIPTIONS``, and
+    these tests guard that contract.
+    """
+
+    def _get_prompt(self) -> str:
+        from core_api.services.memory_enrichment import ENRICHMENT_PROMPT
+        return ENRICHMENT_PROMPT
+
+    def test_every_memory_type_appears_quoted_in_inline_list(self):
+        from common.enrichment.constants import MEMORY_TYPES
+        prompt = self._get_prompt()
+        for t in MEMORY_TYPES:
+            assert f'"{t}"' in prompt, (
+                f"memory_type {t!r} missing from inline list — prompt vocabulary "
+                "drifted from MEMORY_TYPES"
+            )
+
+    def test_every_memory_type_has_a_bullet(self):
+        from common.enrichment.constants import MEMORY_TYPE_DESCRIPTIONS
+        prompt = self._get_prompt()
+        for name, desc in MEMORY_TYPE_DESCRIPTIONS.items():
+            assert f"   - {name}: " in prompt, f"{name!r} bullet missing from prompt"
+            # First clause of the description should also land verbatim
+            first_clause = desc.split(".")[0].split(",")[0].strip()
+            assert first_clause in prompt, (
+                f"{name!r} description first clause not found in prompt: {first_clause!r}"
+            )
+
+    def test_pattern_matches_every_memory_type(self):
+        import re
+        from common.enrichment.constants import MEMORY_TYPES
+        from core_api.constants import MEMORY_TYPES_PATTERN
+        for t in MEMORY_TYPES:
+            assert re.match(MEMORY_TYPES_PATTERN, t), (
+                f"{t!r} not accepted by MEMORY_TYPES_PATTERN — pattern drifted"
+            )
+
+
+@pytest.mark.unit
 class TestHeuristicRegressions:
     """Ensure keyword heuristic still classifies all types correctly after prompt changes."""
 

@@ -14,9 +14,9 @@ from core_api.constants import (
     MAX_TRUST_LEVEL,
     MEMORY_STATUSES_PATTERN,
     MEMORY_TYPES_DESCRIPTION,
-    MEMORY_TYPES_PATTERN,
     MEMORY_VISIBILITIES_PATTERN,
     MIN_TRUST_LEVEL,
+    MemoryType,
 )
 
 # --- Memory ---
@@ -31,8 +31,8 @@ class MemoryCreate(BaseModel):
     tenant_id: str
     fleet_id: str | None = None
     agent_id: str
-    memory_type: str | None = Field(
-        default=None, pattern=MEMORY_TYPES_PATTERN, description=MEMORY_TYPES_DESCRIPTION
+    memory_type: MemoryType | None = Field(
+        default=None, description=MEMORY_TYPES_DESCRIPTION
     )
     content: str = Field(min_length=1, max_length=MAX_CONTENT_LENGTH)
     weight: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -63,8 +63,8 @@ class MemoryCreate(BaseModel):
 class BulkMemoryItem(BaseModel):
     """Single item in a bulk write request. tenant_id/fleet_id/agent_id inherited from parent."""
 
-    memory_type: str | None = Field(
-        default=None, pattern=MEMORY_TYPES_PATTERN, description=MEMORY_TYPES_DESCRIPTION
+    memory_type: MemoryType | None = Field(
+        default=None, description=MEMORY_TYPES_DESCRIPTION
     )
     content: str = Field(min_length=1, max_length=MAX_CONTENT_LENGTH)
     weight: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -154,8 +154,8 @@ class RedistributeResponse(BaseModel):
 
 class MemoryUpdate(BaseModel):
     content: str | None = Field(default=None, min_length=1, max_length=MAX_CONTENT_LENGTH)
-    memory_type: str | None = Field(
-        default=None, pattern=MEMORY_TYPES_PATTERN, description=MEMORY_TYPES_DESCRIPTION
+    memory_type: MemoryType | None = Field(
+        default=None, description=MEMORY_TYPES_DESCRIPTION
     )
     weight: float | None = Field(default=None, ge=0.0, le=1.0)
     title: str | None = None
@@ -285,9 +285,8 @@ class SearchRequest(BaseModel):
     fleet_ids: list[str] | None = None
     query: str = Field(min_length=1, max_length=MAX_QUERY_LENGTH)
     filter_agent_id: str | None = None
-    memory_type_filter: str | None = Field(
+    memory_type_filter: MemoryType | None = Field(
         default=None,
-        pattern=MEMORY_TYPES_PATTERN,
         description="Filter results to a single memory type. " + MEMORY_TYPES_DESCRIPTION,
     )
     status_filter: str | None = Field(default=None, pattern=MEMORY_STATUSES_PATTERN)

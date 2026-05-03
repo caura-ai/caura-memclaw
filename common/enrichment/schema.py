@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from common.enrichment.constants import DEFAULT_MEMORY_TYPE
+from common.enrichment.constants import MemoryType
 
 
 class AtomicFact(BaseModel):
@@ -30,7 +30,7 @@ class AtomicFact(BaseModel):
     """
 
     content: str
-    suggested_type: str = DEFAULT_MEMORY_TYPE
+    suggested_type: MemoryType = MemoryType.FACT
     retrieval_hint: str = ""
 
 
@@ -43,7 +43,7 @@ class EnrichmentResult(BaseModel):
     defaults for the heuristic fallback path).
     """
 
-    memory_type: str = DEFAULT_MEMORY_TYPE
+    memory_type: MemoryType = MemoryType.FACT
     weight: float = 0.7
     title: str = ""
     summary: str = ""
