@@ -1053,28 +1053,34 @@ class TestEvolveRequestValidation:
 
 @pytest.mark.asyncio
 async def test_evolve_rest_rejects_unknown_agent(client):
-    """Non-admin callers must name an agent that actually exists in the
-    tenant. An unknown ``body.agent_id`` is refused before consuming rate-
-    limit budget, which keeps unapproved names from enumerating.
+    """A previously-unseen ``body.agent_id`` from a tenant-key caller
+    must 403 on the WRITE path. The trust soft-pass closes a usability
+    gap on read-only callers (memclaw_list, recall) but write paths
+    persist memories + audit-log rows keyed to ``caller_agent_id``, so
+    identity needs to be a real registered row before the audit trail
+    can be trusted. Operators register agents by writing one memory
+    first — see ``test_evolve_rest_accepts_registered_agent_with_trust``.
     """
-    tenant_id = "default"  # standalone mode: Path 3 → is_admin=False
+    tenant_id = "default"
     resp = await client.post(
         "/api/v1/evolve/report",
         json={
             "tenant_id": tenant_id,
-            "outcome": "try unknown agent",
+            "outcome": "first contact from new agent",
             "outcome_type": "success",
             "agent_id": f"ghost-agent-{uuid.uuid4().hex[:8]}",
             "scope": "agent",
         },
     )
     assert resp.status_code == 403
-    assert "not registered" in resp.json()["detail"].lower()
+    assert "not registered" in resp.json().get("detail", "")
 
 
 @pytest.mark.asyncio
 async def test_insights_rest_rejects_unknown_agent(client):
-    """Same identity contract for insights REST."""
+    """Mirror of ``test_evolve_rest_rejects_unknown_agent``. Insights
+    REST persists insight memories + audit-log rows so the same
+    identity-pinning rule applies — soft-pass is read-only territory."""
     tenant_id = "default"
     resp = await client.post(
         "/api/v1/insights/generate",
@@ -1086,7 +1092,7 @@ async def test_insights_rest_rejects_unknown_agent(client):
         },
     )
     assert resp.status_code == 403
-    assert "not registered" in resp.json()["detail"].lower()
+    assert "not registered" in resp.json().get("detail", "")
 
 
 @pytest.mark.asyncio

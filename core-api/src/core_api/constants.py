@@ -81,6 +81,15 @@ MEMORY_STATUSES_PATTERN = (
     r"|outdated|conflicted|archived|deleted)$"
 )
 
+# ── Health / status probe timeouts ──
+# Upper bound on a single dependency probe (storage / redis / event_bus).
+# Cloud Run typically gives health checks 10-30s before marking a revision
+# unhealthy; we want to fail-fast well before that so a stalled backend
+# can't hang the whole probe. Shared between ``/health`` (binary 503 deploy
+# gate) and ``/stats`` / ``/status`` (public endpoints with the same posture
+# — return ``0`` / "unreachable" rather than block landing-page hits).
+PROBE_TIMEOUT_SECONDS = 5.0
+
 # ── Memory visibility levels ──
 # Named constants are the SoT — ``MEMORY_VISIBILITIES`` and the regex below
 # derive from them so a rename here propagates to membership checks and
