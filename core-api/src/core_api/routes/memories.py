@@ -8,7 +8,7 @@ from uuid import UUID
 import httpx
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, select, tuple_, update
+from sqlalchemy import and_, func, or_, select, tuple_, update
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as SQLATimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,7 +17,13 @@ from common.models.memory import Memory
 from core_api.auth import AuthContext, get_auth_context
 from core_api.clients.storage_client import get_storage_client
 from core_api.config import settings as app_settings
-from core_api.constants import DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT
+from core_api.constants import (
+    DEFAULT_LIST_LIMIT,
+    MAX_LIST_LIMIT,
+    MEMORY_VISIBILITY_SCOPE_AGENT,
+    MEMORY_VISIBILITY_SCOPE_ORG,
+    MEMORY_VISIBILITY_SCOPE_TEAM,
+)
 from core_api.db.session import get_db
 from core_api.middleware.idempotency import (
     IDEMPOTENCY_HEADER,
@@ -145,7 +151,21 @@ async def list_fleets(
         if not auth.tenant_id:
             raise HTTPException(status_code=400, detail="tenant_id is required")
         tenant_id = auth.tenant_id
-    filters = [Memory.deleted_at.is_(None), Memory.fleet_id.isnot(None)]
+    filters = [
+        Memory.deleted_at.is_(None),
+        Memory.fleet_id.isnot(None),
+        # No ``agent_id`` accepted on this route, so there's no caller
+        # identity that could legitimately see ``scope_agent`` rows.
+        # Exclude them the same way ``memory_repository.list_by_filters``
+        # does (line 137) and ``/memories/stats`` does. Without this,
+        # ``memory_count``/``agent_count`` overstate what
+        # ``GET /api/v1/memories?fleet_id=X`` would actually return.
+        # ``Memory.visibility`` is ``nullable=False`` with a server
+        # default (common/models/memory.py:62-66), so the SQL three-
+        # valued-logic pitfall (NULL != 'scope_agent' = NULL → row
+        # silently dropped) doesn't apply here.
+        Memory.visibility != MEMORY_VISIBILITY_SCOPE_AGENT,
+    ]
     if tenant_id:
         filters.append(Memory.tenant_id == tenant_id)
     rows = (
@@ -275,7 +295,35 @@ async def memory_stats(
     if fleet_id:
         filters.append(Memory.fleet_id == fleet_id)
     if agent_id:
+        # ``agent_id`` doubles as visibility identity AND author filter
+        # (mirrors ``list_memories`` above, which forwards it as both
+        # ``caller_agent_id`` and ``written_by`` to ``list_by_filters``).
+        # Mirror ``list_by_filters``'s visibility whitelist explicitly
+        # (memory_repository.py:125-134) so any future restricted
+        # visibility value (e.g. ``scope_private``) is excluded from
+        # both the list and the count, instead of recreating the
+        # count-vs-list mismatch this PR fixes.
         filters.append(Memory.agent_id == agent_id)
+        filters.append(
+            or_(
+                Memory.visibility == MEMORY_VISIBILITY_SCOPE_ORG,
+                Memory.visibility == MEMORY_VISIBILITY_SCOPE_TEAM,
+                and_(
+                    Memory.visibility == MEMORY_VISIBILITY_SCOPE_AGENT,
+                    Memory.agent_id == agent_id,
+                ),
+            )
+        )
+    else:
+        # No identified caller — exclude ``scope_agent`` rows the same
+        # way ``memory_repository.list_by_filters`` does (line 137).
+        # Without this, ``/memories/stats.total`` counts agent-scoped
+        # memories that ``/memories`` never returns, producing the
+        # count-vs-list mismatch the Prism browser surfaces (see
+        # CAURA-000-stats-visibility-scope-agent).
+        # ``Memory.visibility`` is ``nullable=False`` (see model), so
+        # ``!=`` is safe — no rows can be silently NULL-dropped here.
+        filters.append(Memory.visibility != MEMORY_VISIBILITY_SCOPE_AGENT)
     if memory_type:
         filters.append(Memory.memory_type == memory_type)
     if status:

@@ -118,6 +118,50 @@ async def test_list_fleets(client):
             assert f["agent_count"] == 2
 
 
+async def test_list_fleets_excludes_scope_agent(client):
+    # Regression: ``GET /api/v1/fleets`` previously had no visibility
+    # predicate, so its ``memory_count`` / ``agent_count`` overstated
+    # what ``GET /api/v1/memories?fleet_id=X`` would actually return —
+    # the same count-vs-list mismatch the Prism browser surfaced for
+    # ``/memories/stats``. The route accepts no ``agent_id``, so there
+    # is no caller identity that could legitimately see scope_agent rows.
+    tenant_id, headers = get_test_auth()
+    tag = _uid()
+    fid = f"fleet-vis-{tag}"
+
+    async def _post(agent: str, visibility: str, content: str) -> None:
+        resp = await client.post(
+            "/api/v1/memories",
+            json={
+                "tenant_id": tenant_id,
+                "content": f"{content} [{tag}]",
+                "agent_id": agent,
+                "fleet_id": fid,
+                "memory_type": "fact",
+                "visibility": visibility,
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 201, f"Write failed: {resp.text}"
+
+    await _post(f"alice-{tag}", "scope_agent", "alice private")
+    await _post(f"bob-{tag}", "scope_agent", "bob private")
+    await _post(f"shared-{tag}", "scope_org", "team-wide")
+
+    resp = await client.get(
+        f"/api/v1/fleets?tenant_id={tenant_id}",
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    fleets = resp.json()
+    target = next((f for f in fleets if f["fleet_id"] == fid), None)
+    assert target is not None, f"fleet {fid} not in /fleets response"
+    # Only the scope_org memory is visible to an unidentified caller.
+    # Without the visibility filter this would be 3 / 3.
+    assert target["memory_count"] == 1
+    assert target["agent_count"] == 1
+
+
 async def test_dispatch_command(client):
     """Register node, POST command, GET commands → command appears."""
     tenant_id, headers = get_test_auth()

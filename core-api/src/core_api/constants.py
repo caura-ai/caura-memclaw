@@ -82,8 +82,22 @@ MEMORY_STATUSES_PATTERN = (
 )
 
 # ── Memory visibility levels ──
-MEMORY_VISIBILITIES = ("scope_agent", "scope_team", "scope_org")
-MEMORY_VISIBILITIES_PATTERN = r"^(scope_agent|scope_team|scope_org)$"
+# Named constants are the SoT — ``MEMORY_VISIBILITIES`` and the regex below
+# derive from them so a rename here propagates to membership checks and
+# the Pydantic pattern automatically. SQL filters and any other call
+# site should import the named constant rather than the bare string so
+# a typo turns into a NameError at import time, not a silent miss.
+MEMORY_VISIBILITY_SCOPE_AGENT = "scope_agent"
+MEMORY_VISIBILITY_SCOPE_TEAM = "scope_team"
+MEMORY_VISIBILITY_SCOPE_ORG = "scope_org"
+MEMORY_VISIBILITIES = (
+    MEMORY_VISIBILITY_SCOPE_AGENT,
+    MEMORY_VISIBILITY_SCOPE_TEAM,
+    MEMORY_VISIBILITY_SCOPE_ORG,
+)
+MEMORY_VISIBILITIES_PATTERN = (
+    f"^({MEMORY_VISIBILITY_SCOPE_AGENT}|{MEMORY_VISIBILITY_SCOPE_TEAM}|{MEMORY_VISIBILITY_SCOPE_ORG})$"
+)
 
 MAX_CONTENT_LENGTH = 10000
 CHUNKING_THRESHOLD_CHARS = 2000  # content above this triggers auto-chunking
