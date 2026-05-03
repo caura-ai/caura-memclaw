@@ -255,6 +255,18 @@ const PARAM_SCHEMAS: Record<string, Record<string, unknown>> = {
       fleet_id: { type: "string", description: "Required when scope='fleet'" },
     },
   },
+
+  memclaw_stats: {
+    type: "object",
+    required: [],
+    properties: {
+      scope: { type: "string", enum: ["agent", "fleet", "all"], description: "'agent' (default, trust ≥ 1) | 'fleet'/'all' (trust ≥ 2)" },
+      agent_id: { type: "string", description: "Caller agent ID" },
+      fleet_id: { type: "string", description: "Restrict aggregate to a fleet" },
+      memory_type: MEMORY_TYPE_SCHEMA,
+      status: STATUS_SCHEMA,
+    },
+  },
 };
 
 // --- HTTP dispatch ---
@@ -433,6 +445,16 @@ const ENDPOINT_DISPATCH: Record<string, ExecuteFn> = {
   memclaw_evolve: async (params, signal) => {
     const body = await enrichBody(params);
     return apiCall("POST", "/evolve/report", body, undefined, signal);
+  },
+
+  memclaw_stats: async (params, signal) => {
+    const enriched = await enrichBody(params);
+    const query: Record<string, string> = {};
+    for (const [k, v] of Object.entries(enriched)) {
+      if (v === undefined || v === null) continue;
+      query[k] = String(v);
+    }
+    return apiCall("GET", "/memories/stats", undefined, query, signal);
   },
 };
 

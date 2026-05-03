@@ -30,6 +30,7 @@ EXPECTED_PLUGIN_EXPOSED = {
     "memclaw_tune",
     "memclaw_insights",
     "memclaw_evolve",
+    "memclaw_stats",
 }
 
 EXPECTED_PLACEHOLDERS: set[str] = set()
@@ -165,15 +166,11 @@ def test_descriptions_no_leftover_tool_descriptions_import():
         )
 
 
-def test_registry_size_is_9():
-    """v1.0 surface is exactly 9 live tools (no placeholders)."""
+def test_registry_size_matches_expected_surface():
+    """Registry size must match the expected plugin-exposed + placeholder sets."""
     from core_api.tools import REGISTRY
 
-    assert (
-        len(REGISTRY)
-        == len(EXPECTED_PLUGIN_EXPOSED | EXPECTED_PLACEHOLDERS)
-        == 9
-    )
+    assert len(REGISTRY) == len(EXPECTED_PLUGIN_EXPOSED | EXPECTED_PLACEHOLDERS)
 
 
 def test_every_spec_renders_to_descriptor_json():

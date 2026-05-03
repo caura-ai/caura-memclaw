@@ -26,7 +26,7 @@ when to add or move an operation.
 | Bulk delete | REST + MCP (`memclaw_manage op=bulk_delete`) | Admin sometimes; agents cleaning up after themselves sometimes. |
 | Memory lineage walk | REST + MCP (`memclaw_manage op=lineage`) | Agents reviewing their own writes need to trace supersession chains. |
 | Knowledge graph / `/graph` | REST only | Aggregation surface for UIs and analytics tools. Agents that need entity context use `memclaw_entity_get` (single entity) and `memclaw_recall` (with entity_links in results). |
-| Memory stats `/memories/stats` | REST only (revisit per use case) | Aggregate counts are an admin/dashboard concern. If a concrete agent introspection use case appears, expose as `memclaw_stats`. |
+| Memory stats | REST + MCP (`memclaw_stats`) | Aggregate counts (total + breakdown by type, agent, status) — useful for admin/dashboard usage on REST and for agent self-introspection on MCP. Read-only aggregations don't need a use-case gate. |
 | Tenant settings | REST only | Settings are a tenant-administrator concern; not safe for arbitrary agents to flip global config. |
 | Redistribute (mass reassign) | REST only | Destructive bulk op requires `trust_level >= 3`. Admin operation, not agent-driven. |
 | Ingest preview/commit | REST only (revisit per use case) | Pipeline workflow; expose to MCP only if "agent crawls a URL and writes memories" becomes a real use case. |
@@ -37,14 +37,19 @@ when to add or move an operation.
 ## When to add an operation
 
 Before adding a new MCP tool that mirrors a REST endpoint, justify it with a
-concrete agent workflow:
+concrete agent workflow OR demonstrate that the operation is a read-only
+aggregation/introspection:
 
-1. Is there an agent that **today** is blocked from doing useful work because
-   this operation only exists on REST?
-2. If yes, does it fit naturally into an existing tool (`memclaw_manage`,
+1. **Read-only aggregations** (counts, summaries, listings of caller-visible
+   state) don't need a blocking use case — they're cheap, safe, and useful for
+   any agent that wants to introspect the store. Add freely; trust gate at
+   the same level as `memclaw_list` (≥ 1 for own scope, ≥ 2 for cross-agent).
+2. For everything else: is there an agent that **today** is blocked from
+   doing useful work because this operation only exists on REST?
+3. If yes, does it fit naturally into an existing tool (`memclaw_manage`,
    `memclaw_doc`, etc.) as another `op=...`? Prefer extending an existing
    tool over adding a new top-level surface.
-3. If a new tool is genuinely warranted, it must include: a clear description,
+4. If a new tool is genuinely warranted, it must include: a clear description,
    trust-level enforcement consistent with the REST counterpart, and a wet
    test that exercises the same workflow against the local docker stack.
 

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Trust-level MCP matrix test.
 
-Provisions 3 agents at trust 1/2/3, then invokes each of the 9 MCP tools
-and asserts expected-pass vs expected-deny per the declared trust gates.
+Provisions 3 agents at trust 1/2/3, then invokes each MCP tool and asserts
+expected-pass vs expected-deny per the declared trust gates.
 """
+
 import json
 import os
 import sys
@@ -30,7 +31,10 @@ CORE_API = "http://localhost:8000"  # direct core-api — uses X-Tenant-ID heade
 
 
 def http(method, url, body=None, headers=None):
-    h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    h = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
     if headers:
         h.update(headers)
     data = json.dumps(body).encode() if body else None
@@ -62,7 +66,9 @@ def provision():
             },
             headers={"X-API-Key": KEY},
         )
-        print(f"  {aid} seed: {s}  id={body.get('id','-')[:12] if body.get('id') else body.get('detail','')}")
+        print(
+            f"  {aid} seed: {s}  id={body.get('id', '-')[:12] if body.get('id') else body.get('detail', '')}"
+        )
         # Promote trust
         s, body = http(
             "PATCH",
@@ -89,7 +95,9 @@ def mcp_call(agent_id, tool, args=None):
             },
         },
     }
-    s, resp = http("POST", f"{CORE_API}/mcp/", body=body, headers={"X-Tenant-ID": TENANT})
+    s, resp = http(
+        "POST", f"{CORE_API}/mcp/", body=body, headers={"X-Tenant-ID": TENANT}
+    )
     # MCP returns either result (success) or result.isError (tool-level error)
     result = resp.get("result", {})
     err = resp.get("error")
@@ -110,7 +118,11 @@ def mcp_call(agent_id, tool, args=None):
 # Any tool call at lower trust should return DENIED (or equivalent).
 TESTS = [
     # tool, args (merged with tenant/agent/fleet), min_trust_to_succeed
-    ("memclaw_write", {"content": "trust-matrix test memory", "memory_type": "fact"}, 1),
+    (
+        "memclaw_write",
+        {"content": "trust-matrix test memory", "memory_type": "fact"},
+        1,
+    ),
     ("memclaw_recall", {"query": "trust"}, 1),
     ("memclaw_list", {"scope": "agent"}, 1),
     ("memclaw_list", {"scope": "fleet"}, 2),
@@ -122,11 +134,13 @@ TESTS = [
     ("memclaw_insights", {"scope": "agent"}, 1),
     ("memclaw_insights", {"scope": "fleet"}, 2),
     ("memclaw_evolve", {"op": "analyze"}, 2),
+    ("memclaw_stats", {"scope": "agent"}, 1),
+    ("memclaw_stats", {"scope": "fleet"}, 2),
 ]
 
 
 def run_matrix():
-    print("\n=== Trust Matrix (9 tools × 3 trust levels) ===")
+    print("\n=== Trust Matrix (10 tools × 3 trust levels) ===")
     print(f"{'tool':25s} {'args':40s} {'T1':10s} {'T2':10s} {'T3':10s}")
     print("-" * 100)
     for tool, args, min_trust in TESTS:
@@ -139,13 +153,17 @@ def run_matrix():
         t1 = row_results[1][0]
         t2 = row_results[2][0]
         t3 = row_results[3][0]
+
         # Flag if result doesn't match expectation
         def ok(actual, level):
             if level >= min_trust:
                 return "ok" if actual == "OK" else actual[:6]
             else:
-                return "deny" if actual in ("DENIED", "ERROR") else f"PERM!"  # unexpected allow
-        flags = f"{ok(t1,1):10s} {ok(t2,2):10s} {ok(t3,3):10s}"
+                return (
+                    "deny" if actual in ("DENIED", "ERROR") else f"PERM!"
+                )  # unexpected allow
+
+        flags = f"{ok(t1, 1):10s} {ok(t2, 2):10s} {ok(t3, 3):10s}"
         print(f"{tool:25s} {args_repr:40s} {flags}  min={min_trust}")
 
 

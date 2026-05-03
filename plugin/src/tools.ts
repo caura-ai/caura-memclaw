@@ -25,6 +25,7 @@ export const MEMCLAW_TOOLS = [
   "memclaw_tune",
   "memclaw_insights",
   "memclaw_evolve",
+  "memclaw_stats",
 ] as const;
 
 // --- Boot-time drift check ---

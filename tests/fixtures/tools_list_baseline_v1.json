@@ -798,6 +798,85 @@
     "execution": null
   },
   {
+    "name": "memclaw_stats",
+    "title": null,
+    "description": "Aggregate counts of memories: total + breakdowns by type, agent, status. scope='agent' (default) counts only memories visible to YOU (trust \u2265 1); scope='fleet'/'all' aggregates across agents (trust \u2265 2). Read-only \u2014 useful for self-introspection and dashboard-style summaries.",
+    "inputSchema": {
+      "properties": {
+        "scope": {
+          "default": "agent",
+          "description": "agent|fleet|all. 'agent' (default) = your memories only (trust \u2265 1). 'fleet'/'all' = aggregate across agents (trust \u2265 2).",
+          "title": "Scope",
+          "type": "string"
+        },
+        "fleet_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Filter by fleet.",
+          "title": "Fleet Id"
+        },
+        "agent_id": {
+          "default": "mcp-agent",
+          "description": "Caller agent.",
+          "title": "Agent Id",
+          "type": "string"
+        },
+        "memory_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Filter by type.",
+          "title": "Memory Type"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Filter by status.",
+          "title": "Status"
+        }
+      },
+      "title": "memclaw_statsArguments",
+      "type": "object"
+    },
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "title": "Result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "memclaw_statsOutput",
+      "type": "object"
+    },
+    "icons": null,
+    "annotations": null,
+    "meta": null,
+    "execution": null
+  },
+  {
     "name": "memclaw_tune",
     "title": null,
     "description": "Tune YOUR retrieval parameters for memclaw_recall (top_k, min_similarity, fts_weight, graph_max_hops, freshness, recall_boost). Only provide fields to change; no fields \u2192 returns current profile.",

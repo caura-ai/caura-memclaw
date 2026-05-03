@@ -8,7 +8,7 @@ from uuid import UUID
 import httpx
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
-from sqlalchemy import and_, func, or_, select, tuple_, update
+from sqlalchemy import func, select, tuple_, update
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as SQLATimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,8 +21,6 @@ from core_api.constants import (
     DEFAULT_LIST_LIMIT,
     MAX_LIST_LIMIT,
     MEMORY_VISIBILITY_SCOPE_AGENT,
-    MEMORY_VISIBILITY_SCOPE_ORG,
-    MEMORY_VISIBILITY_SCOPE_TEAM,
 )
 from core_api.db.session import get_db
 from core_api.middleware.idempotency import (
@@ -289,74 +287,18 @@ async def memory_stats(
         if not auth.tenant_id:
             raise HTTPException(status_code=400, detail="tenant_id is required")
         tenant_id = auth.tenant_id
-    filters = [Memory.deleted_at.is_(None)]
-    if tenant_id:
-        filters.append(Memory.tenant_id == tenant_id)
-    if fleet_id:
-        filters.append(Memory.fleet_id == fleet_id)
-    if agent_id:
-        # ``agent_id`` doubles as visibility identity AND author filter
-        # (mirrors ``list_memories`` above, which forwards it as both
-        # ``caller_agent_id`` and ``written_by`` to ``list_by_filters``).
-        # Mirror ``list_by_filters``'s visibility whitelist explicitly
-        # (memory_repository.py:125-134) so any future restricted
-        # visibility value (e.g. ``scope_private``) is excluded from
-        # both the list and the count, instead of recreating the
-        # count-vs-list mismatch this PR fixes.
-        filters.append(Memory.agent_id == agent_id)
-        filters.append(
-            or_(
-                Memory.visibility == MEMORY_VISIBILITY_SCOPE_ORG,
-                Memory.visibility == MEMORY_VISIBILITY_SCOPE_TEAM,
-                and_(
-                    Memory.visibility == MEMORY_VISIBILITY_SCOPE_AGENT,
-                    Memory.agent_id == agent_id,
-                ),
-            )
-        )
-    else:
-        # No identified caller — exclude ``scope_agent`` rows the same
-        # way ``memory_repository.list_by_filters`` does (line 137).
-        # Without this, ``/memories/stats.total`` counts agent-scoped
-        # memories that ``/memories`` never returns, producing the
-        # count-vs-list mismatch the Prism browser surfaces (see
-        # CAURA-000-stats-visibility-scope-agent).
-        # ``Memory.visibility`` is ``nullable=False`` (see model), so
-        # ``!=`` is safe — no rows can be silently NULL-dropped here.
-        filters.append(Memory.visibility != MEMORY_VISIBILITY_SCOPE_AGENT)
-    if memory_type:
-        filters.append(Memory.memory_type == memory_type)
-    if status:
-        filters.append(Memory.status == status)
-    base = select(Memory).where(*filters)
 
     try:
-        total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar()
-        by_type = dict(
-            (
-                await db.execute(
-                    select(Memory.memory_type, func.count()).where(*filters).group_by(Memory.memory_type)
-                )
-            ).all()
+        from core_api.services.memory_stats import compute_memory_stats
+
+        return await compute_memory_stats(
+            db,
+            tenant_id=tenant_id,
+            fleet_id=fleet_id,
+            agent_id=agent_id,
+            memory_type=memory_type,
+            status=status,
         )
-        by_agent = dict(
-            (
-                await db.execute(
-                    select(Memory.agent_id, func.count()).where(*filters).group_by(Memory.agent_id)
-                )
-            ).all()
-        )
-        by_status = dict(
-            (
-                await db.execute(select(Memory.status, func.count()).where(*filters).group_by(Memory.status))
-            ).all()
-        )
-        return {
-            "total": total,
-            "by_type": by_type,
-            "by_agent": by_agent,
-            "by_status": by_status,
-        }
     except (OperationalError, SQLATimeoutError):
         # Connection pool exhaustion / connection drop / per-query timeout
         # are the transient failure modes worth degrading for. Programming

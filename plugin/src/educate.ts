@@ -242,7 +242,7 @@ export function educateAgents(
 //
 //   TOOLS.md   — per-workspace append, INJECTED EVERY TURN as bootstrap
 //                (subject to 12 K per-file / 60 K total char caps). Kept
-//                lean on purpose: quick matrix (9 tools × purpose ×
+//                lean on purpose: quick matrix (per-tool purpose ×
 //                returns) + enum vocabulary table + pointer to SKILL.md.
 //                Retained because sub-agent sessions get only AGENTS.md
 //                and TOOLS.md (other bootstrap files are filtered out),
@@ -285,6 +285,7 @@ decision guidance, constraints, and error codes, read
 | \`memclaw_tune\`       | Update retrieval profile (sticky, not per-call)     | current profile |
 | \`memclaw_insights\`   | Reflect: contradictions / failures / patterns / …   | stored as \`insight\` memories |
 | \`memclaw_evolve\`     | Report outcome after acting on recalled memories    | weight updates; may create rules |
+| \`memclaw_stats\`      | Aggregate counts: total + by type/agent/status      | \`{total, by_type, by_agent, by_status, scope}\` |
 
 ### Vocabulary
 
