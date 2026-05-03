@@ -1,4 +1,4 @@
-"""Unit tests for ``memclaw_manage`` (op: read | update | transition | delete).
+"""Unit tests for ``memclaw_manage`` (op: read | update | transition | delete | bulk_delete | lineage).
 
 Covers:
 - Unknown ``op`` → ``INVALID_ARGUMENTS`` envelope listing the expected ops.
@@ -51,11 +51,14 @@ async def test_manage_invalid_op_errors(mcp_env):
     payload = parse_envelope(out)
     assert payload["error"]["code"] == "INVALID_ARGUMENTS"
     assert "wat" in payload["error"]["message"]
+    # sorted() in mcp_server emits the ops in lexicographic order
     assert payload["error"]["details"]["expected_ops"] == [
-        "read",
-        "update",
-        "transition",
+        "bulk_delete",
         "delete",
+        "lineage",
+        "read",
+        "transition",
+        "update",
     ]
 
 

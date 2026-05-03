@@ -379,8 +379,12 @@ async def memclaw_write(
 
 
 async def memclaw_manage(
-    op: Annotated[str, Field(description="read|update|transition|delete.")],
-    memory_id: Annotated[str, Field(description="UUID.")],
+    op: Annotated[str, Field(description="read|update|transition|delete|bulk_delete|lineage.")],
+    memory_id: Annotated[str, Field(description="UUID. Required except for op=bulk_delete.")] = "",
+    memory_ids: Annotated[
+        list[str] | None,
+        Field(description="op=bulk_delete: list of memory UUIDs (max 1000)."),
+    ] = None,
     status: Annotated[str | None, Field(description="op=transition.")] = None,
     content: Annotated[str | None, Field(description="op=update.")] = None,
     memory_type: Annotated[str | None, Field(description="op=update.")] = None,
@@ -390,32 +394,140 @@ async def memclaw_manage(
     source_uri: Annotated[str | None, Field(description="op=update.")] = None,
     agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
 ) -> str:
-    """Per-memory lifecycle: read-by-id, update, transition, delete. Op-dispatched."""
+    """Per-memory lifecycle: read | update | transition | delete | bulk_delete | lineage.
+
+    op=lineage walks the supersession chain for `memory_id` and returns
+    {this, superseded_by, supersessors} — the older row this memory
+    replaced (if any) and any newer rows that supersede this one.
+    Mirrors the focused agent-facing view of REST `/memories/{id}/contradictions`.
+    """
     t0 = time.perf_counter()
     if err := _check_auth():
         return err
-    if op not in {"read", "update", "transition", "delete"}:
+    _valid_ops = {"read", "update", "transition", "delete", "bulk_delete", "lineage"}
+    if op not in _valid_ops:
         return _with_latency(
             json.dumps(
                 {
                     "error": {
                         "code": "INVALID_ARGUMENTS",
-                        "message": f"Unknown op '{op}'. Expected one of: read, update, transition, delete.",
-                        "details": {"op": op, "expected_ops": ["read", "update", "transition", "delete"]},
+                        "message": f"Unknown op '{op}'. Expected one of: {sorted(_valid_ops)}.",
+                        "details": {"op": op, "expected_ops": sorted(_valid_ops)},
                     }
                 }
             ),
             t0,
         )
-    try:
-        uid = UUID(memory_id)
-    except ValueError:
-        return "Error: Invalid memory_id — must be a valid UUID."
+    # bulk_delete uses memory_ids (list); all other ops use memory_id (single UUID).
+    # Validate accordingly so a missing memory_id on bulk_delete doesn't fail with
+    # a misleading "Invalid UUID" error.
+    if op != "bulk_delete":
+        try:
+            uid = UUID(memory_id)
+        except ValueError:
+            return "Error: Invalid memory_id — must be a valid UUID."
     tenant_id = _get_tenant()
     agent_id = _get_agent_id() or agent_id
 
     async with _mcp_session() as db:
         try:
+            if op == "bulk_delete":
+                if not memory_ids:
+                    return _with_latency("Error (422): op=bulk_delete requires non-empty 'memory_ids'.", t0)
+                if len(memory_ids) > 1000:
+                    return _with_latency(
+                        f"Error (422): op=bulk_delete capped at 1000 ids (got {len(memory_ids)}).",
+                        t0,
+                    )
+                try:
+                    uids = [UUID(i) for i in memory_ids]
+                except ValueError as e:
+                    return _with_latency(f"Error (422): invalid UUID in memory_ids — {e}", t0)
+                from datetime import UTC
+                from datetime import datetime as _dt
+
+                from sqlalchemy import update as _sa_update
+
+                from common.models.memory import Memory as _Mem
+
+                stmt = (
+                    _sa_update(_Mem)
+                    .where(
+                        _Mem.tenant_id == tenant_id,
+                        _Mem.id.in_(uids),
+                        _Mem.deleted_at.is_(None),
+                    )
+                    .values(deleted_at=_dt.now(UTC), status="deleted")
+                )
+                result = await db.execute(stmt)
+                await log_action(
+                    db,
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    action="bulk_delete",
+                    resource_type="memory",
+                    detail={"count": result.rowcount, "method": "by_ids", "via": "mcp"},
+                )
+                await db.commit()
+                return _with_latency(json.dumps({"deleted": result.rowcount, "requested": len(uids)}), t0)
+            if op == "lineage":
+                from sqlalchemy import select as _sa_select
+
+                from common.models.memory import Memory as _Mem
+
+                this = await memory_repo.get_by_id_for_tenant(db, uid, tenant_id)
+                if not this:
+                    return _with_latency("Error: Memory not found.", t0)
+
+                # The older memory this row replaced (if any). The
+                # supersedes_id field points at the OLDER row (the
+                # detector's "loser"); this row was the winner.
+                superseded_by = None
+                if this.supersedes_id:
+                    older = await db.get(_Mem, this.supersedes_id)
+                    if older and older.tenant_id == tenant_id and older.deleted_at is None:
+                        superseded_by = {
+                            "id": str(older.id),
+                            "content_preview": older.content[:200],
+                            "status": older.status,
+                            "created_at": (older.created_at.isoformat() if older.created_at else None),
+                        }
+
+                # Newer rows whose supersedes_id points at this row
+                # (this row was their "loser").
+                stmt = (
+                    _sa_select(_Mem)
+                    .where(
+                        _Mem.supersedes_id == uid,
+                        _Mem.tenant_id == tenant_id,
+                        _Mem.deleted_at.is_(None),
+                    )
+                    .order_by(_Mem.created_at.desc())
+                )
+                supersessors = [
+                    {
+                        "id": str(m.id),
+                        "content_preview": m.content[:200],
+                        "status": m.status,
+                        "created_at": m.created_at.isoformat() if m.created_at else None,
+                    }
+                    for m in (await db.execute(stmt)).scalars().all()
+                ]
+                return _with_latency(
+                    json.dumps(
+                        {
+                            "this": {
+                                "id": str(this.id),
+                                "status": this.status,
+                                "supersedes_id": (str(this.supersedes_id) if this.supersedes_id else None),
+                            },
+                            "superseded_by": superseded_by,  # the OLDER row this replaced
+                            "supersessors": supersessors,  # NEWER rows that replaced this
+                        },
+                        default=str,
+                    ),
+                    t0,
+                )
             if op == "read":
                 memory = await memory_repo.get_by_id_for_tenant(db, uid, tenant_id)
                 if not memory:
