@@ -42,6 +42,23 @@ class DocQueryRequest(BaseModel):
     offset: int = Field(default=0, ge=0)
 
 
+class DocSearchRequest(BaseModel):
+    """Vector search over indexed documents.
+
+    Mirrors MCP ``memclaw_doc op=search``: when ``collection`` is omitted,
+    search spans every collection in the tenant (broad strategy); when
+    supplied, search is restricted to that collection (narrow strategy).
+    Only documents written with an ``embed_field`` (i.e. with a non-NULL
+    embedding column) are considered.
+    """
+
+    tenant_id: str
+    fleet_id: str | None = None
+    collection: str | None = Field(default=None, min_length=1, max_length=200)
+    query: str = Field(min_length=1)
+    top_k: int = Field(default=5, ge=1, le=50)
+
+
 class DocOut(BaseModel):
     id: str
     tenant_id: str
@@ -117,6 +134,33 @@ async def upsert_document(
     if _idem:
         await _idem.record(out.model_dump(mode="json"), 200)
     return out
+
+
+# NOTE: /documents/collections must be registered BEFORE /documents/{doc_id}
+# because FastAPI matches in declaration order — without this ordering,
+# `GET /documents/collections` would match `/documents/{doc_id}` with
+# doc_id="collections" and require the `collection=` query param, returning 422.
+@router.get("/documents/collections")
+async def list_collections(
+    tenant_id: str = Query(...),
+    fleet_id: str | None = Query(default=None),
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """Enumerate document collections in the tenant. Mirror of MCP
+    ``memclaw_doc op=list_collections``. Returns one row per collection
+    with the per-collection document count.
+    """
+    auth.enforce_tenant(tenant_id)
+    from core_api.repositories import document_repo
+
+    rows = await document_repo.list_collections(db, tenant_id=tenant_id, fleet_id=fleet_id)
+    return JSONResponse(
+        {
+            "collections": [{"name": name, "count": count} for name, count in rows],
+            "count": len(rows),
+        }
+    )
 
 
 @router.get("/documents/{doc_id}")
@@ -201,3 +245,69 @@ async def delete_document(
         detail={"collection": collection, "doc_id": doc_id},
     )
     await db.commit()
+
+
+# ── Vector search + collections enumeration ──
+#
+# These two endpoints mirror MCP ``memclaw_doc op=search`` and
+# ``op=list_collections``. They go DIRECTLY through ``document_repo``
+# (bypassing the storage-api HTTP hop) for two reasons:
+#   1. The MCP path already does, so behaviour is identical.
+#   2. The corresponding storage-api routes don't exist — adding them
+#      would just be an extra hop with no functional value.
+# See docs/api-surfaces.md for surface ownership rationale.
+
+
+@router.post("/documents/search")
+async def search_documents(
+    body: DocSearchRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+):
+    """Vector search over indexed documents. Mirror of MCP ``memclaw_doc op=search``.
+
+    Embeds ``body.query`` via the configured embedding provider, then ranks
+    documents by cosine similarity. ``collection=None`` searches across all
+    collections in the tenant; supplying ``collection`` scopes the search.
+    """
+    auth.enforce_tenant(body.tenant_id)
+    if auth.tenant_id:
+        await check_and_increment(db, body.tenant_id, "search")
+
+    from common.embedding import get_embedding
+    from core_api.repositories import document_repo
+
+    query_embedding = await get_embedding(body.query)
+    if query_embedding is None:
+        raise HTTPException(
+            status_code=503,
+            detail=("embedding provider returned no vector (check provider config / quota); search aborted"),
+        )
+    pairs = await document_repo.search(
+        db,
+        tenant_id=body.tenant_id,
+        collection=body.collection,
+        query_embedding=query_embedding,
+        top_k=body.top_k,
+        fleet_id=body.fleet_id,
+    )
+    items = [
+        {
+            "collection": d.collection,
+            "doc_id": d.doc_id,
+            "data": d.data,
+            "similarity": round(sim, 4),
+        }
+        for d, sim in pairs
+    ]
+    return JSONResponse(
+        {
+            "collection": body.collection,
+            "count": len(items),
+            "results": items,
+        }
+    )
+
+
+# /documents/collections is registered earlier in the file (before
+# /documents/{doc_id}) to avoid the path-parameter collision.
