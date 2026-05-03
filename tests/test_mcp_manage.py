@@ -91,7 +91,7 @@ async def test_manage_read_happy_path(mcp_env, monkeypatch):
 
 async def test_manage_transition_missing_status_errors(mcp_env):
     out = await mcp_server.memclaw_manage(op="transition", memory_id=VALID_UID)
-    assert "Error (422)" in out
+    assert "INVALID_ARGUMENTS" in out
     assert "op=transition requires 'status'" in out
 
 
@@ -99,7 +99,7 @@ async def test_manage_transition_invalid_status_errors(mcp_env):
     out = await mcp_server.memclaw_manage(
         op="transition", memory_id=VALID_UID, status="garbage"
     )
-    assert "Error (422)" in out
+    assert "INVALID_ARGUMENTS" in out
     assert "Invalid status 'garbage'" in out
 
 
@@ -165,7 +165,7 @@ async def test_manage_service_http_exception_envelope(mcp_env):
         status_code=403, detail="insufficient trust"
     )
     out = await mcp_server.memclaw_manage(op="delete", memory_id=VALID_UID)
-    assert "Error (403)" in out
+    assert "FORBIDDEN" in out
     assert "insufficient trust" in out
 
 

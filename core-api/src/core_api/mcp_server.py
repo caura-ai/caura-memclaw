@@ -34,6 +34,7 @@ from core_api.constants import (
     VERSION,
 )
 from core_api.db.session import async_session
+from core_api.errors import code_for_status
 from core_api.repositories import memory_repo
 from core_api.schemas import BulkMemoryCreate, BulkMemoryItem, MemoryCreate, MemoryUpdate
 from core_api.services.audit_service import log_action
@@ -49,6 +50,7 @@ from core_api.services.memory_service import (
 # Re-export so existing `monkeypatch.setattr(mcp_server, "_require_trust", ...)`
 # sites in tests keep working; production callers should import ``require_trust``
 # directly from ``core_api.services.trust_service``.
+from core_api.services.trust_service import parse_trust_error
 from core_api.services.trust_service import require_trust as _require_trust
 from core_api.services.usage_service import check_and_increment_by_tenant as check_and_increment
 
@@ -62,8 +64,31 @@ _agent_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("mcp_
 _UNAUTH = "__unauthenticated__"
 _ADMIN = "__admin__"
 _NO_AUTH = "__no_auth__"
-_AUTH_ERROR = "Error: Missing or invalid X-API-Key header. Provide a tenant-scoped API key."
-_ADMIN_ERROR = "Error: Admin/system keys cannot be used with MCP. Use a tenant-scoped API key."
+
+
+def _error_response(code: str, message: str, **details) -> str:
+    """Return the canonical MCP error envelope as a JSON string.
+
+    Shape matches the REST surface (see ``core_api.errors.make_error_payload``):
+    ``{"error": {"code": "...", "message": "...", "details": {...}}}``.
+
+    Wrap with ``_with_latency(...)`` when an in-tool latency stamp is desired —
+    ``_with_latency`` parses the JSON, appends ``_latency_ms``, and re-serializes.
+    """
+    from core_api.errors import make_error_payload
+
+    payload = make_error_payload(code, message, details=details if details else None)
+    return json.dumps(payload, default=str)
+
+
+# Pre-tool auth errors (returned directly, NOT through _with_latency, because
+# they fire before any tool work has begun).
+_AUTH_ERROR = _error_response(
+    "UNAUTHORIZED", "Missing or invalid X-API-Key header. Provide a tenant-scoped API key."
+)
+_ADMIN_ERROR = _error_response(
+    "FORBIDDEN", "Admin/system keys cannot be used with MCP. Use a tenant-scoped API key."
+)
 
 
 class MCPAuthMiddleware:
@@ -207,9 +232,19 @@ async def memclaw_recall(
     if err := _check_auth():
         return err
     if memory_type and memory_type not in MEMORY_TYPES:
-        return f"Error (422): Invalid memory_type '{memory_type}'. Must be one of: {', '.join(MEMORY_TYPES)}"
+        return _error_response(
+            "INVALID_ARGUMENTS",
+            f"Invalid memory_type '{memory_type}'. Must be one of: {', '.join(MEMORY_TYPES)}",
+            field="memory_type",
+            value=memory_type,
+        )
     if status and status not in MEMORY_STATUSES:
-        return f"Error (422): Invalid status '{status}'. Must be one of: {', '.join(MEMORY_STATUSES)}"
+        return _error_response(
+            "INVALID_ARGUMENTS",
+            f"Invalid status '{status}'. Must be one of: {', '.join(MEMORY_STATUSES)}",
+            field="status",
+            value=status,
+        )
     tenant_id = _get_tenant()
     agent_id = _get_agent_id() or agent_id  # prefer gateway-verified identity
     capped_top_k = min(top_k, MAX_SEARCH_TOP_K)
@@ -261,7 +296,7 @@ async def memclaw_recall(
             return _with_latency(json.dumps(payload, indent=2, default=str), t0)
         except HTTPException as e:
             logger.warning("MCP tool error (%s): %s", e.status_code, e.detail)
-            return _with_latency(f"Error ({e.status_code}): {e.detail}", t0)
+            return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
 
 
 async def memclaw_write(
@@ -375,7 +410,7 @@ async def memclaw_write(
             return _with_latency(_serialize(result), t0)
         except HTTPException as e:
             logger.warning("MCP tool error (%s): %s", e.status_code, e.detail)
-            return _with_latency(f"Error ({e.status_code}): {e.detail}", t0)
+            return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
 
 
 async def memclaw_manage(
@@ -425,7 +460,7 @@ async def memclaw_manage(
         try:
             uid = UUID(memory_id)
         except ValueError:
-            return "Error: Invalid memory_id — must be a valid UUID."
+            return _error_response("INVALID_ARGUMENTS", "Invalid memory_id — must be a valid UUID.")
     tenant_id = _get_tenant()
     agent_id = _get_agent_id() or agent_id
 
@@ -433,16 +468,25 @@ async def memclaw_manage(
         try:
             if op == "bulk_delete":
                 if not memory_ids:
-                    return _with_latency("Error (422): op=bulk_delete requires non-empty 'memory_ids'.", t0)
+                    return _with_latency(
+                        _error_response(
+                            "INVALID_ARGUMENTS", "op=bulk_delete requires non-empty 'memory_ids'."
+                        ),
+                        t0,
+                    )
                 if len(memory_ids) > 1000:
                     return _with_latency(
-                        f"Error (422): op=bulk_delete capped at 1000 ids (got {len(memory_ids)}).",
+                        _error_response(
+                            "INVALID_ARGUMENTS", f"op=bulk_delete capped at 1000 ids (got {len(memory_ids)})."
+                        ),
                         t0,
                     )
                 try:
                     uids = [UUID(i) for i in memory_ids]
                 except ValueError as e:
-                    return _with_latency(f"Error (422): invalid UUID in memory_ids — {e}", t0)
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", f"invalid UUID in memory_ids — {e}"), t0
+                    )
                 from datetime import UTC
                 from datetime import datetime as _dt
 
@@ -477,7 +521,7 @@ async def memclaw_manage(
 
                 this = await memory_repo.get_by_id_for_tenant(db, uid, tenant_id)
                 if not this:
-                    return _with_latency("Error: Memory not found.", t0)
+                    return _with_latency(_error_response("NOT_FOUND", "Memory not found."), t0)
 
                 # The older memory this row replaced (if any). The
                 # supersedes_id field points at the OLDER row (the
@@ -531,7 +575,7 @@ async def memclaw_manage(
             if op == "read":
                 memory = await memory_repo.get_by_id_for_tenant(db, uid, tenant_id)
                 if not memory:
-                    return _with_latency("Error: Memory not found.", t0)
+                    return _with_latency(_error_response("NOT_FOUND", "Memory not found."), t0)
                 return _with_latency(
                     json.dumps(
                         {
@@ -562,15 +606,20 @@ async def memclaw_manage(
                 )
             if op == "transition":
                 if not status:
-                    return _with_latency("Error (422): op=transition requires 'status'.", t0)
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", "op=transition requires 'status'."), t0
+                    )
                 if status not in MEMORY_STATUSES:
                     return _with_latency(
-                        f"Error (422): Invalid status '{status}'. Must be one of: {', '.join(MEMORY_STATUSES)}",
+                        _error_response(
+                            "INVALID_ARGUMENTS",
+                            f"Invalid status '{status}'. Must be one of: {', '.join(MEMORY_STATUSES)}",
+                        ),
                         t0,
                     )
                 memory = await memory_repo.get_by_id_for_tenant(db, uid, tenant_id)
                 if not memory:
-                    return _with_latency("Error: Memory not found.", t0)
+                    return _with_latency(_error_response("NOT_FOUND", "Memory not found."), t0)
                 old_status = memory.status
                 await memory_repo.update_status(db, uid, status)
                 await log_action(
@@ -612,7 +661,7 @@ async def memclaw_manage(
             return _with_latency(f"Memory {memory_id} deleted.", t0)
         except HTTPException as e:
             logger.warning("MCP tool error (%s): %s", e.status_code, e.detail)
-            return _with_latency(f"Error ({e.status_code}): {e.detail}", t0)
+            return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
 
 
 async def memclaw_entity_get(
@@ -624,7 +673,7 @@ async def memclaw_entity_get(
     try:
         uid = UUID(entity_id)
     except ValueError:
-        return "Error: Invalid entity_id — must be a valid UUID."
+        return _error_response("INVALID_ARGUMENTS", "Invalid entity_id — must be a valid UUID.")
 
     async with _mcp_session() as db:
         result = await get_entity(db, uid, _get_tenant())
@@ -665,7 +714,7 @@ async def memclaw_tune(
             similarity_blend=similarity_blend,
         )
     except (ValidationError, ValueError) as e:
-        return _with_latency(f"Error (422): {e}", t0)
+        return _with_latency(_error_response("INVALID_ARGUMENTS", f"{e}"), t0)
 
     updates = profile.model_dump(exclude_none=True)
     async with _mcp_session() as db:
@@ -685,7 +734,7 @@ async def memclaw_tune(
             return _with_latency(json.dumps({"agent_id": agent_id, "search_profile": current}, indent=2), t0)
         except HTTPException as e:
             logger.warning("MCP tool error (%s): %s", e.status_code, e.detail)
-            return _with_latency(f"Error ({e.status_code}): {e.detail}", t0)
+            return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
 
 
 # ---------------------------------------------------------------------------
@@ -749,10 +798,7 @@ async def memclaw_doc(
     # means "search across every collection in this tenant" — the broad
     # strategy; supply collection to scope the search to just one).
     if op not in {"list_collections", "search"} and not collection:
-        return _with_latency(
-            f"Error (422): op={op} requires 'collection'.",
-            t0,
-        )
+        return _with_latency(_error_response("INVALID_ARGUMENTS", f"op={op} requires 'collection'."), t0)
     tenant_id = _get_tenant()
     agent_id = _get_agent_id() or agent_id
 
@@ -773,9 +819,13 @@ async def memclaw_doc(
                 )
             if op == "write":
                 if not doc_id:
-                    return _with_latency("Error (422): op=write requires 'doc_id'.", t0)
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", "op=write requires 'doc_id'."), t0
+                    )
                 if data is None:
-                    return _with_latency("Error (422): op=write requires 'data'.", t0)
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", "op=write requires 'data'."), t0
+                    )
                 # Optional semantic indexing: embed data[embed_field] so the
                 # doc participates in op=search. Missing/empty source field is
                 # a caller mistake — fail loud rather than silently skip.
@@ -784,8 +834,11 @@ async def memclaw_doc(
                     source = data.get(embed_field)
                     if not isinstance(source, str) or not source.strip():
                         return _with_latency(
-                            "Error (422): op=write embed_field "
-                            f"'{embed_field}' not found in data or not a non-empty string.",
+                            _error_response(
+                                "INVALID_ARGUMENTS",
+                                f"op=write embed_field "
+                                f"'{embed_field}' not found in data or not a non-empty string.",
+                            ),
                             t0,
                         )
                     from common.embedding import get_embedding
@@ -808,7 +861,9 @@ async def memclaw_doc(
                     embedding=embedding,
                 )
                 if row is None:
-                    return _with_latency("Error: document upsert returned no rows", t0)
+                    return _with_latency(
+                        _error_response("INTERNAL_ERROR", "document upsert returned no rows"), t0
+                    )
                 await db.commit()
                 # `text("xmax")` is unlabeled in SQLAlchemy ≥ 2; access by
                 # tuple position. Returning columns are: id, created_at,
@@ -828,7 +883,9 @@ async def memclaw_doc(
                 )
             if op == "read":
                 if not doc_id:
-                    return _with_latency("Error (422): op=read requires 'doc_id'.", t0)
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", "op=read requires 'doc_id'."), t0
+                    )
                 doc = await document_repo.get_by_doc_id(
                     db, tenant_id=tenant_id, collection=collection, doc_id=doc_id
                 )
@@ -867,7 +924,9 @@ async def memclaw_doc(
                 )
             if op == "search":
                 if not query or not query.strip():
-                    return _with_latency("Error (422): op=search requires a non-empty 'query'.", t0)
+                    return _with_latency(
+                        _error_response("INVALID_ARGUMENTS", "op=search requires a non-empty 'query'."), t0
+                    )
                 from common.embedding import get_embedding
 
                 query_embedding = await get_embedding(query)
@@ -912,7 +971,7 @@ async def memclaw_doc(
                 )
             # op == "delete"
             if not doc_id:
-                return _with_latency("Error (422): op=delete requires 'doc_id'.", t0)
+                return _with_latency(_error_response("INVALID_ARGUMENTS", "op=delete requires 'doc_id'."), t0)
             from sqlalchemy import delete as sa_delete
 
             from common.models.document import Document
@@ -940,10 +999,10 @@ async def memclaw_doc(
             )
         except HTTPException as e:
             logger.warning("MCP tool error (%s): %s", e.status_code, e.detail)
-            return _with_latency(f"Error ({e.status_code}): {e.detail}", t0)
+            return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
         except Exception as e:
             logger.error("MCP doc op=%s error: %s", op, e, exc_info=True)
-            return _with_latency(f"Error: {e}", t0)
+            return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
 
 
 async def memclaw_list(
@@ -975,17 +1034,26 @@ async def memclaw_list(
     if err := _check_auth():
         return err
     if scope not in VALID_SCOPES:
-        return f"Error (422): Invalid scope '{scope}'. Must be: agent, fleet, all."
+        return _error_response("INVALID_ARGUMENTS", f"Invalid scope '{scope}'. Must be: agent, fleet, all.")
     if memory_type and memory_type not in MEMORY_TYPES:
-        return f"Error (422): Invalid memory_type '{memory_type}'. Must be one of: {', '.join(MEMORY_TYPES)}"
+        return _error_response(
+            "INVALID_ARGUMENTS",
+            f"Invalid memory_type '{memory_type}'. Must be one of: {', '.join(MEMORY_TYPES)}",
+        )
     if status and status not in MEMORY_STATUSES:
-        return f"Error (422): Invalid status '{status}'. Must be one of: {', '.join(MEMORY_STATUSES)}"
+        return _error_response(
+            "INVALID_ARGUMENTS", f"Invalid status '{status}'. Must be one of: {', '.join(MEMORY_STATUSES)}"
+        )
     if sort not in {"created_at", "weight", "recall_count"}:
-        return f"Error (422): Invalid sort '{sort}'. Must be one of: created_at, weight, recall_count."
+        return _error_response(
+            "INVALID_ARGUMENTS", f"Invalid sort '{sort}'. Must be one of: created_at, weight, recall_count."
+        )
     if order not in {"asc", "desc"}:
-        return "Error (422): order must be 'asc' or 'desc'."
+        return _error_response("INVALID_ARGUMENTS", "order must be 'asc' or 'desc'.")
     if cursor and (sort != "created_at" or order != "desc"):
-        return "Error (422): cursor pagination requires sort=created_at and order=desc."
+        return _error_response(
+            "INVALID_ARGUMENTS", "cursor pagination requires sort=created_at and order=desc."
+        )
     capped_limit = max(1, min(int(limit), 50))
 
     from datetime import datetime as _dt
@@ -997,7 +1065,10 @@ async def memclaw_list(
     agent_id = _get_agent_id() or agent_id
 
     if scope == "agent" and written_by is not None and written_by != agent_id:
-        return f"Error (422): written_by must be omitted or match your own agent_id ('{agent_id}') when scope='agent'."
+        return _error_response(
+            "INVALID_ARGUMENTS",
+            f"written_by must be omitted or match your own agent_id ('{agent_id}') when scope='agent'.",
+        )
 
     # Dynamic trust: scope='agent' requires trust ≥ 1, 'fleet'/'all' requires ≥ 2.
     min_level = 1 if scope == "agent" else 2
@@ -1005,7 +1076,7 @@ async def memclaw_list(
     async with _mcp_session() as db:
         trust, _, terr = await _require_trust(db, tenant_id, agent_id, min_level=min_level)
         if terr:
-            return _with_latency(terr, t0)
+            return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
 
         # scope='agent': force written_by to the caller's agent_id so they
         # can only see their own memories regardless of other filters.
@@ -1020,19 +1091,23 @@ async def memclaw_list(
             try:
                 ts_after = _dt.fromisoformat(created_after)
             except ValueError:
-                return _with_latency("Error (422): created_after must be ISO8601.", t0)
+                return _with_latency(
+                    _error_response("INVALID_ARGUMENTS", "created_after must be ISO8601."), t0
+                )
         if created_before:
             try:
                 ts_before = _dt.fromisoformat(created_before)
             except ValueError:
-                return _with_latency("Error (422): created_before must be ISO8601.", t0)
+                return _with_latency(
+                    _error_response("INVALID_ARGUMENTS", "created_before must be ISO8601."), t0
+                )
 
         c_ts = c_id = None
         if cursor:
             try:
                 c_ts, c_id = decode_cursor(cursor)
             except Exception:
-                return _with_latency("Error (422): Invalid cursor.", t0)
+                return _with_latency(_error_response("INVALID_ARGUMENTS", "Invalid cursor."), t0)
 
         rows = await memory_repo.list_by_filters(
             db,
@@ -1099,16 +1174,23 @@ async def memclaw_insights(
     # Pre-validate inputs before consuming rate-limit budget.
     if focus not in INSIGHTS_FOCUS_MODES:
         return _with_latency(
-            f"Error (422): Invalid focus '{focus}'. Must be one of: {', '.join(INSIGHTS_FOCUS_MODES)}",
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid focus '{focus}'. Must be one of: {', '.join(INSIGHTS_FOCUS_MODES)}",
+            ),
             t0,
         )
     if scope not in VALID_SCOPES:
-        return _with_latency(f"Error (422): Invalid scope '{scope}'. Must be: agent, fleet, all", t0)
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", f"Invalid scope '{scope}'. Must be: agent, fleet, all"), t0
+        )
     if scope == "fleet" and not fleet_id:
-        return _with_latency("Error (422): fleet_id is required when scope is 'fleet'.", t0)
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", "fleet_id is required when scope is 'fleet'."), t0
+        )
     if focus == "divergence" and scope == "agent":
         return _with_latency(
-            "Error (422): Focus 'divergence' requires scope='fleet' or scope='all'.",
+            _error_response("INVALID_ARGUMENTS", "Focus 'divergence' requires scope='fleet' or scope='all'."),
             t0,
         )
 
@@ -1118,7 +1200,7 @@ async def memclaw_insights(
     async with _mcp_session() as db:
         _, _, terr = await _require_trust(db, tenant_id, agent_id, min_level=min_level)
         if terr:
-            return _with_latency(terr, t0)
+            return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
         try:
             await check_and_increment(db, tenant_id, "insights")
             from core_api.services.insights_service import generate_insights
@@ -1133,10 +1215,10 @@ async def memclaw_insights(
             )
             return _with_latency(json.dumps(result, indent=2, default=str), t0)
         except HTTPException as e:
-            return _with_latency(f"Error ({e.status_code}): {e.detail}", t0)
+            return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
         except Exception as e:
             logger.exception("Unhandled error in memclaw_insights")
-            return _with_latency(f"Error: {e}", t0)
+            return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
 
 
 async def memclaw_evolve(
@@ -1166,18 +1248,24 @@ async def memclaw_evolve(
     # Pre-validate inputs before consuming rate-limit budget.
     if outcome_type not in EVOLVE_OUTCOME_TYPES:
         return _with_latency(
-            (
-                f"Error (422): Invalid outcome_type '{outcome_type}'. "
-                f"Must be one of: {', '.join(EVOLVE_OUTCOME_TYPES)}"
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid outcome_type '{outcome_type}'. Must be one of: {', '.join(EVOLVE_OUTCOME_TYPES)}",
             ),
             t0,
         )
     if not outcome or not outcome.strip():
-        return _with_latency("Error (422): outcome must be a non-empty description.", t0)
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", "outcome must be a non-empty description."), t0
+        )
     if scope not in VALID_SCOPES:
-        return _with_latency(f"Error (422): Invalid scope '{scope}'. Must be: agent, fleet, all.", t0)
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", f"Invalid scope '{scope}'. Must be: agent, fleet, all."), t0
+        )
     if scope == "fleet" and not fleet_id:
-        return _with_latency("Error (422): fleet_id is required when scope is 'fleet'.", t0)
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", "fleet_id is required when scope is 'fleet'."), t0
+        )
 
     # Dynamic trust: scope='agent' requires trust ≥ 1, 'fleet'/'all' requires ≥ 2.
     min_level = 1 if scope == "agent" else 2
@@ -1185,7 +1273,7 @@ async def memclaw_evolve(
     async with _mcp_session() as db:
         _, _, terr = await _require_trust(db, tenant_id, agent_id, min_level=min_level)
         if terr:
-            return _with_latency(terr, t0)
+            return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
         try:
             await check_and_increment(db, tenant_id, "evolve")
             from core_api.services.evolve_service import report_outcome
@@ -1202,10 +1290,10 @@ async def memclaw_evolve(
             )
             return _with_latency(json.dumps(result, indent=2, default=str), t0)
         except HTTPException as e:
-            return _with_latency(f"Error ({e.status_code}): {e.detail}", t0)
+            return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
         except Exception as e:
             logger.exception("Unhandled error in memclaw_evolve")
-            return _with_latency(f"Error: {e}", t0)
+            return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
 
 
 # ── Mountable app + lifespan ──
