@@ -485,6 +485,69 @@ async def count_active_memories(tenant_id: str, fleet_id: str | None = None) -> 
     return {"count": count}
 
 
+@router.get("/null-embedding-ids")
+async def list_null_embedding_ids(
+    tenant_id: str,
+    limit: int = 500,
+    after: str | None = None,
+) -> dict:
+    """Page through memories where ``embedding IS NULL`` for one tenant.
+
+    Drives the event-driven embedding backfill task in core-worker
+    (``core_worker.backfill``) — the worker fetches a page of ids
+    here, calls ``GET /memories/{id}?tenant_id=...`` per row to
+    retrieve the content, then publishes one ``EMBED_REQUESTED`` event
+    per row. See ``local_emb_res/specs/C-backfill-task-pr.md``.
+
+    Each returned row carries only the **identifiers** the worker
+    needs to address the next fetch — ``id`` and ``tenant_id``. The
+    raw ``content`` and ``content_hash`` are deliberately NOT inlined
+    here. Two reasons:
+
+    1. **Defence-in-depth.** The OSS storage API has no auth
+       middleware (see ``app.py``); a successful GET on this endpoint
+       must not leak every memory's content in a single response. An
+       attacker who guesses the per-tenant id still has to issue
+       one ``GET /memories/{id}`` per row, which is rate-limitable
+       and audit-logged separately.
+    2. **Payload size.** A 5000-row page with full content can run to
+       multiple MB; ids-only keeps it deterministic and small
+       regardless of corpus shape.
+
+    Idempotent under restart: the consumer's writes flip rows from
+    NULL to non-NULL, so a re-run picks up only rows that are still
+    NULL.
+
+    ``tenant_id`` is required for the same defence-in-depth reason —
+    no un-scoped scans across all tenants. For whole-deployment
+    scans, iterate the tenant list externally and call this endpoint
+    once per tenant.
+    """
+    if limit < 1 or limit > 5000:
+        raise HTTPException(
+            status_code=422,
+            detail="limit must be in [1, 5000]",
+        )
+    after_uuid: UUID | None = None
+    if after is not None:
+        try:
+            after_uuid = UUID(after)
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail=f"after must be a UUID, got {after!r}",
+            )
+
+    rows, total_remaining = await _svc.memory_list_null_embedding_rows(
+        limit=limit, after=after_uuid, tenant_id=tenant_id
+    )
+    return {
+        "rows": [{"id": str(row_id), "tenant_id": row_tenant} for row_id, row_tenant in rows],
+        "next_after": str(rows[-1][0]) if rows else None,
+        "total_remaining": total_remaining,
+    }
+
+
 @router.get("/distinct-agents")
 async def count_distinct_agents() -> dict:
     """Global count of distinct agent identities across all memories.

@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from core_api.constants import VECTOR_DIM
 from core_api.pipeline.context import PipelineContext
 from core_api.pipeline.steps.write.parallel_embed_enrich import ParallelEmbedEnrich
 from core_api.schemas import MemoryCreate
@@ -72,7 +73,7 @@ async def test_skips_embed_when_flag_off() -> None:
         patch("core_api.pipeline.steps.write.parallel_embed_enrich.settings.embed_on_hot_path", False),
         patch(
             "core_api.pipeline.steps.write.parallel_embed_enrich.get_embedding",
-            new=AsyncMock(return_value=[0.1] * 768),
+            new=AsyncMock(return_value=[0.1] * VECTOR_DIM),
         ) as embed,
     ):
         await ParallelEmbedEnrich().execute(ctx)
@@ -83,7 +84,7 @@ async def test_skips_embed_when_flag_off() -> None:
 
 async def test_runs_embed_when_flag_on() -> None:
     ctx = _ctx()
-    fake = [0.1] * 768
+    fake = [0.1] * VECTOR_DIM
     with (
         patch("core_api.pipeline.steps.write.parallel_embed_enrich.settings.embed_on_hot_path", True),
         patch(
@@ -99,13 +100,13 @@ async def test_runs_embed_when_flag_on() -> None:
 async def test_uses_cached_embedding_even_when_flag_off() -> None:
     """A cached embedding is a pure dict lookup — there's no provider call
     to offload. The step must reuse it regardless of the flag."""
-    cached = [0.42] * 768
+    cached = [0.42] * VECTOR_DIM
     ctx = _ctx(cached_embedding=cached)
     with (
         patch("core_api.pipeline.steps.write.parallel_embed_enrich.settings.embed_on_hot_path", False),
         patch(
             "core_api.pipeline.steps.write.parallel_embed_enrich.get_embedding",
-            new=AsyncMock(return_value=[0.0] * 768),
+            new=AsyncMock(return_value=[0.0] * VECTOR_DIM),
         ) as embed,
     ):
         await ParallelEmbedEnrich().execute(ctx)
@@ -126,7 +127,7 @@ async def test_enrichment_still_runs_when_flag_off() -> None:
         patch("core_api.pipeline.steps.write.parallel_embed_enrich.settings.embed_on_hot_path", False),
         patch(
             "core_api.pipeline.steps.write.parallel_embed_enrich.get_embedding",
-            new=AsyncMock(return_value=[0.0] * 768),
+            new=AsyncMock(return_value=[0.0] * VECTOR_DIM),
         ) as embed,
         patch("core_api.services.memory_enrichment.enrich_memory", new=_enrich),
     ):
@@ -151,7 +152,7 @@ async def test_hint_reembed_skipped_when_flag_off() -> None:
         patch("core_api.pipeline.steps.write.parallel_embed_enrich.settings.embed_on_hot_path", False),
         patch(
             "core_api.pipeline.steps.write.parallel_embed_enrich.get_embedding",
-            new=AsyncMock(return_value=[0.0] * 768),
+            new=AsyncMock(return_value=[0.0] * VECTOR_DIM),
         ) as embed,
         patch("core_api.services.memory_enrichment.enrich_memory", new=_enrich),
     ):
@@ -185,7 +186,7 @@ async def test_reembed_skips_initial_sleep_when_flag_off() -> None:
 
     with (
         patch.object(memory_service.settings, "embed_on_hot_path", False),
-        patch.object(memory_service, "get_embedding", new=AsyncMock(return_value=[0.1] * 768)),
+        patch.object(memory_service, "get_embedding", new=AsyncMock(return_value=[0.1] * VECTOR_DIM)),
         patch.object(memory_service, "get_storage_client", return_value=sc),
         patch("core_api.services.memory_service.asyncio.sleep", new=_fake_sleep),
         patch.object(memory_service, "track_task"),
@@ -213,7 +214,7 @@ async def test_reembed_sleeps_on_failure_path_when_flag_on() -> None:
 
     with (
         patch.object(memory_service.settings, "embed_on_hot_path", True),
-        patch.object(memory_service, "get_embedding", new=AsyncMock(return_value=[0.1] * 768)),
+        patch.object(memory_service, "get_embedding", new=AsyncMock(return_value=[0.1] * VECTOR_DIM)),
         patch.object(memory_service, "get_storage_client", return_value=sc),
         patch("core_api.services.memory_service.asyncio.sleep", new=_fake_sleep),
         patch.object(memory_service, "track_task"),
@@ -246,7 +247,7 @@ async def test_reembed_schedules_contradiction_after_success() -> None:
 
     with (
         patch.object(memory_service.settings, "embed_on_hot_path", False),
-        patch.object(memory_service, "get_embedding", new=AsyncMock(return_value=[0.1] * 768)),
+        patch.object(memory_service, "get_embedding", new=AsyncMock(return_value=[0.1] * VECTOR_DIM)),
         patch.object(memory_service, "get_storage_client", return_value=sc),
         patch("core_api.services.memory_service.asyncio.sleep", new=_noop_sleep),
         patch.object(memory_service, "track_task"),
@@ -268,7 +269,7 @@ async def test_reembed_race_guard_fires_with_flag_on_too() -> None:
     Regression guard for a review finding."""
     from core_api.services import memory_service
 
-    hint_enhanced = [0.9] * 768  # written by _enrich_memory_background
+    hint_enhanced = [0.9] * VECTOR_DIM  # written by _enrich_memory_background
     sc = MagicMock()
     sc.get_memory = AsyncMock(
         return_value={"id": "m1", "deleted_at": None, "fleet_id": "f1", "embedding": hint_enhanced}
@@ -285,7 +286,7 @@ async def test_reembed_race_guard_fires_with_flag_on_too() -> None:
     with (
         # Flag ON — the configuration where the earlier guard was broken.
         patch.object(memory_service.settings, "embed_on_hot_path", True),
-        patch.object(memory_service, "get_embedding", new=AsyncMock(return_value=[0.1] * 768)),
+        patch.object(memory_service, "get_embedding", new=AsyncMock(return_value=[0.1] * VECTOR_DIM)),
         patch.object(memory_service, "get_storage_client", return_value=sc),
         patch("core_api.services.memory_service.asyncio.sleep", new=_noop_sleep),
         patch.object(memory_service, "track_task"),
@@ -307,7 +308,7 @@ async def test_reembed_respects_existing_embedding_from_enrich_race() -> None:
     on the existing value so coverage isn't lost."""
     from core_api.services import memory_service
 
-    existing = [0.9] * 768  # hint-enhanced embedding written by enrich
+    existing = [0.9] * VECTOR_DIM  # hint-enhanced embedding written by enrich
     sc = MagicMock()
     sc.get_memory = AsyncMock(
         return_value={"id": "m1", "deleted_at": None, "fleet_id": "f1", "embedding": existing}
@@ -335,7 +336,7 @@ async def test_reembed_respects_existing_embedding_from_enrich_race() -> None:
 
     with (
         patch.object(memory_service.settings, "embed_on_hot_path", False),
-        patch.object(memory_service, "get_embedding", new=AsyncMock(return_value=[0.1] * 768)),
+        patch.object(memory_service, "get_embedding", new=AsyncMock(return_value=[0.1] * VECTOR_DIM)),
         patch.object(memory_service, "get_storage_client", return_value=sc),
         patch("core_api.services.memory_service.asyncio.sleep", new=_noop_sleep),
         patch("core_api.services.contradiction_detector.detect_contradictions_async", new=_fake_detect),
@@ -373,7 +374,7 @@ async def test_bulk_reembed_preserves_batching() -> None:
 
     async def _fake_batch(texts, _cfg):
         batch_calls.append(len(texts))
-        return [[0.1] * 768 for _ in texts]
+        return [[0.1] * VECTOR_DIM for _ in texts]
 
     def _stub_tracked_task(coro, _name, *_a, **_k):
         coro.close()
@@ -404,8 +405,8 @@ async def test_enrich_fires_contradiction_when_overwriting_existing_embedding() 
     uncovered unless we fire contradiction detection post-enrich too."""
     from core_api.services import memory_service
 
-    raw_existing = [0.1] * 768      # already written by _reembed
-    hint_enhanced = [0.9] * 768     # enrich computes + overwrites with this
+    raw_existing = [0.1] * VECTOR_DIM      # already written by _reembed
+    hint_enhanced = [0.9] * VECTOR_DIM     # enrich computes + overwrites with this
 
     mem_row = {
         "id": "m1",
@@ -520,7 +521,7 @@ async def test_enrich_no_contradiction_when_no_prior_embedding() -> None:
     """
     from core_api.services import memory_service
 
-    hint_enhanced = [0.9] * 768
+    hint_enhanced = [0.9] * VECTOR_DIM
     mem_row = {
         "id": "m1",
         "deleted_at": None,
@@ -606,7 +607,7 @@ async def test_reembed_is_failure_fallback_triggers_backoff() -> None:
 
     with (
         patch.object(memory_service.settings, "embed_on_hot_path", False),
-        patch.object(memory_service, "get_embedding", new=AsyncMock(return_value=[0.1] * 768)),
+        patch.object(memory_service, "get_embedding", new=AsyncMock(return_value=[0.1] * VECTOR_DIM)),
         patch.object(memory_service, "get_storage_client", return_value=sc),
         patch("core_api.services.memory_service.asyncio.sleep", new=_fake_sleep),
         patch.object(memory_service, "track_task"),
@@ -724,7 +725,7 @@ async def test_bulk_reembed_reschedules_items_whose_get_memory_failed() -> None:
     sc.update_embedding = AsyncMock()
 
     async def _batch(_texts, _cfg):
-        return [[0.1] * 768, [0.2] * 768]
+        return [[0.1] * VECTOR_DIM, [0.2] * VECTOR_DIM]
 
     def _fake_detect(*args, **_kwargs):
         async def _noop() -> None:
@@ -752,7 +753,7 @@ async def test_bulk_reembed_reschedules_items_whose_get_memory_failed() -> None:
         )
 
     # Item B went through the normal write pass.
-    sc.update_embedding.assert_awaited_once_with(str(mem_b_id), [0.2] * 768)
+    sc.update_embedding.assert_awaited_once_with(str(mem_b_id), [0.2] * VECTOR_DIM)
     # Item A was rescheduled as a per-item retry (reembed task) AND
     # item B scheduled contradiction detection — both tracked.
     names = [call.args[1] for call in tracked.call_args_list]
@@ -786,7 +787,7 @@ async def test_bulk_reembed_patch_failure_reschedules_item() -> None:
     sc.update_embedding = AsyncMock(side_effect=_update_embedding)
 
     async def _batch(_texts, _cfg):
-        return [[0.1] * 768, [0.2] * 768]
+        return [[0.1] * VECTOR_DIM, [0.2] * VECTOR_DIM]
 
     def _fake_detect(*args, **_kwargs):
         async def _noop() -> None:
@@ -828,8 +829,8 @@ async def test_bulk_reembed_respects_existing_embedding_per_item() -> None:
     their fresh batch-computed embedding written."""
     from core_api.services import memory_service
 
-    hint_enhanced = [0.9] * 768  # already written by _enrich_memory_background
-    fresh = [0.1] * 768          # what the bulk batch call returns
+    hint_enhanced = [0.9] * VECTOR_DIM  # already written by _enrich_memory_background
+    fresh = [0.1] * VECTOR_DIM          # what the bulk batch call returns
 
     # mem_a: enrichment already wrote an embedding (race guard should fire)
     # mem_b: still NULL (normal path should fire)
@@ -894,7 +895,7 @@ async def test_bulk_reembed_falls_back_on_length_mismatch() -> None:
     async def _short_batch(texts, _cfg):
         # Provider returned 2 embeddings for 5 inputs — real-world shape
         # when a provider partial-fails mid-batch.
-        return [[0.1] * 768 for _ in texts[:2]]
+        return [[0.1] * VECTOR_DIM for _ in texts[:2]]
 
     sc = MagicMock()
     sc.get_memory = AsyncMock(return_value={"id": "m", "deleted_at": None, "fleet_id": "f"})

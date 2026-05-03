@@ -55,3 +55,9 @@ class FakeEmbeddingProvider:
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         """Generate deterministic embeddings for multiple texts."""
         return [fake_embedding(t) for t in texts]
+
+    # Deliberately does NOT implement ``embed_query`` —
+    # ``FakeEmbeddingProvider`` is symmetric by design (deterministic hash).
+    # The query path falls back to :meth:`embed` via the
+    # ``hasattr(provider, "embed_query")`` check in
+    # :func:`common.embedding._service.get_query_embedding`.

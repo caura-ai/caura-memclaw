@@ -23,7 +23,8 @@ real token and the writer's ``--no-allow-unauthenticated`` accepts it.
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
@@ -215,6 +216,104 @@ async def update_memory_embedding(
         return
     # 5xx / 429 / network → raise → consumer nacks → Pub/Sub redelivers.
     resp.raise_for_status()
+
+
+@dataclass(frozen=True)
+class NullEmbeddingRow:
+    """Identifiers for one memory row that needs re-embedding.
+
+    Carries only the fields needed to address a follow-up
+    ``GET /memories/{id}`` fetch. Raw ``content`` / ``content_hash``
+    are NOT included — the listing endpoint deliberately returns
+    ids-only (defence-in-depth on the unauthenticated storage API),
+    and the worker fetches content per row before publishing.
+    """
+
+    memory_id: UUID
+    tenant_id: str
+
+
+async def iter_memories_with_null_embedding(
+    client: httpx.AsyncClient,
+    *,
+    tenant_id: str,
+    batch_size: int = 500,
+) -> AsyncIterator[list[NullEmbeddingRow]]:
+    """Paginate memories whose ``embedding IS NULL`` for one tenant.
+
+    Yields lists of up to *batch_size* rows so the caller can publish
+    events in batches and apply backpressure. Stops when the storage
+    API reports an empty page.
+
+    Idempotent under restart: each call re-queries from the start, but
+    rows the consumer has since embedded are no longer NULL and are
+    skipped naturally by the storage-side filter.
+
+    Transient HTTP errors propagate — the operator-driven CLI prefers
+    a loud failure over a silent partial-scan.
+
+    ``tenant_id`` is **required**. The storage-API endpoint refuses
+    un-scoped requests because the OSS API has no auth middleware.
+    For whole-deployment scans, iterate the tenant list and call once
+    per tenant.
+    """
+    after: str | None = None
+    while True:
+        params: dict[str, Any] = {"limit": batch_size, "tenant_id": tenant_id}
+        if after is not None:
+            params["after"] = after
+        resp = await _signed_call(
+            client.get,
+            f"{_PREFIX}/memories/null-embedding-ids",
+            params=params,
+        )
+        resp.raise_for_status()
+        page = resp.json()
+        rows_payload = page.get("rows") or []
+        if not rows_payload:
+            # Endpoint contract: when ``rows`` is non-empty,
+            # ``next_after`` is always a UUID string (the last row's
+            # id). When ``rows`` is empty, we're done — no need for a
+            # secondary ``next_after is None`` check, which used to
+            # follow the yield below but was unreachable under the
+            # contract.
+            return
+        yield [
+            NullEmbeddingRow(
+                memory_id=UUID(r["id"]),
+                tenant_id=r["tenant_id"],
+            )
+            for r in rows_payload
+        ]
+        after = page["next_after"]
+
+
+async def get_memory(
+    client: httpx.AsyncClient,
+    *,
+    memory_id: UUID,
+    tenant_id: str,
+) -> dict:
+    """Fetch a single memory by id, scoped to ``tenant_id``.
+
+    Used by the embedding backfill worker to retrieve ``content`` +
+    ``content_hash`` after the listing endpoint hands it an id. The
+    listing path deliberately returns ids-only so this round-trip
+    here is the only place raw memory content is exposed over the
+    HTTP boundary, on a per-row basis (rate-limitable, audit-loggable
+    if the storage API later adds auth middleware).
+
+    Raises ``HTTPStatusError`` on 404 or any non-2xx — the caller
+    decides whether to skip-and-continue (the row was deleted between
+    listing and fetch) or abort.
+    """
+    resp = await _signed_call(
+        client.get,
+        f"{_PREFIX}/memories/{memory_id}",
+        params={"tenant_id": tenant_id},
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
 async def update_memory_enrichment(

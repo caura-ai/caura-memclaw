@@ -12,6 +12,8 @@ from uuid import uuid4
 
 import pytest
 
+from core_api.constants import VECTOR_DIM
+
 
 # ---------------------------------------------------------------------------
 # 1. Auto-chunk child visibility inheritance
@@ -178,7 +180,7 @@ class TestContradictionVisibilityScoping:
         mock_result.all.return_value = []
         mock_db.execute = AsyncMock(return_value=mock_result)
 
-        embedding = [0.1] * 768
+        embedding = [0.1] * VECTOR_DIM
         await memory_repo.find_similar_candidates(mock_db, new_memory, embedding)
 
         # Inspect the compiled SQL statement passed to db.execute
@@ -219,7 +221,7 @@ class TestContradictionVisibilityScoping:
             "core_api.services.contradiction_detector.get_storage_client",
             return_value=mock_sc,
         ):
-            embedding = [0.1] * 768
+            embedding = [0.1] * VECTOR_DIM
             await _detect(new_memory, embedding)
 
         # Verify the RDF path was invoked (single-value predicate)
@@ -292,7 +294,7 @@ class TestSupersessionFirstMatchOnly:
             "core_api.services.contradiction_detector.get_storage_client",
             return_value=mock_sc,
         ):
-            embedding = [0.1] * 768
+            embedding = [0.1] * VECTOR_DIM
             contradictions = await _detect(new_memory, embedding)
 
         # Should find 2 contradictions
@@ -365,7 +367,7 @@ class TestSupersessionFirstMatchOnly:
             new_callable=AsyncMock,
             return_value=True,
         ):
-            embedding = [0.1] * 768
+            embedding = [0.1] * VECTOR_DIM
             contradictions = await _detect(new_memory, embedding)
 
         assert len(contradictions) == 2

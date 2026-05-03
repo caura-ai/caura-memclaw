@@ -75,3 +75,9 @@ class VertexEmbeddingProvider:
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         """Generate embedding vectors for multiple texts in one call."""
         return await asyncio.to_thread(self._embed_batch_sync, texts)
+
+    # Deliberately does NOT implement ``embed_query`` — Vertex's
+    # ``TextEmbeddingModel`` does not currently expose an instruction-aware
+    # mode in the SDK shape we use. The query path falls back to
+    # :meth:`embed` via the ``hasattr(provider, "embed_query")`` check in
+    # :func:`common.embedding._service.get_query_embedding`.

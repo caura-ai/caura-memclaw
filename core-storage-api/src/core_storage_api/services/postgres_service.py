@@ -1307,6 +1307,72 @@ class PostgresService:
     # F) Crystallizer hygiene
     # ------------------------------------------------------------------
 
+    async def memory_list_null_embedding_rows(
+        self,
+        *,
+        limit: int,
+        after: UUID | None = None,
+        tenant_id: str | None = None,
+    ) -> tuple[list[tuple[UUID, str]], int]:
+        """Page through memories whose ``embedding IS NULL``.
+
+        Returns ``(rows, total_remaining)``. Each row carries only the
+        identifiers the caller needs to address a follow-up fetch
+        (``id, tenant_id``). The raw ``content`` and ``content_hash``
+        are NOT included — the worker uses ``GET /memories/{id}`` per
+        row to retrieve them. This keeps the listing endpoint's
+        response small + deterministic and avoids leaking full memory
+        content via what is essentially an unauthenticated id scan
+        (the storage API has no auth middleware; see Spec I in
+        ``local_emb_res/specs/``). Cursor-style on ``id`` for stable
+        resumability under the consumer's concurrent writes flipping
+        rows from NULL to non-NULL.
+
+        ``deleted_at`` rows are excluded — re-embedding them is wasted
+        work since they're already filtered out of every read path.
+
+        ``total_remaining`` is an exact ``COUNT(*)`` of *all* rows still
+        matching the embedding-NULL + deleted-at + (optional) tenant
+        filter — i.e. it uses ``base_filters``, not ``page_filters``. The
+        cursor (``after``) is paging-only state; including it in the
+        count would shrink the reported total as the backfill walks
+        forward, which is the wrong number for the caller to drive
+        progress UI / completion logging on. Acceptable on tables up to
+        a few million rows; revisit with ``pg_class.reltuples`` if it
+        shows up in operator profiles.
+        """
+        async with get_session() as session:
+            base_filters = [
+                Memory.embedding.is_(None),
+                Memory.deleted_at.is_(None),
+            ]
+            if tenant_id is not None:
+                base_filters.append(Memory.tenant_id == tenant_id)
+
+            page_filters = list(base_filters)
+            if after is not None:
+                page_filters.append(Memory.id > after)
+
+            stmt = (
+                select(
+                    Memory.id,
+                    Memory.tenant_id,
+                )
+                .where(*page_filters)
+                .order_by(Memory.id)
+                .limit(limit)
+            )
+            rows = (await session.execute(stmt)).all()
+
+            total_remaining = (
+                await session.execute(select(func.count()).select_from(Memory).where(*base_filters))
+            ).scalar_one()
+
+            return (
+                [(r[0], r[1]) for r in rows],
+                int(total_remaining),
+            )
+
     async def memory_find_missing_embeddings(
         self,
         tenant_id: str,

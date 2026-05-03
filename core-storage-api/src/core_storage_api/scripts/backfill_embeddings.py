@@ -1,0 +1,426 @@
+"""Re-embed memories and entities whose embedding is NULL.
+
+Companion to alembic migration 012_vector_dim_1024. After 012 NULLs every
+existing 768-dim embedding (pgvector cannot widen a vector column in
+place), this script walks the relevant rows and re-embeds each via the
+configured embedding provider — typically the same hosted OpenAI account
+the deployment was already using, just now producing 1024-dim vectors via
+the SDK's ``dimensions=`` parameter.
+
+Standalone CLI (no event bus, no core-worker required). For OSS docker-
+compose deployments this is the recommended eager backfill path. For
+enterprise / multi-tenant production cutovers, prefer the event-driven
+backfill task in core-worker (see ``local_emb_res/specs/C-backfill-task-pr.md``).
+
+Idempotent and restartable: the WHERE clauses filter to rows with NULL
+embeddings, so a partial run can be resumed by simply re-running the
+command — already-embedded rows are skipped naturally.
+
+⚠ **Single-provider only — does NOT honour per-tenant embedding configs.**
+
+This CLI calls ``common.embedding.get_embedding(content)`` without a
+``tenant_config`` argument, which means every row — regardless of its
+``tenant_id`` — is re-embedded against the **process-level** embedding
+provider resolved from environment variables (``EMBEDDING_PROVIDER``,
+``OPENAI_*``, ``OPENAI_EMBEDDING_*``). On a multi-tenant deployment
+where individual tenants have overridden the embedding provider /
+model / base_url via ``tenant_config``, this script will silently
+re-embed those rows against the wrong provider, producing vectors
+that are **inconsistent with the rest of the tenant's data** in the
+shared embedding space. Cross-tenant search quality and per-tenant
+recall will both degrade.
+
+Threading per-tenant ``tenant_config`` here would require resolving
+each row's tenant config (DB lookup or proxy call) inside the embed
+loop, which conflicts with the "standalone, no service deps" design
+goal of this CLI.
+
+If your deployment uses per-tenant embedding overrides, **stop and
+use the event-driven backfill task in core-worker instead**:
+
+    docker compose run --rm core-worker \\
+        python -m core_worker.cli backfill-embeddings
+
+That path publishes ``EMBED_REQUESTED`` events and lets the regular
+embed worker resolve ``tenant_config`` per row, exactly matching the
+hot path. Use the ``--tenant-id`` flag below only to **scope** the
+scan to one tenant — it does not change which embedding provider
+runs the call.
+
+Usage:
+    # Run inside the docker-compose stack so envs are wired up correctly.
+    docker compose run --rm core-storage-api \\
+        python -m core_storage_api.scripts.backfill_embeddings
+
+    # Dry-run first to estimate scope (does not call OpenAI / write DB):
+    docker compose run --rm core-storage-api \\
+        python -m core_storage_api.scripts.backfill_embeddings --dry-run
+
+    # Per-tenant phasing for prod cutover safety:
+    python -m core_storage_api.scripts.backfill_embeddings --tenant-id tenant-abc
+
+Scope:
+- ``memories.embedding`` — re-embedded from ``memories.content``.
+- ``entities.name_embedding`` — re-embedded from ``entities.canonical_name``.
+- ``documents.embedding`` — NOT handled. Documents store opaque JSON and
+  the original embed source is the user-configured ``embed_field``; the
+  per-doc ``embed_field`` isn't recorded in the row. Treat documents as
+  lazy (re-write the doc with the same ``embed_field`` to re-embed) or
+  use a custom script.
+
+Exit codes:
+    0  Backfill completed (or dry-run completed).
+    1  Configuration error (missing env, DB unreachable, etc).
+    2  Embedding provider returned None on too many rows in a row
+       (probable degradation; surface and stop).
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import dataclasses
+import logging
+import os
+import sys
+import time
+import uuid
+from collections.abc import AsyncIterator
+
+logger = logging.getLogger(__name__)
+
+
+# Stop the loop if too many consecutive embed calls return None.
+# ``get_embedding`` returns None only after exhausting its retry budget,
+# so a streak of Nones means the provider is meaningfully degraded
+# rather than blipping. Better to halt and let the operator escalate
+# than to spend the next hour writing nothing.
+_MAX_CONSECUTIVE_NONES = 20
+
+
+@dataclasses.dataclass
+class _TableSpec:
+    table: str
+    embedding_column: str
+    content_column: str
+    # Whether this table soft-deletes rows via a ``deleted_at`` timestamp
+    # column. When True, the scan filter excludes soft-deleted rows so we
+    # don't waste embed calls (and provider quota) on tombstones — keeps
+    # the scope consistent with ``postgres_service.memory_list_null_embedding_rows``
+    # and the ``/null-embedding-ids`` endpoint that the event-driven
+    # backfill task uses. ``entities`` does not have a ``deleted_at``
+    # column.
+    has_deleted_at: bool = False
+
+
+_TARGETS: tuple[_TableSpec, ...] = (
+    _TableSpec(
+        table="memories",
+        embedding_column="embedding",
+        content_column="content",
+        has_deleted_at=True,
+    ),
+    _TableSpec(
+        table="entities",
+        embedding_column="name_embedding",
+        content_column="canonical_name",
+    ),
+)
+
+
+@dataclasses.dataclass
+class BackfillReport:
+    table: str
+    scanned: int
+    embedded: int
+    skipped_empty_content: int
+    none_returns: int
+    elapsed_s: float
+
+
+async def _iter_null_rows(
+    engine,
+    spec: _TableSpec,
+    *,
+    tenant_id: str | None,
+    batch_size: int,
+) -> AsyncIterator[list[tuple[uuid.UUID, str]]]:
+    """Yield batches of (id, content) for rows where the embedding is NULL.
+
+    Cursor-style pagination on ``id`` for stable resumability — the
+    consumer's writes flip ``embedding`` from NULL to non-NULL, so on a
+    re-run the same page-after-id may yield fewer rows but never
+    duplicates.
+    """
+    from sqlalchemy import text
+
+    after: uuid.UUID | None = None
+    while True:
+        params: dict = {"limit": batch_size}
+        sql = f"SELECT id, {spec.content_column} FROM {spec.table} WHERE {spec.embedding_column} IS NULL "
+        # Skip soft-deleted rows on tables that have ``deleted_at`` —
+        # consistent with ``memory_list_null_embedding_rows`` and the
+        # event-driven backfill task; otherwise we'd burn provider
+        # quota re-embedding tombstones that nothing reads.
+        if spec.has_deleted_at:
+            sql += "AND deleted_at IS NULL "
+        if tenant_id is not None:
+            sql += "AND tenant_id = :tenant_id "
+            params["tenant_id"] = tenant_id
+        if after is not None:
+            sql += "AND id > :after "
+            params["after"] = after
+        sql += "ORDER BY id LIMIT :limit"
+        async with engine.connect() as conn:
+            result = await conn.execute(text(sql), params)
+            rows = result.all()
+        if not rows:
+            return
+        yield [(row[0], row[1]) for row in rows]
+        after = rows[-1][0]
+
+
+async def _backfill_one_table(
+    engine,
+    spec: _TableSpec,
+    *,
+    tenant_id: str | None,
+    batch_size: int,
+    max_inflight: int,
+    dry_run: bool,
+) -> BackfillReport:
+    from sqlalchemy import text
+
+    from common.embedding import get_embedding
+
+    sem = asyncio.Semaphore(max_inflight)
+    started = time.monotonic()
+    scanned = embedded = skipped_empty = none_returns = 0
+    consecutive_nones = 0
+    none_lock = asyncio.Lock()
+
+    async def _embed_and_write(row_id: uuid.UUID, content: str | None) -> None:
+        nonlocal embedded, skipped_empty, none_returns, consecutive_nones
+        if not content:
+            # Defensive: ``content`` is NOT NULL on memories but is
+            # technically nullable on entities' canonical_name? No,
+            # canonical_name is also NOT NULL. Still — empty string is
+            # possible, and ``get_embedding("")`` is provider-dependent.
+            # Skip rather than ship a degenerate vector.
+            skipped_empty += 1
+            return
+        async with sem:
+            if dry_run:
+                # Count what would have been done without calling out.
+                embedded += 1
+                return
+            vec = await get_embedding(content)
+            if vec is None:
+                async with none_lock:
+                    none_returns += 1
+                    consecutive_nones += 1
+                    if consecutive_nones >= _MAX_CONSECUTIVE_NONES:
+                        raise RuntimeError(
+                            f"Embedding provider returned None on "
+                            f"{_MAX_CONSECUTIVE_NONES} consecutive rows; "
+                            "stopping. Check OPENAI_API_KEY validity, "
+                            "rate-limit headroom, and the registry warnings "
+                            "logged at startup."
+                        )
+                return
+            async with none_lock:
+                consecutive_nones = 0
+            async with engine.connect() as conn:
+                # Pass the raw ``list[float]`` — asyncpg's pgvector codec
+                # (registered globally via ``register_vector`` on the
+                # async engine) serializes the list to pgvector's binary
+                # representation. Using ``str(vec)`` would force pgvector
+                # to re-parse a Python repr (``'[0.1, 0.2, ...]'``) and
+                # crashes when the codec is registered, since the codec
+                # then expects a sequence.
+                await conn.execute(
+                    text(f"UPDATE {spec.table} SET {spec.embedding_column} = :emb WHERE id = :id"),
+                    {"emb": vec, "id": row_id},
+                )
+                await conn.commit()
+            embedded += 1
+
+    async for batch in _iter_null_rows(engine, spec, tenant_id=tenant_id, batch_size=batch_size):
+        scanned += len(batch)
+        await asyncio.gather(*(_embed_and_write(rid, c) for rid, c in batch))
+        logger.info(
+            "backfill[%s] progress: scanned=%d embedded=%d empty=%d none=%d",
+            spec.table,
+            scanned,
+            embedded,
+            skipped_empty,
+            none_returns,
+        )
+
+    return BackfillReport(
+        table=spec.table,
+        scanned=scanned,
+        embedded=embedded,
+        skipped_empty_content=skipped_empty,
+        none_returns=none_returns,
+        elapsed_s=time.monotonic() - started,
+    )
+
+
+async def run_backfill(
+    *,
+    tenant_id: str | None,
+    batch_size: int,
+    max_inflight: int,
+    dry_run: bool,
+    only_table: str | None = None,
+) -> list[BackfillReport]:
+    """Walk every NULL-embedding row in the targeted tables and re-embed.
+
+    Returns one ``BackfillReport`` per table processed.
+
+    Per-tenant embedding providers are NOT honoured — see the module
+    docstring's warning. ``tenant_id`` here scopes the SQL scan, not
+    the embedding-provider resolution; every row is embedded against
+    the process-level provider (``EMBEDDING_PROVIDER`` env, etc.).
+    Multi-tenant deployments with per-tenant overrides must use the
+    event-driven backfill task in ``core-worker`` instead.
+    """
+    from core_storage_api.database.init import get_engine
+
+    engine = get_engine()
+    reports: list[BackfillReport] = []
+    for spec in _TARGETS:
+        if only_table is not None and spec.table != only_table:
+            continue
+        logger.info(
+            "backfill[%s] starting (tenant=%s, batch=%d, max_inflight=%d, dry_run=%s)",
+            spec.table,
+            tenant_id,
+            batch_size,
+            max_inflight,
+            dry_run,
+        )
+        report = await _backfill_one_table(
+            engine,
+            spec,
+            tenant_id=tenant_id,
+            batch_size=batch_size,
+            max_inflight=max_inflight,
+            dry_run=dry_run,
+        )
+        reports.append(report)
+        logger.info(
+            "backfill[%s] done: scanned=%d embedded=%d empty=%d none=%d elapsed=%.1fs",
+            spec.table,
+            report.scanned,
+            report.embedded,
+            report.skipped_empty_content,
+            report.none_returns,
+            report.elapsed_s,
+        )
+    return reports
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="core_storage_api.scripts.backfill_embeddings")
+    p.add_argument(
+        "--tenant-id",
+        default=None,
+        help=(
+            "Restrict the SQL scan to a single tenant id. NOTE: this scopes "
+            "the rows scanned; it does NOT switch the embedding provider to "
+            "the tenant's per-tenant config. Multi-tenant deployments with "
+            "per-tenant provider overrides must use the core-worker "
+            "event-driven backfill task instead — see module docstring."
+        ),
+    )
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=500,
+        help="Rows per pagination page. Default 500.",
+    )
+    p.add_argument(
+        "--max-inflight",
+        type=int,
+        default=50,
+        help="Concurrent embed calls. Default 50. Tune down if hitting "
+        "OpenAI rate limits, up if rate-limit headroom allows.",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Count rows that would be re-embedded; don't call the embedding provider or write to the DB.",
+    )
+    p.add_argument(
+        "--only-table",
+        choices=[s.table for s in _TARGETS],
+        default=None,
+        help="Limit to a single table (memories or entities). Default: both.",
+    )
+    p.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+    return p
+
+
+async def _amain(argv: list[str]) -> int:
+    args = _build_parser().parse_args(argv)
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+    )
+
+    # Sanity: does an embedding provider key resolve to anything?
+    if not os.environ.get("OPENAI_API_KEY") and (os.environ.get("EMBEDDING_PROVIDER", "fake") in ("openai",)):
+        logger.error(
+            "EMBEDDING_PROVIDER=openai but OPENAI_API_KEY is unset. "
+            "Set the key or change the provider before running backfill."
+        )
+        return 1
+
+    try:
+        reports = await run_backfill(
+            tenant_id=args.tenant_id,
+            batch_size=args.batch_size,
+            max_inflight=args.max_inflight,
+            dry_run=args.dry_run,
+            only_table=args.only_table,
+        )
+    except RuntimeError as e:
+        # Reserved for the "degraded provider" abort path (20 consecutive
+        # None returns from get_embedding) — tells operator monitoring
+        # this is provider-side, not local config.
+        logger.error("backfill aborted: %s", e)
+        return 2
+    except Exception as e:
+        # Anything else (DB unreachable, registry misconfig surfacing as
+        # ValueError, an asyncio cancellation, etc.) — exit 1 with a
+        # stack trace so the failure is debuggable but the script's
+        # exit code distinguishes it from the provider-degraded case.
+        logger.error(
+            "backfill aborted (configuration or unexpected error): %s",
+            e,
+            exc_info=True,
+        )
+        return 1
+
+    total_scanned = sum(r.scanned for r in reports)
+    total_embedded = sum(r.embedded for r in reports)
+    print(
+        f"backfill {'dry-run ' if args.dry_run else ''}done: "
+        f"scanned={total_scanned} embedded={total_embedded} "
+        f"({len(reports)} table(s))"
+    )
+    return 0
+
+
+def main() -> None:
+    sys.exit(asyncio.run(_amain(sys.argv[1:])))
+
+
+if __name__ == "__main__":
+    main()

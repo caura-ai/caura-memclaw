@@ -1,7 +1,10 @@
 """DB-query constants shared between core-api and core-storage-api."""
 
 # ── Embeddings ──
-VECTOR_DIM = 768
+# Native dim of the default embedder (BAAI/bge-m3, see local-embedder docs).
+# Schema upgrade lives in alembic migration 012_vector_dim_1024.py — keep
+# this constant in lock-step with that migration.
+VECTOR_DIM = 1024
 
 # ── Write-time semantic dedup ──
 SEMANTIC_DEDUP_THRESHOLD = 0.95  # cosine similarity above this -> near-duplicate

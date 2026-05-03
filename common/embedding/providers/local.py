@@ -86,3 +86,10 @@ class LocalEmbedding:
             lambda: self._model.encode(texts, normalize_embeddings=True, batch_size=32),
         )
         return vecs.tolist()
+
+    # Deliberately does NOT implement ``embed_query`` — sentence-
+    # transformers models served here (default ``BAAI/bge-base-en-v1.5``)
+    # are symmetric encoders with no query-side instruction prefix. The
+    # query path falls back to :meth:`embed` via the
+    # ``hasattr(provider, "embed_query")`` check in
+    # :func:`common.embedding._service.get_query_embedding`.

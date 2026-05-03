@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from core_api.constants import VECTOR_DIM
 from core_api.pipeline.context import PipelineContext
 from core_api.pipeline.steps.write.parallel_embed_enrich import ParallelEmbedEnrich
 from core_api.pipeline.steps.write.schedule_background_tasks import (
@@ -78,7 +79,7 @@ def _ctx(
         "input": data or _input(),
         "content_hash": "f" * 64,
         "memory": {"id": memory_id or uuid.uuid4()},
-        "embedding": [0.1] * 768,
+        "embedding": [0.1] * VECTOR_DIM,
         "resolved_write_mode": write_mode,
     }
     if cached_embedding is not None:
@@ -108,7 +109,7 @@ async def test_skips_inline_enrich_when_flag_off() -> None:
         ),
         patch(
             "core_api.pipeline.steps.write.parallel_embed_enrich.get_embedding",
-            new=AsyncMock(return_value=[0.0] * 768),
+            new=AsyncMock(return_value=[0.0] * VECTOR_DIM),
         ),
         patch(
             "core_api.services.memory_enrichment.enrich_memory",
@@ -135,7 +136,7 @@ async def test_runs_inline_enrich_when_flag_on() -> None:
         ),
         patch(
             "core_api.pipeline.steps.write.parallel_embed_enrich.get_embedding",
-            new=AsyncMock(return_value=[0.1] * 768),
+            new=AsyncMock(return_value=[0.1] * VECTOR_DIM),
         ),
         patch("core_api.services.memory_enrichment.enrich_memory", new=_enrich),
     ):
@@ -148,7 +149,7 @@ async def test_hint_reembed_skipped_when_enrich_flag_off() -> None:
     means the hint isn't available; back-channel ENRICHED consumer can
     pick it up later if high-value."""
     ctx = _ctx(enrichment=True)
-    embed_spy = AsyncMock(return_value=[0.1] * 768)
+    embed_spy = AsyncMock(return_value=[0.1] * VECTOR_DIM)
     with (
         patch(
             "core_api.pipeline.steps.write.parallel_embed_enrich.settings.enrich_on_hot_path",

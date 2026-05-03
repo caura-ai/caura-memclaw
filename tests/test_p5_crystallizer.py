@@ -23,6 +23,7 @@ from core_api.constants import (
     CRYSTALLIZER_DEDUP_NEIGHBORS,
     CRYSTALLIZER_DEDUP_THRESHOLD,
     CRYSTALLIZER_MAX_DEDUP_PAIRS,
+    VECTOR_DIM,
 )
 
 
@@ -181,7 +182,7 @@ class TestBatchANNIntegration:
         )
 
     @staticmethod
-    def _fake_embedding(seed: str, dim: int = 768) -> list[float]:
+    def _fake_embedding(seed: str, dim: int = VECTOR_DIM) -> list[float]:
         """Deterministic embedding from seed string."""
         import hashlib
         import struct
