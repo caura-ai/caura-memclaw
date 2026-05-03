@@ -11,6 +11,7 @@ import pytest
 from sqlalchemy import select
 
 from common.models.memory import Memory
+from core_api.constants import VECTOR_DIM
 from core_api.schemas import MemoryCreate, MemoryOut
 
 # Ensure pipeline flag is off for legacy path tests
@@ -373,7 +374,7 @@ async def test_schedule_background_tasks_fast_mode_fires_background_enrichment()
         data={
             "input": _make_input(),
             "memory": mock_memory,
-            "embedding": [0.1] * 768,
+            "embedding": [0.1] * VECTOR_DIM,
             "resolved_write_mode": "fast",
         },
         tenant_config=mock_config,
@@ -412,7 +413,7 @@ async def test_schedule_background_tasks_strong_mode_fires_entity_and_contradict
         data={
             "input": _make_input(),
             "memory": mock_memory,
-            "embedding": [0.1] * 768,
+            "embedding": [0.1] * VECTOR_DIM,
             "resolved_write_mode": "strong",
         },
         tenant_config=mock_config,

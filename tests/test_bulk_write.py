@@ -16,7 +16,7 @@ from uuid import uuid4
 
 import pytest
 
-from core_api.constants import BULK_MAX_ITEMS, DEFAULT_MEMORY_WEIGHT
+from core_api.constants import BULK_MAX_ITEMS, DEFAULT_MEMORY_WEIGHT, VECTOR_DIM
 from core_api.schemas import (
     BulkItemResult,
     BulkMemoryCreate,
@@ -138,7 +138,7 @@ class TestBatchEmbedding:
         config.embedding_provider = "fake"
         results = await get_embeddings_batch(texts, config)
         assert len(results) == 3
-        assert all(len(e) == 768 for e in results)
+        assert all(len(e) == VECTOR_DIM for e in results)
 
     @pytest.mark.asyncio
     async def test_batch_matches_single(self):

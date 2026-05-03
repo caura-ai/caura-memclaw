@@ -34,7 +34,7 @@ except ImportError:
         pass  # type: ignore[misc]
 
 
-from common.embedding import get_embedding, get_embeddings_batch
+from common.embedding import get_embedding, get_embeddings_batch, get_query_embedding
 from common.events import publish_memory_embed_request, publish_memory_enrich_request
 from core_api.constants import (
     BULK_EMBEDDING_TIMEOUT_SECONDS,
@@ -2584,7 +2584,14 @@ async def _get_or_cache_embedding(query: str, tenant_id: str, tenant_config):
             return json.loads(_cached_raw)
         except (ValueError, TypeError):
             pass
-    embedding = await asyncio.wait_for(get_embedding(query, tenant_config), timeout=10.0)
+    # Search-side embed uses the instruction-aware path. For symmetric
+    # models (OpenAI, bge, snowflake-m, gte-en-v1.5) this is identical to
+    # ``get_embedding(query, tenant_config)``. For instruction-aware models
+    # (Qwen3-Embedding, e5-instruct), the provider prepends the configured
+    # task instruction (env: ``EMBEDDING_QUERY_INSTRUCTION``) so the query
+    # is encoded with the same instruction prefix the model was trained on.
+    # Documents (writes) embed unmodified text.
+    embedding = await asyncio.wait_for(get_query_embedding(query, tenant_config), timeout=10.0)
     if embedding is None:
         raise ValueError("Embedding service unavailable")
     await cache_set(_cache_key, json.dumps(embedding), ttl=EMBEDDING_CACHE_TTL)

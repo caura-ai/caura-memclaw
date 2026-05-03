@@ -117,11 +117,27 @@ services:
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      # Embedder experiment (A.5) — local TEI sidecar overrides
+      OPENAI_EMBEDDING_BASE_URL: "${OPENAI_EMBEDDING_BASE_URL:-}"
+      OPENAI_EMBEDDING_SEND_DIMENSIONS: "${OPENAI_EMBEDDING_SEND_DIMENSIONS:-true}"
+      OPENAI_EMBEDDING_MODEL: "${OPENAI_EMBEDDING_MODEL:-}"
+      # Option B (instruction-aware query encoding) and Matryoshka truncation.
+      # Default instruction applied to all /api/v1/search calls; ingest path
+      # unchanged. Truncate-to-dim lets us run native-1024/2560/4096-dim models
+      # against an unchanged 768-dim schema (Qwen3-Embedding family with MRL).
+      EMBEDDING_QUERY_INSTRUCTION: "${EMBEDDING_QUERY_INSTRUCTION:-}"
+      OPENAI_EMBEDDING_TRUNCATE_TO_DIM: "${OPENAI_EMBEDDING_TRUNCATE_TO_DIM:-}"
+      EMBEDDING_PROVIDER: "${EMBEDDING_PROVIDER:-fake}"
+      ENTITY_EXTRACTION_PROVIDER: "${ENTITY_EXTRACTION_PROVIDER:-fake}"
+      USE_LLM_FOR_MEMORY_CREATION: "${USE_LLM_FOR_MEMORY_CREATION:-false}"
     depends_on:
       core-storage-api:
         condition: service_healthy
       redis:
         condition: service_healthy
+      tei:
+        condition: service_healthy
+        required: false  # only enforced when --profile embed-local is active
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
       interval: 15s
@@ -129,6 +145,31 @@ services:
       retries: 3
       start_period: 15s
 
+  # ── Local Embedder (opt-in via ``--profile embed-local``) ───────
+  # See docker-compose.yml for the full block + comments. This dev
+  # variant is identical so that ``--profile embed-local`` works the
+  # same way against the hot-reload stack.
+
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:${TEI_IMAGE_TAG:-cpu-1.7}
+    profiles: ["embed-local"]
+    command:
+      - --model-id
+      - "${TEI_MODEL_ID:-BAAI/bge-m3}"
+      - --auto-truncate
+    environment:
+      HUGGINGFACE_HUB_CACHE: /data
+    volumes:
+      - tei_cache:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    # See docker-compose.yml for the optional GPU deploy block.
+
 volumes:
   pgdata:
   redis_data:
+  tei_cache:

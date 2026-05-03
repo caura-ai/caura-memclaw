@@ -35,6 +35,7 @@ from core_api.constants import (
     CRYSTALLIZER_DEDUP_THRESHOLD,
     SEMANTIC_DEDUP_CANDIDATE_LIMIT,
     SEMANTIC_DEDUP_THRESHOLD,
+    VECTOR_DIM,
 )
 from common.embedding import fake_embedding
 
@@ -96,7 +97,7 @@ class TestFindSemanticDuplicateMocked:
 
         with patch("core_api.services.memory_service.get_storage_client", return_value=mock_sc):
             result = await _find_semantic_duplicate(
-                None, "tenant-1", None, [0.1] * 768,
+                None, "tenant-1", None, [0.1] * VECTOR_DIM,
             )
         assert result is None
 
@@ -110,7 +111,7 @@ class TestFindSemanticDuplicateMocked:
 
         with patch("core_api.services.memory_service.get_storage_client", return_value=mock_sc):
             result = await _find_semantic_duplicate(
-                None, "tenant-1", None, [0.1] * 768,
+                None, "tenant-1", None, [0.1] * VECTOR_DIM,
             )
         assert result is mock_memory
 
@@ -124,7 +125,7 @@ class TestFindSemanticDuplicateMocked:
 
         with patch("core_api.services.memory_service.get_storage_client", return_value=mock_sc):
             await _find_semantic_duplicate(
-                None, "tenant-1", "fleet-a", [0.1] * 768,
+                None, "tenant-1", "fleet-a", [0.1] * VECTOR_DIM,
             )
 
         call_data = mock_sc.find_semantic_duplicate.call_args[0][0]
@@ -141,7 +142,7 @@ class TestFindSemanticDuplicateMocked:
         exclude = uuid4()
         with patch("core_api.services.memory_service.get_storage_client", return_value=mock_sc):
             await _find_semantic_duplicate(
-                None, "tenant-1", None, [0.1] * 768, exclude_id=exclude,
+                None, "tenant-1", None, [0.1] * VECTOR_DIM, exclude_id=exclude,
             )
 
         call_data = mock_sc.find_semantic_duplicate.call_args[0][0]

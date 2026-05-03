@@ -406,6 +406,129 @@ The **reader/writer split** is an opt-in topology for high-write-rate deploys th
 
 ---
 
+## Upgrading from v1.x
+
+> **⚠️ v2.0.0 ships a destructive schema migration.** If your installation is on
+> v1.x and has any memories already stored, follow this procedure carefully — the
+> migration NULLs every existing embedding to widen the pgvector column from
+> 768 → 1024 dim. The application is designed to refuse the migration
+> automatically; you must opt in.
+
+### What changes
+
+- Default embedder model: `BAAI/bge-m3` (was: OpenAI `text-embedding-3-small`).
+  Self-hosted via the new `tei` profile in docker-compose; documented in
+  [`docs/local-embedder.md`](docs/local-embedder.md).
+- pgvector schema dim: `vector(1024)` (was: `vector(768)`).
+- Existing embeddings on `memories.embedding`, `entities.name_embedding`, and
+  `documents.embedding` are NULLed by alembic revision `012_vector_dim_1024`.
+  Re-embedding is required; until rows are re-embedded, semantic search returns
+  no results for those rows.
+
+### Procedure (OSS, docker-compose)
+
+1. **Stop the stack** so no writes happen during migration:
+   ```bash
+   docker compose down
+   ```
+
+2. **Snapshot the database.** A `pg_dump` is the safest fallback. Replace
+   `<container>` with the running PostgreSQL container name (typically
+   `caura-memclaw-db-1`):
+   ```bash
+   docker compose up -d db    # bring just the DB back
+   docker exec <container> pg_dump -U memclaw memclaw > backup-pre-v2.sql
+   docker compose down
+   ```
+
+3. **Pull the new image** and start with the migration opt-in env set. The
+   gate enforces an explicit opt-in because the migration is destructive on
+   a populated DB:
+   ```bash
+   docker compose pull
+   MEMCLAW_RUN_DESTRUCTIVE_MIGRATIONS=true docker compose up -d
+   ```
+   The `core-storage-api` container will run `alembic upgrade head` on
+   startup. The migration runs in seconds-to-minutes for typical OSS
+   workloads.
+
+4. **Verify migration completed.** Look for the line
+   `Database initialization complete` in the `core-storage-api` logs:
+   ```bash
+   docker compose logs core-storage-api | grep -i "alembic\|migration"
+   ```
+
+5. **Re-embed your data.** Two paths:
+   - **Lazy** (zero action): the application re-embeds rows on next read or
+     write that touches them. Search will return empty results for cold rows
+     until they are touched. Acceptable for low-traffic personal deployments.
+   - **Eager (recommended):** run the bundled backfill CLI. It walks every
+     memory and entity with a NULL embedding and re-embeds via the configured
+     provider. Idempotent — safe to re-run. First do a dry-run to estimate
+     scope:
+     ```bash
+     docker compose run --rm core-storage-api \
+       python -m core_storage_api.scripts.backfill_embeddings --dry-run
+     ```
+     Then the real run:
+     ```bash
+     docker compose run --rm core-storage-api \
+       python -m core_storage_api.scripts.backfill_embeddings
+     ```
+     Optional knobs: `--tenant-id <id>` (per-tenant cutover), `--batch-size N`,
+     `--max-inflight N`, `--only-table memories|entities`. Documents are NOT
+     covered (their embed-source field is per-row JSON, not a fixed column);
+     re-write any embedded documents to refresh them.
+   - **Eager (event-driven, recommended for multi-tenant production):** if you
+     run the `core-worker` service, drive the existing `EMBED_REQUESTED`
+     consumer instead. The CLI scans `WHERE embedding IS NULL` and publishes
+     one event per row, inheriting per-tenant concurrency + retry + DLQ:
+     ```bash
+     docker compose run --rm core-worker \
+       python -m core_worker.cli backfill-embeddings --dry-run
+     docker compose run --rm core-worker \
+       python -m core_worker.cli backfill-embeddings
+     ```
+     Same knobs as the standalone script (`--tenant-id`, `--batch-size`,
+     `--max-inflight`, `--dry-run`). Currently covers `memories` only.
+
+6. **Once stable, unset `MEMCLAW_RUN_DESTRUCTIVE_MIGRATIONS`** so subsequent
+   `up` commands don't carry the opt-in:
+   ```bash
+   unset MEMCLAW_RUN_DESTRUCTIVE_MIGRATIONS  # if exported in the shell
+   # or remove the line from your .env file
+   ```
+
+### What if I skip the opt-in?
+
+`core-storage-api` will refuse to start, with a clear error message reporting
+how many rows would be NULLed. The container exits non-zero; the rest of the
+stack stays healthy. No data is touched. Set the env var and retry.
+
+### Rolling back
+
+The migration has a symmetric `downgrade()`. To revert, set the env var and
+explicitly downgrade:
+
+```bash
+docker compose run --rm \
+  -e MEMCLAW_RUN_DESTRUCTIVE_MIGRATIONS=true \
+  core-storage-api alembic downgrade 009
+```
+
+This NULLs any 1024-dim embeddings written since the upgrade and widens the
+columns back to `vector(768)`. The same data-loss tradeoff applies in reverse.
+For untouched-since-upgrade installations, the simpler recovery is to restore
+the snapshot from step 2.
+
+### v1.x → v2.x compatibility for client code
+
+No public API changes. Code that reads memory embeddings via the search/recall
+endpoints is unaffected. Client code that hardcodes `768` for vector lengths
+should be updated to read `VECTOR_DIM` from `common.constants`.
+
+---
+
 ## API Reference
 
 All routes are versioned under `/api/v1/`. Interactive Swagger docs at `/api/docs`.

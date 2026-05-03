@@ -37,7 +37,16 @@ async def test_eviction_schedules_aclose_on_evicted_provider(
     aclose_calls: list[tuple[str, str]] = []
 
     class _FakeProvider:
-        def __init__(self, *, api_key: str, model: str) -> None:
+        def __init__(
+            self,
+            *,
+            api_key: str,
+            model: str,
+            base_url: str | None = None,
+            send_dimensions: bool = True,
+            query_instruction: str | None = None,
+            truncate_to_dim: int | None = None,
+        ) -> None:
             self.api_key = api_key
             self.model = model
             self.aclose = AsyncMock(
@@ -46,12 +55,24 @@ async def test_eviction_schedules_aclose_on_evicted_provider(
 
     monkeypatch.setattr(registry_mod, "OpenAIEmbeddingProvider", _FakeProvider)
 
+    # ``_get_or_create_openai_provider`` grew four args after the
+    # local-embedder branch landed (base_url / send_dimensions /
+    # query_instruction / truncate_to_dim). Pass the no-op defaults
+    # here — eviction is keyed on the full tuple so passing identical
+    # extras across both calls keeps the test's intent (different
+    # api_keys → distinct cache slots → first one evicted).
+    _DEFAULTS = dict(
+        base_url=None,
+        send_dimensions=True,
+        query_instruction=None,
+        truncate_to_dim=None,
+    )
     # First insert — no eviction yet.
-    registry_mod._get_or_create_openai_provider("key-A", "model-1")
+    registry_mod._get_or_create_openai_provider("key-A", "model-1", **_DEFAULTS)
     assert aclose_calls == []
 
     # Second insert exceeds cap=1 → evicts (key-A, model-1).
-    registry_mod._get_or_create_openai_provider("key-B", "model-1")
+    registry_mod._get_or_create_openai_provider("key-B", "model-1", **_DEFAULTS)
 
     # Yield to the event loop so the scheduled aclose() task runs.
     import asyncio
@@ -77,7 +98,16 @@ def test_eviction_outside_running_loop_does_not_raise(
     )
 
     class _FakeProvider:
-        def __init__(self, *, api_key: str, model: str) -> None:
+        def __init__(
+            self,
+            *,
+            api_key: str,
+            model: str,
+            base_url: str | None = None,
+            send_dimensions: bool = True,
+            query_instruction: str | None = None,
+            truncate_to_dim: int | None = None,
+        ) -> None:
             self.api_key = api_key
             self.model = model
 
@@ -86,7 +116,13 @@ def test_eviction_outside_running_loop_does_not_raise(
 
     monkeypatch.setattr(registry_mod, "OpenAIEmbeddingProvider", _FakeProvider)
 
-    registry_mod._get_or_create_openai_provider("key-A", "model-1")
+    _DEFAULTS = dict(
+        base_url=None,
+        send_dimensions=True,
+        query_instruction=None,
+        truncate_to_dim=None,
+    )
+    registry_mod._get_or_create_openai_provider("key-A", "model-1", **_DEFAULTS)
     # No event loop running here — the second call triggers eviction
     # and must swallow the RuntimeError from get_running_loop().
-    registry_mod._get_or_create_openai_provider("key-B", "model-1")
+    registry_mod._get_or_create_openai_provider("key-B", "model-1", **_DEFAULTS)

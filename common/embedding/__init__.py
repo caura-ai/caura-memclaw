@@ -4,9 +4,14 @@ Public surface:
 
 * :class:`~common.embedding.protocols.EmbeddingProvider` — async protocol
   every provider implements.
-* :func:`get_embedding` / :func:`get_embeddings_batch` — service-level
-  entrypoints with retry. Backwards-compatible with the prior
-  ``core_api.services.embedding`` module.
+* :class:`~common.embedding.protocols.InstructionAwareEmbedder` — optional
+  protocol for models with asymmetric query/document encoding (Qwen3-class).
+* :func:`get_embedding` / :func:`get_embeddings_batch` /
+  :func:`get_query_embedding` — service-level entrypoints with retry.
+  ``get_query_embedding`` routes through the instruction-aware path when
+  the resolved provider implements ``InstructionAwareEmbedder``, else
+  falls back to :func:`get_embedding`'s symmetric behaviour. Backwards-
+  compatible with the prior ``core_api.services.embedding`` module.
 * :func:`get_embedding_provider` — factory.
 * :func:`init_platform_embedding` / :func:`get_platform_embedding` —
   platform-tier singleton, initialised once at service startup from
@@ -33,8 +38,12 @@ from common.embedding._platform import (
     init_platform_embedding,
 )
 from common.embedding._registry import get_embedding_provider
-from common.embedding._service import get_embedding, get_embeddings_batch
-from common.embedding.protocols import EmbeddingProvider
+from common.embedding._service import (
+    get_embedding,
+    get_embeddings_batch,
+    get_query_embedding,
+)
+from common.embedding.protocols import EmbeddingProvider, InstructionAwareEmbedder
 from common.embedding.providers.fake import (
     FakeEmbeddingProvider,
     fake_embedding,
@@ -43,11 +52,13 @@ from common.embedding.providers.fake import (
 __all__ = [
     "EmbeddingProvider",
     "FakeEmbeddingProvider",
+    "InstructionAwareEmbedder",
     "fake_embedding",
     "get_embedding",
     "get_embedding_provider",
     "get_embeddings_batch",
     "get_platform_embedding",
     "get_platform_init_errors",
+    "get_query_embedding",
     "init_platform_embedding",
 ]
