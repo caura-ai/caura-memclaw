@@ -8,6 +8,15 @@ from [Conventional Commits](https://www.conventionalcommits.org/).
 
 ## [2.0.0](https://github.com/caura-ai/caura-memclaw/compare/v1.0.1...v2.0.0) (2026-05-03)
 
+> ⚠️ **BREAKING CHANGE — local embedder + 1024-dim schema migration.**
+> v2.0.0 introduces a self-hosted embedder profile (`BAAI/bge-m3` via HuggingFace
+> TEI sidecar — see [`docs/local-embedder.md`](docs/local-embedder.md)) and
+> migrates the pgvector schema from 768-dim to 1024-dim (alembic
+> `012_vector_dim_1024`). Existing installations must opt in via
+> `MEMCLAW_RUN_DESTRUCTIVE_MIGRATIONS=true` and re-embed afterward — see
+> [README "Upgrading from v1.x"](README.md#upgrading-from-v1x) for the
+> procedure. Fresh installs are unaffected.
+
 
 ### Features
 
