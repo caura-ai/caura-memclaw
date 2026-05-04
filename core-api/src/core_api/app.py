@@ -55,6 +55,7 @@ from core_api.routes.memories import router as memories_router
 from core_api.routes.plugin import plugin_bootstrap_router
 from core_api.routes.plugin import router as plugin_router
 from core_api.routes.settings import router as settings_router
+from core_api.routes.skills import router as skills_router
 from core_api.routes.stats import router as stats_router
 from core_api.routes.stm import router as stm_router
 
@@ -568,6 +569,7 @@ app.include_router(stats_router, prefix="/api/v1")
 app.include_router(stm_router, prefix="/api/v1")
 app.include_router(insights_router, prefix="/api/v1")
 app.include_router(evolve_router, prefix="/api/v1")
+app.include_router(skills_router, prefix="/api/v1")
 
 # Test-only endpoints (time-warp, etc.) — only registered when TESTING=1
 if _os.getenv("TESTING") == "1":

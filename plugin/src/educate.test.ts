@@ -561,6 +561,8 @@ describe("buildToolsMd", () => {
     "memclaw_insights",
     "memclaw_evolve",
     "memclaw_stats",
+    "memclaw_share_skill",
+    "memclaw_unshare_skill",
   ];
 
   test("lists every plugin-exposed tool", () => {

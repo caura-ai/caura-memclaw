@@ -87,6 +87,38 @@ it's a doc. If you already hold an ID, it's an entity.
 
 Dated, concrete, standalone, atomic, updated (not duplicated).
 
+## Discovering shared skills
+
+Skills are SKILL.md artifacts that agents share across the fleet —
+debugging recipes, ops runbooks, refactor playbooks. Before improvising
+a non-trivial workflow, check the catalog:
+
+```
+GET /skills?query=<natural language>      # semantic search by description
+memclaw_doc op=query collection=skills    # browse by recency / fleet
+memclaw_doc op=read collection=skills doc_id=<name>   # full body
+```
+
+Skill descriptions are auto-embedded so semantic search ("how do I
+research scientific papers?") returns the right skill even when names
+don't match.
+
+Sharing has two modes:
+
+- **Publish-only** (default, `install_on_fleet=false`) — the skill
+  lands in the `skills` catalog and teammates discover it via the
+  query above. Recommended for most shares: low-friction, doesn't
+  touch teammates' filesystems.
+- **Install on fleet** (`install_on_fleet=true`) — also queues an
+  install command per node in `target_fleet_id`; OpenClaw discovers
+  the skill in its palette automatically on next workspace open. Use
+  this only when every agent on the fleet genuinely needs the skill
+  installed (operational runbooks, mandatory workflows).
+
+Built something reusable? Share it back with `memclaw_share_skill` —
+default to publish-only and only set `install_on_fleet=true` when
+mandatory.
+
 ## Session loop
 
 1. Recall — "what is known about this?" / "what happened since last session?"
@@ -147,6 +179,23 @@ Close the loop. `outcome_type` ∈ {success, failure, partial}.
 `related_ids` = the recall IDs you acted on. Success reinforces weights;
 failure auto-creates `rule` memories. Trust 2.
 
+**`memclaw_share_skill(name, description, content, target_fleet_id, install_on_fleet=false, version=1)`**
+Share a SKILL.md. `name` is a slug (`[a-z0-9._-]`, 1-100 chars) used
+as the upsert key and on-disk directory. The `description` field is
+auto-embedded so the skill is discoverable via semantic search.
+Default (`install_on_fleet=false`) publishes to the catalog only —
+recipients discover via `memclaw_doc op=query collection=skills` or
+`GET /skills?query=...`. With `install_on_fleet=true`, also queues
+install commands so every node in `target_fleet_id` materialises the
+skill and OpenClaw picks it up at next workspace open. Trust 1.
+
+**`memclaw_unshare_skill(name, unshare_from_fleet=false, target_fleet_id=?)`**
+Remove a shared skill. Default removes from the catalog only —
+already-installed nodes keep their local copy. With
+`unshare_from_fleet=true` (and a `target_fleet_id`), also queues
+`uninstall_skill` commands per node so plugins delete the local
+SKILL.md (idempotent). Trust 1.
+
 ### Which tool, when
 
 - Might have seen before → `memclaw_recall`
@@ -158,6 +207,9 @@ failure auto-creates `rule` memories. Trust 2.
 - Acted on a recalled memory → `memclaw_evolve`
 - Recall quality off across queries → `memclaw_tune` (once, sticky)
 - Session boundary / orchestrator sweep → `memclaw_insights`
+- Stuck on a non-trivial workflow → search by meaning (`GET /skills?query=...`) or browse (`memclaw_doc op=query collection=skills`) before improvising
+- Built a reusable workflow → `memclaw_share_skill` to teach the fleet
+- Skill is wrong / superseded → `memclaw_unshare_skill` to remove it
 
 ### Constraints that matter
 

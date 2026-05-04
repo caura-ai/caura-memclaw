@@ -27,12 +27,20 @@
     "description": "Find memories by meaning (hybrid semantic+keyword). Set include_brief=true for an LLM summary paragraph. For non-semantic browse use memclaw_list; for read-by-id use memclaw_manage op=read.",
     "stm_only": false
   },
+  "memclaw_share_skill": {
+    "description": "Share a SKILL.md with the fleet. Default publishes to the catalog (memclaw_doc op=query collection=skills); pass install_on_fleet=true to also auto-install on every node in target_fleet_id. Trust ≥ 1.",
+    "stm_only": false
+  },
   "memclaw_stats": {
     "description": "Aggregate counts of memories: total + breakdowns by type, agent, status. scope='agent' (default) counts only memories visible to YOU (trust ≥ 1); scope='fleet'/'all' aggregates across agents (trust ≥ 2). Read-only — useful for self-introspection and dashboard-style summaries.",
     "stm_only": false
   },
   "memclaw_tune": {
     "description": "Tune YOUR retrieval parameters for memclaw_recall (top_k, min_similarity, fts_weight, graph_max_hops, freshness, recall_boost). Only provide fields to change; no fields → returns current profile.",
+    "stm_only": false
+  },
+  "memclaw_unshare_skill": {
+    "description": "Remove a shared skill from the catalog. Default removes from catalog only; pass unshare_from_fleet=true (with target_fleet_id) to also delete the SKILL.md on every fleet node. Trust ≥ 1.",
     "stm_only": false
   },
   "memclaw_write": {

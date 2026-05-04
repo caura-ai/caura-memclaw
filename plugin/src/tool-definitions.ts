@@ -267,6 +267,32 @@ const PARAM_SCHEMAS: Record<string, Record<string, unknown>> = {
       status: STATUS_SCHEMA,
     },
   },
+
+  memclaw_share_skill: {
+    type: "object",
+    required: ["name", "description", "content", "target_fleet_id"],
+    properties: {
+      name: { type: "string", description: "Skill name (lowercase, [a-z0-9._-], 1-100 chars). Doubles as on-disk directory name and the upsert key." },
+      description: { type: "string", description: "One-line summary used for browse/search (1-500 chars)." },
+      content: { type: "string", description: "Full SKILL.md markdown body." },
+      target_fleet_id: { type: "string", description: "Fleet the skill is scoped to (catalog tag and, if install_on_fleet=true, the install target)." },
+      install_on_fleet: { type: "boolean", description: "False (default): publish to catalog only. True: also auto-install on every node in target_fleet_id." },
+      agent_id: { type: "string", description: "Author agent (recorded on the doc)." },
+      target_agent_ids: { type: "array", items: { type: "string" }, description: "Optional list of recipient agent_ids — informational only in v1." },
+      version: { type: "integer", description: "Skill version (default 1). Re-shares overwrite by name." },
+    },
+  },
+
+  memclaw_unshare_skill: {
+    type: "object",
+    required: ["name"],
+    properties: {
+      name: { type: "string", description: "Skill name (must match the share)." },
+      unshare_from_fleet: { type: "boolean", description: "False (default): catalog-only removal. True: also rm SKILL.md on every fleet node (requires target_fleet_id)." },
+      target_fleet_id: { type: "string", description: "Required when unshare_from_fleet=true." },
+      agent_id: { type: "string", description: "Caller agent." },
+    },
+  },
 };
 
 // --- HTTP dispatch ---
@@ -455,6 +481,42 @@ const ENDPOINT_DISPATCH: Record<string, ExecuteFn> = {
       query[k] = String(v);
     }
     return apiCall("GET", "/memories/stats", undefined, query, signal);
+  },
+
+  memclaw_share_skill: async (params, signal) => {
+    const enriched = await enrichBody(params);
+    const body: Record<string, unknown> = {
+      tenant_id: enriched.tenant_id,
+      name: enriched.name,
+      description: enriched.description,
+      content: enriched.content,
+      target_fleet_id: enriched.target_fleet_id,
+      install_on_fleet: enriched.install_on_fleet ?? false,
+      author_agent_id: enriched.agent_id ?? enriched.author_agent_id,
+      target_agent_ids: enriched.target_agent_ids,
+      version: enriched.version ?? 1,
+    };
+    return apiCall("POST", "/skills/share", body, undefined, signal);
+  },
+
+  memclaw_unshare_skill: async (params, signal) => {
+    const enriched = await enrichBody(params);
+    const name = enriched.name as string;
+    assertSafePathSegment(name, "name");
+    const query: Record<string, string> = {
+      tenant_id: enriched.tenant_id as string,
+      unshare_from_fleet: String(enriched.unshare_from_fleet ?? false),
+    };
+    if (enriched.target_fleet_id) {
+      query.target_fleet_id = String(enriched.target_fleet_id);
+    }
+    return apiCall(
+      "DELETE",
+      `/skills/${encodeURIComponent(name)}`,
+      undefined,
+      query,
+      signal,
+    );
   },
 };
 

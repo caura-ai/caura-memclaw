@@ -286,6 +286,8 @@ decision guidance, constraints, and error codes, read
 | \`memclaw_insights\`   | Reflect: contradictions / failures / patterns / …   | stored as \`insight\` memories |
 | \`memclaw_evolve\`     | Report outcome after acting on recalled memories    | weight updates; may create rules |
 | \`memclaw_stats\`      | Aggregate counts: total + by type/agent/status      | \`{total, by_type, by_agent, by_status, scope}\` |
+| \`memclaw_share_skill\`| Share a SKILL.md with a fleet                        | \`{skill_id, queued_nodes, node_ids}\` |
+| \`memclaw_unshare_skill\`| Remove a shared skill                              | \`{deleted, queued_nodes, node_ids}\` |
 
 ### Vocabulary
 
@@ -339,7 +341,7 @@ carries the at-a-glance tool list and enum vocabulary every turn.
 
 ### Write triggers (non-negotiable)
 
-Task completed · Bug found or fixed · Deployment performed · Decision made · API discovered or changed · Person context updated · Blocker encountered · Commitment made · Configuration changed · Error pattern identified. If in doubt: WRITE IT.
+Task completed · Bug found or fixed · Deployment performed · Decision made · API discovered or changed · Person context updated · Blocker encountered · Commitment made · Configuration changed · Error pattern identified · **Skill created or substantially updated**. If in doubt: WRITE IT.
 
 ### 3-layer memory capture (mandatory)
 
@@ -359,6 +361,47 @@ If your runtime dispatches subagents:
 - Both writes MUST carry their own \`agent_id\`.
 
 Single-agent runtimes ignore this section.
+
+### Discover shared skills before improvising
+
+Before tackling a non-trivial workflow you don't already have a local
+skill for (debugging recipe, ops runbook, refactor pattern, audit
+playbook), check the shared skills catalog. Semantic search (by
+meaning) is supported on the description field:
+
+\`\`\`
+GET /skills?query=<natural language>        # semantic search
+memclaw_doc op=query collection=skills      # browse by recency / fleet
+\`\`\`
+
+If a relevant skill exists, read it before reinventing:
+
+\`\`\`
+memclaw_doc op=read collection=skills doc_id=<name>
+\`\`\`
+
+Skills you share land in the catalog by default — recipients pull on
+demand. Reserve \`install_on_fleet=true\` for the rare case where every
+agent on the fleet genuinely needs the skill installed locally
+(operational runbooks, mandatory workflows). Most shares should leave
+it off and let teammates discover via the catalog query.
+
+### After creating a skill: explicit share decision (mandatory)
+
+Whenever you create a new skill or substantially update an existing
+one, you MUST decide explicitly between two options:
+
+1. **Share** — call \`memclaw_share_skill\` so the fleet can discover it
+   (publish-only by default, no filesystem writes on teammates'
+   machines). This is the right default for any skill that another
+   agent could plausibly reuse.
+2. **Keep local** — only when the skill is half-baked, agent-specific,
+   or genuinely private. Document the reason in a memory write so
+   future-you can revisit and share later.
+
+Skipping the decision (just writing the skill and moving on) is not an
+acceptable outcome. The catalog only compounds value if reusable
+skills land in it — and "I forgot" is the most common failure mode.
 
 ### Quality enforcement
 
