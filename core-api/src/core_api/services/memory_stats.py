@@ -1,0 +1,87 @@
+"""Memory aggregation stats — shared by REST `/memories/stats` and MCP `memclaw_stats`.
+
+Pure DB-bound aggregation: count totals plus group-by breakdowns by type,
+agent, and status. Visibility scoping mirrors `memory_repository.list_by_filters`
+(memory_repository.py:125-137) so `/memories/stats.total` matches
+`/memories.length` exactly — no count-vs-list mismatch.
+
+Callers handle their own auth + transient-DB fallback policy. This module
+is import-safe (no FastAPI imports).
+"""
+
+from __future__ import annotations
+
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from common.models.memory import Memory
+from core_api.constants import (
+    MEMORY_VISIBILITY_SCOPE_AGENT,
+    MEMORY_VISIBILITY_SCOPE_ORG,
+    MEMORY_VISIBILITY_SCOPE_TEAM,
+)
+
+
+async def compute_memory_stats(
+    db: AsyncSession,
+    *,
+    tenant_id: str | None,
+    fleet_id: str | None = None,
+    agent_id: str | None = None,
+    memory_type: str | None = None,
+    status: str | None = None,
+) -> dict:
+    """Return ``{total, by_type, by_agent, by_status}`` for the given filters.
+
+    When ``agent_id`` is provided it doubles as the visibility identity AND
+    the author filter (matches the REST handler and ``list_by_filters``).
+    When omitted, ``scope_agent`` rows are excluded so totals never include
+    memories that ``/memories`` would never return for the same caller.
+    """
+    filters = [Memory.deleted_at.is_(None)]
+    if tenant_id:
+        filters.append(Memory.tenant_id == tenant_id)
+    if fleet_id:
+        filters.append(Memory.fleet_id == fleet_id)
+    if agent_id:
+        filters.append(Memory.agent_id == agent_id)
+        filters.append(
+            or_(
+                Memory.visibility == MEMORY_VISIBILITY_SCOPE_ORG,
+                Memory.visibility == MEMORY_VISIBILITY_SCOPE_TEAM,
+                and_(
+                    Memory.visibility == MEMORY_VISIBILITY_SCOPE_AGENT,
+                    Memory.agent_id == agent_id,
+                ),
+            )
+        )
+    else:
+        filters.append(Memory.visibility != MEMORY_VISIBILITY_SCOPE_AGENT)
+    if memory_type:
+        filters.append(Memory.memory_type == memory_type)
+    if status:
+        filters.append(Memory.status == status)
+
+    base = select(Memory).where(*filters)
+    total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar()
+    by_type = dict(
+        (
+            await db.execute(
+                select(Memory.memory_type, func.count()).where(*filters).group_by(Memory.memory_type)
+            )
+        ).all()
+    )
+    by_agent = dict(
+        (
+            await db.execute(select(Memory.agent_id, func.count()).where(*filters).group_by(Memory.agent_id))
+        ).all()
+    )
+    by_status = dict(
+        (await db.execute(select(Memory.status, func.count()).where(*filters).group_by(Memory.status))).all()
+    )
+    return {
+        "total": total,
+        "by_type": by_type,
+        "by_agent": by_agent,
+        "by_status": by_status,
+    }

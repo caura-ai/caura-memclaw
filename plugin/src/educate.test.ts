@@ -560,9 +560,10 @@ describe("buildToolsMd", () => {
     "memclaw_tune",
     "memclaw_insights",
     "memclaw_evolve",
+    "memclaw_stats",
   ];
 
-  test("lists all 9 tools", () => {
+  test("lists every plugin-exposed tool", () => {
     const tools = buildToolsMd();
     for (const tool of ALL_TOOLS) {
       assert.ok(tools.includes(tool), `missing tool: ${tool}`);

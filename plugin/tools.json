@@ -572,6 +572,52 @@
     "trust_required": 0
   },
   {
+    "description": "Aggregate counts of memories: total + breakdowns by type, agent, status. scope='agent' (default) counts only memories visible to YOU (trust \u2265 1); scope='fleet'/'all' aggregates across agents (trust \u2265 2). Read-only \u2014 useful for self-introspection and dashboard-style summaries.",
+    "error_codes": [],
+    "impl_status": "live",
+    "name": "memclaw_stats",
+    "ops": [],
+    "params": [
+      {
+        "default": "agent",
+        "description": "agent|fleet|all. 'agent' (default) = your memories only (trust \u2265 1). 'fleet'/'all' = aggregate across agents (trust \u2265 2).",
+        "name": "scope",
+        "required": false,
+        "type": "str"
+      },
+      {
+        "default": null,
+        "description": "Filter by fleet.",
+        "name": "fleet_id",
+        "required": false,
+        "type": "str | None"
+      },
+      {
+        "default": "mcp-agent",
+        "description": "Caller agent.",
+        "name": "agent_id",
+        "required": false,
+        "type": "str"
+      },
+      {
+        "default": null,
+        "description": "Filter by type.",
+        "name": "memory_type",
+        "required": false,
+        "type": "str | None"
+      },
+      {
+        "default": null,
+        "description": "Filter by status.",
+        "name": "status",
+        "required": false,
+        "type": "str | None"
+      }
+    ],
+    "plugin_exposed": true,
+    "trust_required": 1
+  },
+  {
     "description": "Tune YOUR retrieval parameters for memclaw_recall (top_k, min_similarity, fts_weight, graph_max_hops, freshness, recall_boost). Only provide fields to change; no fields \u2192 returns current profile.",
     "error_codes": [],
     "impl_status": "live",

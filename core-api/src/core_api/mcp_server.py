@@ -186,7 +186,7 @@ mcp = FastMCP(
         "Just provide the content — MemClaw handles the rest. "
         "First-time setup: install the 'memclaw' usage skill via this server's "
         "/api/v1/install-skill endpoint (see README § 'Install the skill'). The "
-        "skill teaches agents when and how to use these 9 tools."
+        "skill teaches agents when and how to use these 10 tools."
     ),
     stateless_http=True,
     json_response=True,
@@ -1141,6 +1141,78 @@ async def memclaw_list(
             ),
             t0,
         )
+
+
+async def memclaw_stats(
+    scope: Annotated[
+        str,
+        Field(
+            description="agent|fleet|all. 'agent' (default) = your memories only (trust ≥ 1). 'fleet'/'all' = aggregate across agents (trust ≥ 2)."
+        ),
+    ] = "agent",
+    fleet_id: Annotated[str | None, Field(description="Filter by fleet.")] = None,
+    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    memory_type: Annotated[str | None, Field(description="Filter by type.")] = None,
+    status: Annotated[str | None, Field(description="Filter by status.")] = None,
+) -> str:
+    """Aggregate counts: total plus breakdowns by type, agent, status.
+    scope='agent' (default) requires trust ≥ 1; scope='fleet'/'all' requires
+    trust ≥ 2. scope='agent' counts only memories visible to the caller (mirrors
+    memclaw_list visibility scoping); broader scopes drop the per-caller filter."""
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if scope not in VALID_SCOPES:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", f"Invalid scope '{scope}'. Must be: agent, fleet, all."),
+            t0,
+        )
+    if memory_type and memory_type not in MEMORY_TYPES:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid memory_type '{memory_type}'. Must be one of: {', '.join(MEMORY_TYPES)}",
+            ),
+            t0,
+        )
+    if status and status not in MEMORY_STATUSES:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid status '{status}'. Must be one of: {', '.join(MEMORY_STATUSES)}",
+            ),
+            t0,
+        )
+
+    tenant_id = _get_tenant()
+    agent_id = _get_agent_id() or agent_id
+    min_level = 1 if scope == "agent" else 2
+
+    async with _mcp_session() as db:
+        trust, _, terr = await _require_trust(db, tenant_id, agent_id, min_level=min_level)
+        if terr:
+            return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
+
+        # scope='agent' filters to caller's own memories (mirrors memclaw_list);
+        # scope='fleet'/'all' drops the per-caller filter so cross-agent
+        # aggregates surface — fleet_id (if supplied) still narrows the pool.
+        effective_agent_id = agent_id if scope == "agent" else None
+
+        from core_api.services.memory_stats import compute_memory_stats
+
+        try:
+            stats = await compute_memory_stats(
+                db,
+                tenant_id=tenant_id,
+                fleet_id=fleet_id,
+                agent_id=effective_agent_id,
+                memory_type=memory_type,
+                status=status,
+            )
+            return _with_latency(json.dumps({**stats, "scope": scope}, default=str), t0)
+        except Exception as e:
+            logger.exception("Unhandled error in memclaw_stats")
+            return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
 
 
 # ---------------------------------------------------------------------------

@@ -43,7 +43,7 @@ describe("tool-specs loader", () => {
 });
 
 describe("MEMCLAW_TOOLS surface", () => {
-  test("is the expected v1.0 list of 9 plugin tools", () => {
+  test("is the expected list of plugin tools", () => {
     assert.deepEqual([...MEMCLAW_TOOLS], [
       "memclaw_recall",
       "memclaw_write",
@@ -54,6 +54,7 @@ describe("MEMCLAW_TOOLS surface", () => {
       "memclaw_tune",
       "memclaw_insights",
       "memclaw_evolve",
+      "memclaw_stats",
     ]);
   });
 
