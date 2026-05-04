@@ -327,29 +327,36 @@ const memclawPlugin = {
     // --- Auto-educate agents on first load ---
     // SKILL.md is discovered by OpenClaw via the `skills` field in
     // `openclaw.plugin.json` (one copy per node, plugin-root-relative).
-    // This block only handles per-workspace artifacts: HEARTBEAT.md prompt,
-    // TOOLS.md append, AGENTS.md append.
+    // This block writes the per-workspace artifacts: TOOLS.md and
+    // AGENTS.md (both fenced + version-tagged for safe re-runs).
+    //
+    // Pre-C1 we also wrote a 4-sentence DEFAULT_EDUCATION paragraph
+    // into HEARTBEAT.md, fully redundant with TOOLS.md/AGENTS.md/
+    // SKILL.md and unfenced. That write is dropped; legacy paragraphs
+    // left over from prior installs are cleaned up inside
+    // writeEducationFiles via cleanupStaleHeartbeatEducation.
     const educatedFlagPath = join(getPluginDir(), ".educated");
     if (!existsSync(educatedFlagPath)) {
       try {
-        const DEFAULT_EDUCATION =
-          `You have been connected to MemClaw \u2014 a shared persistent memory system. ` +
-          `You now have ${MEMCLAW_TOOLS.length} tools for writing, searching, and managing memories. ` +
-          `Check skills/memclaw/SKILL.md for full instructions. Key rules: always search before ` +
-          `starting work, always write findings after completing work, always include your agent_id.`;
-
-        const eduResult = educateAgents(DEFAULT_EDUCATION);
         const filesResult = writeEducationFiles(
           buildToolsMd(),
           buildAgentsMd(),
         );
 
-        if (eduResult.verified > 0 || filesResult.toolsUpdated > 0 || filesResult.agentsUpdated > 0) {
-          writeFileSync(educatedFlagPath, new Date().toISOString(), "utf-8");
+        // Write the flag on any successful return from writeEducationFiles,
+        // regardless of whether any workspace files were actually updated.
+        // The flag's purpose is "education has been attempted", not
+        // "something changed". Per-workspace errors are silently absorbed
+        // inside writeEducationFiles (via logError) and will be retried on
+        // the next heartbeat tick — so NOT writing the flag here would
+        // cause re-attempts on every plugin load indefinitely.
+        writeFileSync(educatedFlagPath, new Date().toISOString(), "utf-8");
+
+        if (filesResult.toolsUpdated > 0 || filesResult.agentsUpdated > 0) {
           console.log(
-            `[memclaw] Auto-educated ${eduResult.verified} workspace(s), ` +
-              `TOOLS.md in ${filesResult.toolsUpdated}, ` +
-              `AGENTS.md in ${filesResult.agentsUpdated}`,
+            `[memclaw] Auto-educated workspaces ` +
+              `(TOOLS.md: ${filesResult.toolsUpdated}, ` +
+              `AGENTS.md: ${filesResult.agentsUpdated})`,
           );
         }
       } catch (e: unknown) {

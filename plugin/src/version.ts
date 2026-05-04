@@ -1,2 +1,2 @@
 // Auto-generated from /VERSION — do not edit
-export const PLUGIN_VERSION = "1.0.1";
+export const PLUGIN_VERSION = "2.0.0";

@@ -20,6 +20,7 @@ import {
   unlinkSync,
 } from "fs";
 import { join, basename, resolve } from "path";
+import { createHash } from "crypto";
 import { isContainedPath, assertPromptLength } from "./validation.js";
 import { getOpenClawBaseDir } from "./paths.js";
 import { MEMCLAW_TOOLS } from "./tools.js";
@@ -125,6 +126,80 @@ export function discoverAgentWorkspaces(
   }
 
   return results;
+}
+
+/**
+ * Strip the legacy DEFAULT_EDUCATION paragraph from a HEARTBEAT.md
+ * string, if present. Pre-C1 the plugin wrote a 4-sentence MemClaw
+ * intro into each workspace's HEARTBEAT.md on first install:
+ *
+ *   You have been connected to MemClaw — a shared persistent memory
+ *   system. You now have N tools for writing, searching, and managing
+ *   memories. Check skills/memclaw/SKILL.md for full instructions.
+ *   Key rules: always search before starting work, always write
+ *   findings after completing work, always include your agent_id.
+ *
+ * That paragraph is fully redundant with TOOLS.md / AGENTS.md /
+ * SKILL.md and the system-prompt section, has no fence (so plugin
+ * upgrades never refreshed it), and frozen the tool count at write
+ * time. We no longer write it (auto-education stops at TOOLS.md /
+ * AGENTS.md), and this helper one-shot cleans it from any
+ * HEARTBEAT.md left over from a prior install.
+ *
+ * Match strategy: anchor on the unique opening clause ("You have been
+ * connected to MemClaw") and the unique closing clause ("always
+ * include your agent_id."), single-line `[^\n]*?` between. Optional
+ * leading separator pattern `\n+---\n+` — flexible enough to match
+ * both the canonical `\n\n---\n\n` (which is what `educateAgents`
+ * writes when prepending to non-empty content) AND the reduced
+ * `\n---\n\n` form that's left behind when an *earlier* paragraph
+ * already consumed one of the two leading newlines on its own
+ * trailing-`\n?`.
+ *
+ * Loops until no more matches are found. A single call therefore
+ * cleans **all** stale paragraphs in one pass, including the
+ * pathological case (seen in the wild on 0.98.5 → 1.0 → 2.0
+ * upgrade-chain installs) where the file accumulated multiple
+ * paragraphs across reinstalls because `.educated` was deleted
+ * between them. Without the loop, two-paragraph files would leave a
+ * stray `---` rule between strips.
+ *
+ * Returns `{ content, cleaned }`; `cleaned` is true if any paragraph
+ * was removed.
+ *
+ * The paragraph was always written as a single line by `educateAgents`
+ * (the `prompt.trim()` it stores is the plain `DEFAULT_EDUCATION`
+ * string with no internal newlines). The `[^\n]*?` middle is
+ * intentionally single-line and will silently no-op if a future
+ * version of the content was reflowed across multiple lines — do NOT
+ * "fix" the regex to be multi-line (`[\s\S]*?`) without re-thinking
+ * anchors, because greedy multi-line matching could span unrelated
+ * user prose between two coincidental anchor occurrences and delete
+ * it.
+ */
+export function cleanupStaleHeartbeatEducation(
+  content: string,
+): { content: string; cleaned: boolean } {
+  // `\n{1,2}` (not `\n+`) on each side of the rule: bounded to one or
+  // two newlines so we never eat a trailing newline from preceding
+  // user content. The canonical separator written by `educateAgents`
+  // is `\n\n---\n\n` (2+2); after a previous strip leaves a reduced
+  // form `\n---\n\n` (1+2), this still matches.
+  const re =
+    /(?:\n{1,2}---\n{1,2})?You have been connected to MemClaw[^\n]*?always include your agent_id\.\n?/;
+  let cur = content;
+  let cleaned = false;
+  // Bounded loop: stale paragraphs accumulate one per upgrade. A few
+  // iterations is normal; an upper bound prevents infinite looping if
+  // the regex were ever to match the empty string. Each iteration
+  // makes monotonic progress (slice removes at least one char).
+  for (let i = 0; i < 32; i++) {
+    const m = cur.match(re);
+    if (!m || m[0].length === 0) break;
+    cur = cur.slice(0, m.index!) + cur.slice(m.index! + m[0].length);
+    cleaned = true;
+  }
+  return { content: cur, cleaned };
 }
 
 /**
@@ -314,115 +389,256 @@ export function buildAgentsMd(): string {
 
 ## Memory V2 — MemClaw Protocol (mandatory)
 
-Supersedes any earlier memory instructions in this file. MemClaw is the
-primary persistent, cross-session, multi-agent memory; prior file-based
-memory (e.g. \`memory.md\`) is session-local scratchpad only.
+Supersedes any earlier memory instructions. MemClaw is the primary
+persistent, cross-session, multi-agent memory. Any workspace file
+(\`MEMORY.md\`, \`memory.md\`, etc.) is a session-local scratchpad —
+keep it lean (active projects + current routing + recent decisions
+≤ 7 days, target a few KB). Anything historical, factual, or useful
+to other agents → write it to MemClaw.
 
-**Before your first MemClaw tool call in a session**, read
-\`skills/memclaw/SKILL.md\` — it holds the per-tool signatures, decision
-guidance, constraints, and error codes. \`TOOLS.md\` in this workspace
+**Identity.** Every call MUST carry your correct \`agent_id\` (and
+\`fleet_id\` for team/org visibility, fleet-scoped reads, and cross-fleet
+operations). Never fabricate. If uncertain, write privately
+(\`visibility=scope_agent\`) until resolved.
+
+**Completion contract.** No silent completions — every meaningful
+outcome MUST produce a write. No write = not done. Checkpoint every
+30 min on long tasks.
+
+**Write triggers.** Task done · bug · deploy · decision · API change ·
+blocker · commitment · config change · error pattern · skill created
+or updated. If in doubt: write.
+
+**Skills.** Check the shared catalog before improvising
+(\`memclaw_doc op=query collection=skills\`). After creating a skill,
+share via \`memclaw_share_skill\` or document why you're keeping it
+local — never just forget to share.
+
+Before your first MemClaw call this session, read
+\`skills/memclaw/SKILL.md\` for tool signatures, capture cadences
+(L1/L2/L3), quality, prohibitions, and skill sharing. \`TOOLS.md\`
 carries the at-a-glance tool list and enum vocabulary every turn.
-
-### Identity is non-negotiable
-
-- Every call MUST carry your correct \`agent_id\`. Never fabricate, reuse
-  another agent's id, or hardcode a placeholder.
-- \`fleet_id\` MUST be correct for team/org visibility writes,
-  fleet-scoped reads, and cross-fleet operations.
-- If uncertain, do NOT guess. Write privately
-  (\`visibility=scope_agent\`) until identity is resolved.
-
-### Completion contract
-
-- No silent completions. Every completion MUST produce a write: what was
-  done, found, changed, what's next.
-- Long tasks (> 30 min) MUST checkpoint every 30 minutes.
-- No write = not completed.
-
-### Write triggers (non-negotiable)
-
-Task completed · Bug found or fixed · Deployment performed · Decision made · API discovered or changed · Person context updated · Blocker encountered · Commitment made · Configuration changed · Error pattern identified · **Skill created or substantially updated**. If in doubt: WRITE IT.
-
-### 3-layer memory capture (mandatory)
-
-- **L1 per-turn.** After each meaningful outcome, write with date,
-  what, who, outcome, next.
-- **L2 session boundary.** At > 60 % context or session end, write a
-  full summary.
-- **L3 consolidation.** On periodic runtime sweeps: find gaps, merge
-  duplicates, transition contradicted facts to \`outdated\`.
-
-### Orchestrator + subagent protocol
-
-If your runtime dispatches subagents:
-
-- The spawning agent MUST write findings after every subagent completion.
-- The subagent MUST write its own findings before handing back.
-- Both writes MUST carry their own \`agent_id\`.
-
-Single-agent runtimes ignore this section.
-
-### Discover shared skills before improvising
-
-Before tackling a non-trivial workflow you don't already have a local
-skill for (debugging recipe, ops runbook, refactor pattern, audit
-playbook), check the shared skills catalog. Semantic search (by
-meaning) is supported on the description field:
-
-\`\`\`
-GET /skills?query=<natural language>        # semantic search
-memclaw_doc op=query collection=skills      # browse by recency / fleet
-\`\`\`
-
-If a relevant skill exists, read it before reinventing:
-
-\`\`\`
-memclaw_doc op=read collection=skills doc_id=<name>
-\`\`\`
-
-Skills you share land in the catalog by default — recipients pull on
-demand. Reserve \`install_on_fleet=true\` for the rare case where every
-agent on the fleet genuinely needs the skill installed locally
-(operational runbooks, mandatory workflows). Most shares should leave
-it off and let teammates discover via the catalog query.
-
-### After creating a skill: explicit share decision (mandatory)
-
-Whenever you create a new skill or substantially update an existing
-one, you MUST decide explicitly between two options:
-
-1. **Share** — call \`memclaw_share_skill\` so the fleet can discover it
-   (publish-only by default, no filesystem writes on teammates'
-   machines). This is the right default for any skill that another
-   agent could plausibly reuse.
-2. **Keep local** — only when the skill is half-baked, agent-specific,
-   or genuinely private. Document the reason in a memory write so
-   future-you can revisit and share later.
-
-Skipping the decision (just writing the skill and moving on) is not an
-acceptable outcome. The catalog only compounds value if reusable
-skills land in it — and "I forgot" is the most common failure mode.
-
-### Quality enforcement
-
-- Every memory MUST include a date.
-- Prefer update over near-duplicate.
-- Before a key fact, recall for contradictions; transition the older
-  memory to \`outdated\` in the same turn.
-- One topic per memory; batch into a single call.
-
-### Prohibited behaviors
-
-- NEVER fabricate or impersonate \`agent_id\` / \`fleet_id\`.
-- NEVER delete memories you merely disagree with — transition them to
-  \`outdated\` or \`archived\`. \`op=delete\` is a soft-delete; it requires
-  trust 3 and is reserved for correcting genuinely wrong data.
-- NEVER write with organization-wide visibility unless the memory is
-  genuinely org-relevant.
-- NEVER silently drop a denied call — surface the error so the
-  orchestrator can decide whether to escalate.
-- NEVER substitute local files or scratchpads for MemClaw writes.
 `;
+}
+
+// --- Fenced-block migration ---
+//
+// Per-workspace TOOLS.md and AGENTS.md sections are wrapped in versioned
+// fence markers:
+//
+//   <!-- memclaw:tools v=<8-hex> -->
+//   …rendered block…
+//   <!-- /memclaw:tools -->
+//
+// The version is the first 8 hex chars of the SHA-256 of the block string.
+// On subsequent runs, `spliceFencedBlock` decides what to do based on
+// what it finds in the existing file:
+//
+//   1. Fence with matching version → no-op (idempotent).
+//   2. Fence with different version → in-place replace, content outside
+//      the fence preserved byte-for-byte. Lets us push education
+//      updates to existing installs on heartbeat.
+//   3. No fence, but a legacy heading (the pre-fence block layout from
+//      v1.x) → splice from one preceding `---` rule (if any) through
+//      the heading and on to the next H2 / EOF, then write the fenced
+//      block in its place. A one-shot `<filename>.memclaw-bak` is
+//      written before the splice so users who hand-edited inside our
+//      block can recover.
+//   4. No fence, no legacy heading → append at EOF (fresh install).
+//
+// This replaces the pre-fix presence-based idempotency
+// (`includes("MemClaw")` / `includes("## Memory V2")`) which never
+// updated stale content after a plugin upgrade.
+
+function blockHash(content: string): string {
+  return createHash("sha256").update(content).digest("hex").slice(0, 8);
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Find the line range covered by a legacy MemClaw section (pre-fence
+ * format), or null if no MemClaw legacy heading is present.
+ *
+ * Uses **prefix matching** on the heading rather than exact-equality:
+ * the plugin has emitted at least two heading forms over its history
+ * (e.g. v0.98.5 wrote `## MemClaw — Long-Term Agent Memory (auto-added
+ * by plugin)` for TOOLS.md; v1.x wrote `## MemClaw — Tools Available`).
+ * Both share a stable prefix (`## MemClaw —`), so prefix matching
+ * catches every historical form in one pass without us having to
+ * enumerate them.
+ *
+ * To prevent false positives on user-authored headings that happen to
+ * start with the same prefix, the splice range is additionally
+ * required to contain a MemClaw token (default: `memclaw_`). If the
+ * range doesn't contain it, the function returns null and the splice
+ * is skipped.
+ *
+ * The range starts at one preceding `---` rule (if any blank-only lines
+ * separate it from the heading) and ends at the next `## ` heading or
+ * EOF — so splicing it out removes our block cleanly without touching
+ * surrounding user content.
+ */
+export function findLegacyRange(
+  content: string,
+  legacyHeadingPrefix: string,
+  contentMustInclude: string = "memclaw_",
+): { start: number; end: number } | null {
+  // Split on LF, not CRLF: under CRLF input each `lines[i]` carries a
+  // trailing `\r` and `lines[i].length + 1` (LF) sums to the correct
+  // offset in the original string regardless of line ending. The only
+  // place CRLF leaks through is the prefix check below — strip a
+  // trailing `\r` for that comparison so the offset math stays
+  // consistent with the original (un-normalized) content.
+  const lines = content.split("\n");
+  const stripCR = (s: string): string =>
+    s.length > 0 && s.charCodeAt(s.length - 1) === 13 ? s.slice(0, -1) : s;
+
+  let h = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (stripCR(lines[i]).startsWith(legacyHeadingPrefix)) {
+      h = i;
+      break;
+    }
+  }
+  if (h === -1) return null;
+
+  // Walk back through blank lines; if the previous non-blank is `---`,
+  // include it in the range. Otherwise start at the heading.
+  let s = h;
+  let probe = h - 1;
+  while (probe >= 0 && lines[probe].trim() === "") probe--;
+  if (probe >= 0 && lines[probe].trim() === "---") {
+    s = probe;
+  }
+
+  // End: next H2 after the heading, or EOF.
+  let e = lines.length;
+  for (let i = h + 1; i < lines.length; i++) {
+    if (lines[i].startsWith("## ")) {
+      e = i;
+      break;
+    }
+  }
+
+  // Convert line indices to character offsets. When `e === lines.length`
+  // and the source content has no trailing newline, the per-line `+1` (for
+  // the LF that's no longer there) over-counts by one. `slice` would still
+  // do the right thing, but the explicit clamp documents the intent.
+  const startChar = lines.slice(0, s).reduce((acc, l) => acc + l.length + 1, 0);
+  const endChar = Math.min(
+    lines.slice(0, e).reduce((acc, l) => acc + l.length + 1, 0),
+    content.length,
+  );
+
+  // Content-shape verification: the splice range MUST contain a
+  // MemClaw token (default `memclaw_`). This guards against a user
+  // heading that coincidentally starts with the same prefix but
+  // contains no MemClaw content. If the slice doesn't smell like one
+  // of our blocks, leave it alone.
+  if (contentMustInclude) {
+    const slice = content.slice(startChar, endChar);
+    if (!slice.toLowerCase().includes(contentMustInclude.toLowerCase())) {
+      return null;
+    }
+  }
+
+  return { start: startChar, end: endChar };
+}
+
+interface SpliceResult {
+  content: string;
+  updated: boolean;
+  backedUp: boolean;
+}
+
+export function spliceFencedBlock(
+  existing: string,
+  marker: "tools" | "agents",
+  newBlock: string,
+  legacyHeadingPrefix: string,
+  options: { force?: boolean; backupPath?: string } = {},
+): SpliceResult {
+  const tag = `memclaw:${marker}`;
+  const innerContent = newBlock.replace(/^\n+|\n+$/g, "");
+  const version = blockHash(innerContent);
+  const fenced = `<!-- ${tag} v=${version} -->\n${innerContent}\n<!-- /${tag} -->\n`;
+
+  // Case 1 + 2: existing fenced block.
+  const fenceRe = new RegExp(
+    `<!--\\s*${escapeRegex(tag)}\\s+v=([a-f0-9]+)\\s*-->[\\s\\S]*?<!--\\s*/${escapeRegex(tag)}\\s*-->\\n?`,
+  );
+  const fenceMatch = existing.match(fenceRe);
+  if (fenceMatch) {
+    if (!options.force && fenceMatch[1] === version) {
+      return { content: existing, updated: false, backedUp: false };
+    }
+    // Stale-version replace (or force-rewrite). Mirror the legacy-bridge
+    // backup behaviour: a user may have hand-edited inside the fenced
+    // block (e.g. added a personal comment); a version bump would
+    // otherwise silently discard those edits. The one-shot
+    // `<file>.memclaw-bak` preserves the pre-replace content for
+    // recovery. Same one-shot semantics as case 3 below: if the
+    // backup already exists, leave it alone.
+    let backedUp = false;
+    if (options.backupPath && !existsSync(options.backupPath)) {
+      try {
+        writeFileSync(options.backupPath, existing, "utf-8");
+        backedUp = true;
+      } catch (e: unknown) {
+        logError(`Failed to write backup at ${options.backupPath}`, e);
+      }
+    }
+    const start = fenceMatch.index!;
+    const end = start + fenceMatch[0].length;
+    return {
+      content: existing.slice(0, start) + fenced + existing.slice(end),
+      updated: true,
+      backedUp,
+    };
+  }
+
+  // Case 3: legacy heading present.
+  const legacyRange = findLegacyRange(existing, legacyHeadingPrefix);
+  if (legacyRange) {
+    let backedUp = false;
+    if (options.backupPath && !existsSync(options.backupPath)) {
+      try {
+        writeFileSync(options.backupPath, existing, "utf-8");
+        backedUp = true;
+      } catch (e: unknown) {
+        logError(`Failed to write backup at ${options.backupPath}`, e);
+      }
+    }
+    return {
+      content:
+        existing.slice(0, legacyRange.start) +
+        fenced +
+        existing.slice(legacyRange.end),
+      updated: true,
+      backedUp,
+    };
+  }
+
+  // Case 4: append at EOF. Always leave a blank line between the
+  // file's last content line and the fence opener so the appended
+  // block is markdown-readable, regardless of how the existing file
+  // ends.
+  const sep =
+    existing.length === 0
+      ? ""
+      : existing.endsWith("\n\n")
+        ? ""
+        : existing.endsWith("\n")
+          ? "\n"
+          : "\n\n";
+  return {
+    content: existing + sep + fenced,
+    updated: true,
+    backedUp: false,
+  };
 }
 
 /**
@@ -434,12 +650,21 @@ skills land in it — and "I forgot" is the most common failure mode.
  * auto-gated by plugin enablement.
  *
  * Called from both auto-education (first load) and the "educate" command.
+ *
+ * Idempotency is version-based via `spliceFencedBlock` (see above): a
+ * workspace already carrying the current-version fenced block is
+ * left untouched; a workspace with a stale-version fence or a legacy
+ * pre-fence section is auto-migrated to the current content.
+ *
+ * `options.force=true` bypasses the version compare and rewrites the
+ * fenced block even when it already matches.
  */
 export function writeEducationFiles(
   toolsMdSection: string,
   agentsMdSection: string,
   agentIds?: string[],
   baseDir?: string,
+  options: { force?: boolean } = {},
 ): { toolsUpdated: number; agentsUpdated: number } {
   const ocBase = baseDir || getOpenClawBaseDir();
   const wsList = discoverAgentWorkspaces(ocBase, agentIds);
@@ -448,23 +673,77 @@ export function writeEducationFiles(
 
   for (const { path: wsPath } of wsList) {
     try {
-      // TOOLS.md — append if not already present
       const toolsPath = join(wsPath, "TOOLS.md");
-      const existingTools = existsSync(toolsPath) ? readFileSync(toolsPath, "utf-8") : "";
-      if (!existingTools.includes("MemClaw")) {
-        writeFileSync(toolsPath, existingTools + toolsMdSection, "utf-8");
+      const existingTools = existsSync(toolsPath)
+        ? readFileSync(toolsPath, "utf-8")
+        : "";
+      const toolsResult = spliceFencedBlock(
+        existingTools,
+        "tools",
+        toolsMdSection,
+        // Prefix, not exact match. Catches every legacy heading the
+        // plugin has emitted: `## MemClaw — Tools Available` (1.x),
+        // `## MemClaw — Long-Term Agent Memory (auto-added by plugin)`
+        // (0.98.5), and any future variant that keeps the same
+        // `## MemClaw —` lead.
+        "## MemClaw —",
+        {
+          force: options.force,
+          backupPath: toolsPath + ".memclaw-bak",
+        },
+      );
+      if (toolsResult.updated) {
+        writeFileSync(toolsPath, toolsResult.content, "utf-8");
         toolsUpdated++;
       }
 
-      // AGENTS.md — append if not already present
       const agentsPath = join(wsPath, "AGENTS.md");
-      const existingAgents = existsSync(agentsPath) ? readFileSync(agentsPath, "utf-8") : "";
-      if (!existingAgents.includes("## Memory V2")) {
-        writeFileSync(agentsPath, existingAgents + agentsMdSection, "utf-8");
+      const existingAgents = existsSync(agentsPath)
+        ? readFileSync(agentsPath, "utf-8")
+        : "";
+      const agentsResult = spliceFencedBlock(
+        existingAgents,
+        "agents",
+        agentsMdSection,
+        // Prefix, not exact match. Catches `## Memory V2 — MemClaw
+        // Protocol (mandatory)` (1.x), `## Memory V2 (auto-added by
+        // MemClaw plugin — replaces any earlier memory section above)`
+        // (0.98.5), and any future variant under the same `## Memory V2`
+        // family. The content-shape check (`memclaw_` token) prevents
+        // false positives on user prose.
+        "## Memory V2",
+        {
+          force: options.force,
+          backupPath: agentsPath + ".memclaw-bak",
+        },
+      );
+      if (agentsResult.updated) {
+        writeFileSync(agentsPath, agentsResult.content, "utf-8");
         agentsUpdated++;
       }
-    } catch {
-      // Skip workspace on error
+
+      // One-shot cleanup of the pre-C1 DEFAULT_EDUCATION paragraph the
+      // plugin used to append to HEARTBEAT.md on first install.
+      // Idempotent: a HEARTBEAT.md that doesn't contain the paragraph
+      // (or doesn't exist) is a no-op. If stripping the paragraph
+      // leaves the file empty (the first-install case where the file
+      // was created solely to hold our paragraph), unlink rather than
+      // writing a 0-byte file: educateAgents treats absent and empty
+      // identically when the host later pushes a real prompt.
+      const hbPath = join(wsPath, "HEARTBEAT.md");
+      if (existsSync(hbPath)) {
+        const existingHb = readFileSync(hbPath, "utf-8");
+        const hbResult = cleanupStaleHeartbeatEducation(existingHb);
+        if (hbResult.cleaned) {
+          if (hbResult.content.length === 0) {
+            unlinkSync(hbPath);
+          } else {
+            writeFileSync(hbPath, hbResult.content, "utf-8");
+          }
+        }
+      }
+    } catch (e: unknown) {
+      logError(`writeEducationFiles failed for ${wsPath}`, e);
     }
   }
 

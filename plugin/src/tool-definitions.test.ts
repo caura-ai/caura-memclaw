@@ -7,10 +7,14 @@
  */
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { MEMCLAW_TOOLS } from "./tools.js";
 import { createToolFromSpec } from "./tool-definitions.js";
 import { TOOL_SPECS, TOOL_SPECS_BY_NAME, getSpec } from "./tool-specs.js";
+import { buildToolsMd } from "./educate.js";
+import { memclawPromptSectionText } from "./prompt-section.js";
 
 describe("tool-specs loader", () => {
   test("loads a non-empty ordered spec list from tools.json", () => {
@@ -150,6 +154,132 @@ describe("createToolFromSpec factory", () => {
     const spec = getSpec("memclaw_recall");
     const tool = createToolFromSpec("memclaw_recall");
     assert.equal(tool.description, spec.description);
+  });
+});
+
+describe("drift checks across tool surface artefacts", () => {
+  // SKILL.md ships with the plugin and is read on demand by every agent;
+  // it MUST list every plugin-exposed tool as a tool card. Without this
+  // gate, adding a tool (e.g. memclaw_stats in #64) silently leaves
+  // SKILL.md a version behind and agents see the wrong tool count.
+  test("SKILL.md has a tool card for every tool in MEMCLAW_TOOLS", () => {
+    const skillPath = join(
+      import.meta.dirname,
+      "..",
+      "skills",
+      "memclaw",
+      "SKILL.md",
+    );
+    const skill = readFileSync(skillPath, "utf-8");
+    for (const name of MEMCLAW_TOOLS) {
+      const marker = "**`" + name + "(";
+      assert.ok(
+        skill.includes(marker),
+        `SKILL.md is missing tool card for ${name} (expected line starting with ${marker})`,
+      );
+    }
+  });
+
+  // TOOLS.md (per-workspace bootstrap) is built from buildToolsMd() and
+  // injected into every turn. It must mention every exposed tool by name.
+  test("buildToolsMd output mentions every tool in MEMCLAW_TOOLS", () => {
+    const md = buildToolsMd();
+    for (const name of MEMCLAW_TOOLS) {
+      assert.ok(
+        md.includes("`" + name + "`"),
+        `buildToolsMd output missing ${name}`,
+      );
+    }
+  });
+
+  // PARAM_SCHEMAS / ENDPOINT_DISPATCH are not exported, but
+  // createToolFromSpec throws when either is missing — iterating
+  // MEMCLAW_TOOLS via the factory covers the "MEMCLAW_TOOLS ⊆ {schemas,
+  // dispatch}" direction (already in the createToolFromSpec test
+  // above). The reverse direction — extra entries in either map that
+  // are NOT in MEMCLAW_TOOLS — is guarded indirectly: any extra entry
+  // would still need a tools.json spec to be reachable, and the
+  // existing "every plugin_exposed tool in tools.json is listed in
+  // MEMCLAW_TOOLS" test catches that.
+  test("MEMCLAW_TOOLS == plugin-exposed tools in tools.json (set equality)", () => {
+    const exposed = new Set(
+      TOOL_SPECS.filter((s) => s.plugin_exposed).map((s) => s.name),
+    );
+    const listed = new Set(MEMCLAW_TOOLS);
+    assert.deepEqual(listed, exposed);
+  });
+
+  // The system-prompt fragment is paid on every turn. It MUST stay slim
+  // and MUST NOT duplicate the protocol that already lives in TOOLS.md
+  // (per-turn), AGENTS.md (per-turn), and SKILL.md (on-demand).
+  // Regression guard against the pre-C3 verbose form.
+  describe("prompt-section.ts (per-turn system-prompt fragment)", () => {
+    const tools = memclawPromptSectionText(new Set(MEMCLAW_TOOLS));
+
+    test("includes header, identity, and pointer to SKILL.md", () => {
+      assert.ok(tools.includes("## MemClaw Memory"), "missing header");
+      assert.ok(tools.includes("`agent_id`"), "missing agent_id mention");
+      assert.ok(tools.includes("never fabricate") || tools.includes("Never fabricate"),
+        "missing identity 'never fabricate' clause");
+      assert.ok(
+        tools.includes("skills/memclaw/SKILL.md"),
+        "must reference skills/memclaw/SKILL.md by path",
+      );
+    });
+
+    test("lists all currently-available MemClaw tools by name", () => {
+      for (const name of MEMCLAW_TOOLS) {
+        assert.ok(
+          tools.includes(name),
+          `prompt-section must list ${name} in available-tools cue`,
+        );
+      }
+    });
+
+    test("does NOT restate the deep protocol (lives in SKILL.md)", () => {
+      // Pre-C3 the section emitted full prose for the three rules,
+      // write triggers, document-store guidance, delete/transition,
+      // and report-outcomes. All of that now lives in SKILL.md.
+      assert.ok(
+        !/Rule 1 — Search before/.test(tools),
+        "pre-C3 'Rule 1 — Search before' prose leaked back into prompt-section",
+      );
+      assert.ok(
+        !/Rule 2 — Write when/.test(tools),
+        "pre-C3 'Rule 2 — Write when' prose leaked back into prompt-section",
+      );
+      assert.ok(
+        !/Rule 3 — Update when/.test(tools),
+        "pre-C3 'Rule 3 — Update when' prose leaked back into prompt-section",
+      );
+      assert.ok(
+        !/Document Store/.test(tools),
+        "Document Store guidance belongs in SKILL.md, not the per-turn fragment",
+      );
+      assert.ok(
+        !/Deleting & transitions/.test(tools),
+        "Delete/transition guidance belongs in SKILL.md",
+      );
+      assert.ok(
+        !/Report outcomes/.test(tools),
+        "Report-outcomes guidance belongs in SKILL.md",
+      );
+    });
+
+    test("is slim: under 800 chars (post-C3 budget)", () => {
+      // Pre-C3 this fragment was ~3 KB of prose paid on every turn.
+      // If this grows back, ask whether the new content really has to
+      // be every-turn and not on-demand via SKILL.md.
+      assert.ok(
+        tools.length < 800,
+        `prompt-section is ${tools.length} chars; should be < 800. Move deep content to SKILL.md.`,
+      );
+    });
+
+    test("emits nothing when no MemClaw tools are available", () => {
+      const empty = memclawPromptSectionText(new Set());
+      assert.equal(empty, "", "must emit empty string when no tools available");
+    });
   });
 });
 
