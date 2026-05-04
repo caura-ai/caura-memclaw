@@ -231,16 +231,27 @@ async def _backfill_one_table(
             async with none_lock:
                 consecutive_nones = 0
             async with engine.connect() as conn:
-                # Pass the raw ``list[float]`` — asyncpg's pgvector codec
-                # (registered globally via ``register_vector`` on the
-                # async engine) serializes the list to pgvector's binary
-                # representation. Using ``str(vec)`` would force pgvector
-                # to re-parse a Python repr (``'[0.1, 0.2, ...]'``) and
-                # crashes when the codec is registered, since the codec
-                # then expects a sequence.
+                # Pass the vector as ``str(vec)`` (Python's list repr —
+                # ``'[0.1, 0.2, ...]'``) and let pgvector's input parser
+                # cast it on the column-type side. The CLI's deployed
+                # asyncpg driver does NOT have the ``register_vector``
+                # codec registered (it's only added on connections
+                # created via pgvector's helper, not via SQLAlchemy's
+                # default async engine factory). Without the codec,
+                # asyncpg tries to serialize a ``list[float]`` directly
+                # and bails with ``invalid input for query argument $1
+                # ... (expected str, got list)``. The text-cast path
+                # is what every other write site in this codebase
+                # already uses (see ``memory_update_embedding``); this
+                # CLI just needs to match.
+                #
+                # Explicit ``::vector`` cast on the placeholder so
+                # PostgreSQL parses the string at server side rather
+                # than relying on implicit-cast inference, which would
+                # depend on asyncpg's chosen wire-type for the param.
                 await conn.execute(
-                    text(f"UPDATE {spec.table} SET {spec.embedding_column} = :emb WHERE id = :id"),
-                    {"emb": vec, "id": row_id},
+                    text(f"UPDATE {spec.table} SET {spec.embedding_column} = (:emb)::vector WHERE id = :id"),
+                    {"emb": str(vec), "id": row_id},
                 )
                 await conn.commit()
             embedded += 1
