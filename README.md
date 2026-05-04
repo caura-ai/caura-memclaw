@@ -291,24 +291,27 @@ Add MemClaw to any MCP client with one config block.
 - **Claude Desktop** — `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows)
 - **Cursor** — Settings > MCP Servers > Add Server
 
-The client discovers 9 tools automatically:
+The client discovers 12 tools automatically:
 
 | Tool | Purpose |
 |---|---|
 | `memclaw_write` | Single or batch write (up to 100 items). LLM infers type, title, summary, tags, embedding |
 | `memclaw_recall` | Hybrid semantic + keyword recall with graph-enhanced retrieval; optional LLM brief |
-| `memclaw_manage` | Per-memory lifecycle: `read`, `update`, `transition`, `delete` |
+| `memclaw_manage` | Per-memory lifecycle: `read`, `update`, `transition`, `delete`, `bulk_delete`, `lineage` |
 | `memclaw_list` | Filter by type/status/agent/weight/date, sort, cursor-paginate |
-| `memclaw_doc` | Document CRUD: `write`, `read`, `query`, `delete` on named JSON collections |
+| `memclaw_doc` | Document CRUD: `write`, `read`, `query`, `delete`, `list_collections`, `search` (semantic) on named JSON collections |
 | `memclaw_entity_get` | Look up an entity with linked memories and relations |
 | `memclaw_tune` | Tune per-agent retrieval parameters (top_k, min_similarity, graph_max_hops, etc.) |
 | `memclaw_insights` | Analyze the memory store across 6 focus modes. Findings persist as `insight` memories |
 | `memclaw_evolve` | Report outcomes against recalled memories — adjusts weights, generates rules (Karpathy Loop) |
+| `memclaw_stats` | Aggregate counts: total + breakdowns by type, agent, status. Read-only |
+| `memclaw_share_skill` | Share a SKILL.md with the fleet. Default publishes to the catalog; `install_on_fleet=true` also auto-installs on every fleet node |
+| `memclaw_unshare_skill` | Remove a shared skill. Default removes from catalog only; `unshare_from_fleet=true` also rms the local SKILL.md on fleet nodes |
 
 ### Install the skill (Claude Code & Codex)
 
 Install MemClaw's usage guide as a **skill** so your agent knows *when* and
-*how* to use the 9 tools — the memory/doc mental model, the three rules
+*how* to use the 12 tools — the memory/doc mental model, the three rules
 (recall, write, supersede), trust levels, common patterns, and
 anti-patterns. The skill is loaded on-demand (not per-turn), so it costs
 nothing until the agent reaches for MemClaw.
@@ -711,7 +714,7 @@ memclaw/
 ├── core-api/                      # Main FastAPI service
 │   └── src/core_api/
 │       ├── app.py                 # FastAPI app, lifespan, middleware
-│       ├── mcp_server.py          # MCP server (Streamable HTTP, 9 tools)
+│       ├── mcp_server.py          # MCP server (Streamable HTTP, 12 tools)
 │       ├── constants.py           # Tool descriptions, limits, ranking params
 │       ├── config.py              # Settings (env vars)
 │       ├── auth.py                # API key + JWT auth, tenant enforcement
@@ -772,7 +775,7 @@ MemClaw v1.x follows [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html). The su
 
 ### Stable surfaces
 
-#### MCP tools (9)
+#### MCP tools (12)
 
 The MCP server is mounted at `/mcp`. Tool names, parameter names, and the documented op-dispatch values are stable.
 
@@ -780,13 +783,16 @@ The MCP server is mounted at `/mcp`. Tool names, parameter names, and the docume
 |---|---|
 | `memclaw_recall` | Hybrid semantic + keyword search over memories, with optional LLM-summarised brief. |
 | `memclaw_write` | Single or batch (≤100) memory write; auto-enriched with type, title, summary, tags. |
-| `memclaw_manage` | Per-memory lifecycle, op-dispatched: `read` \| `update` \| `transition` \| `delete`. |
+| `memclaw_manage` | Per-memory lifecycle, op-dispatched: `read` \| `update` \| `transition` \| `delete` \| `bulk_delete` \| `lineage`. |
 | `memclaw_list` | Non-semantic enumeration with filters, sort, cursor pagination. |
 | `memclaw_doc` | Structured-document CRUD, op-dispatched: `write` \| `read` \| `query` \| `delete` \| `list_collections` \| `search`. |
 | `memclaw_entity_get` | Look up a knowledge-graph entity by UUID. |
 | `memclaw_tune` | Read/update an agent's per-search profile (top_k, fts_weight, freshness, blend, …). |
 | `memclaw_insights` | Karpathy-Loop reflection: contradictions, failures, stale, divergence, patterns, discover. |
 | `memclaw_evolve` | Karpathy-Loop feedback: record an outcome (`success` \| `failure` \| `partial`) against memories. |
+| `memclaw_stats` | Aggregate counts: total + breakdowns by `type` / `agent` / `status`. Read-only. |
+| `memclaw_share_skill` | Share a SKILL.md with the fleet. Default publishes to the catalog (semantic-searchable); `install_on_fleet=true` also auto-installs on every fleet node. |
+| `memclaw_unshare_skill` | Remove a shared skill. Default removes from catalog only; `unshare_from_fleet=true` also rms the local SKILL.md on fleet nodes. |
 
 #### REST endpoints
 

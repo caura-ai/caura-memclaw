@@ -306,7 +306,7 @@ if (!config.plugins.load.paths.includes(pluginDir)) config.plugins.load.paths.pu
 
 if (!config.tools) config.tools = {{}};
 if (!Array.isArray(config.tools.alsoAllow)) config.tools.alsoAllow = [];
-const tools = ['memclaw_recall','memclaw_write','memclaw_manage','memclaw_doc','memclaw_list','memclaw_entity_get','memclaw_tune','memclaw_insights','memclaw_evolve','memclaw_stats'];
+const tools = ['memclaw_recall','memclaw_write','memclaw_manage','memclaw_doc','memclaw_list','memclaw_entity_get','memclaw_tune','memclaw_insights','memclaw_evolve','memclaw_stats','memclaw_share_skill','memclaw_unshare_skill'];
 for (const t of tools) {{
   if (!config.tools.alsoAllow.includes(t)) config.tools.alsoAllow.push(t);
 }}
@@ -388,7 +388,7 @@ echo '  macOS:  launchctl kickstart -k "gui/$(id -u)/ai.openclaw.gateway"'
 echo ""
 echo "After restart, MemClaw will:"
 echo "  1. Claim the memory slot (replacing memory-core)"
-echo "  2. Load the plugin and register 10 tools"
+echo "  2. Load the plugin and register 12 tools"
 echo "  3. Auto-educate your agents (SKILL.md, TOOLS.md, AGENTS.md, HEARTBEAT.md)"
 echo "  4. Start heartbeating to the MemClaw API"
 echo ""

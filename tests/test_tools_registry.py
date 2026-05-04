@@ -11,6 +11,7 @@ future refactors can't silently break it:
 - No name collisions.
 - The plugin-exposed set matches the expected v1.0 surface.
 """
+
 from __future__ import annotations
 
 import inspect
@@ -31,6 +32,8 @@ EXPECTED_PLUGIN_EXPOSED = {
     "memclaw_insights",
     "memclaw_evolve",
     "memclaw_stats",
+    "memclaw_share_skill",
+    "memclaw_unshare_skill",
 }
 
 EXPECTED_PLACEHOLDERS: set[str] = set()
@@ -117,8 +120,6 @@ def test_placeholders_are_reserved_set():
         name for name, spec in REGISTRY.items() if spec.impl_status == "reserved"
     }
     assert reserved == EXPECTED_PLACEHOLDERS
-
-
 
 
 def test_op_dispatched_tools_have_expected_op_sets():

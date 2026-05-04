@@ -6,6 +6,7 @@ of which 7 are live and 3 are knowledge-layer placeholders — plus 3
 STM tools). The pre-consolidation `*_16tools.json` baselines are kept
 in `tests/fixtures/` for token-budget delta measurement.
 """
+
 from __future__ import annotations
 
 import json
@@ -16,7 +17,7 @@ import pytest
 pytestmark = pytest.mark.unit
 
 FIXTURES = Path(__file__).parent / "fixtures"
-EXPECTED_TOOL_COUNT = 10
+EXPECTED_TOOL_COUNT = 12
 
 
 @pytest.mark.asyncio
@@ -49,7 +50,6 @@ def test_registry_has_v1_spec_count():
     from core_api.tools import REGISTRY
 
     assert len(REGISTRY) == EXPECTED_TOOL_COUNT
-
 
 
 def test_no_placeholders_remain():

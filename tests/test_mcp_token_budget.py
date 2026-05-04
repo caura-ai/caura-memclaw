@@ -5,6 +5,7 @@ Asserts ``tools/list`` encodes to ≤ ``CEILING_TOKENS`` cl100k tokens.
 Skipped if ``tiktoken`` isn't installed (the package is available in this
 repo's venv; a dev running the suite without it just skips this gate).
 """
+
 from __future__ import annotations
 
 import json
@@ -19,9 +20,10 @@ tiktoken = pytest.importorskip("tiktoken")
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
-# Current measured count is 3919 tokens. Ceiling gives ~8% headroom for
-# minor future description edits before drifting triggers.
-CEILING_TOKENS = 4250
+# Current measured count is 4462 tokens (11 tools, post-share_skill).
+# Ceiling gives ~12% headroom for 1-2 more tools or description tweaks
+# before the gate trips. Raise intentionally when the surface grows.
+CEILING_TOKENS = 5000
 
 
 def _count(path: Path) -> int:
