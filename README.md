@@ -72,6 +72,8 @@ Get up and running in minutes — no infrastructure, automatic updates, usage an
 The fastest path is Docker Compose — one command brings up Postgres + pgvector + Redis + the API.
 
 > **Prefer not to use Docker?** Skip to [Manual deployment (Python + Postgres)](#manual-deployment) below for the bare-Python path.
+>
+> **No cloud API key, no external calls?** v2.0+ supports a self-hosted local embedder (`BAAI/bge-m3` via HuggingFace TEI) — see [`docs/local-embedder.md`](docs/local-embedder.md). The setup below walks through the OpenAI default; the local-embedder doc walks through the alternative.
 
 #### Prerequisites
 
@@ -99,8 +101,16 @@ OPENAI_API_KEY=sk-...
 
 > Without any AI keys the stack still starts — dummy providers return non-semantic embeddings, useful for testing the API surface.
 
+> 💡 **Want zero cloud API calls?** v2.0+ ships a self-hosted embedder
+> profile (`BAAI/bge-m3` on a [HuggingFace TEI](https://github.com/huggingface/text-embeddings-inference)
+> sidecar). Bring up the stack with `docker compose --profile embed-local up -d`
+> and set the four `OPENAI_EMBEDDING_*` envs from `.env.example` — see
+> [`docs/local-embedder.md`](docs/local-embedder.md) for the full setup.
+> Combined with `IS_STANDALONE=true` (below) this is a fully self-contained
+> deployment with no external API calls.
+
 <details>
-<summary>Other providers (Gemini, Anthropic, OpenRouter)</summary>
+<summary>Other providers (Gemini, Anthropic, OpenRouter, self-hosted)</summary>
 
 | Provider | `.env` settings | Required key |
 |---|---|---|
@@ -108,8 +118,9 @@ OPENAI_API_KEY=sk-...
 | **Google Gemini** | `EMBEDDING_PROVIDER=openai`<br>`ENTITY_EXTRACTION_PROVIDER=gemini` | `GEMINI_API_KEY` + `OPENAI_API_KEY` |
 | **Anthropic** | `EMBEDDING_PROVIDER=openai`<br>`ENTITY_EXTRACTION_PROVIDER=anthropic` | `ANTHROPIC_API_KEY` + `OPENAI_API_KEY` |
 | **OpenRouter** | `EMBEDDING_PROVIDER=openai`<br>`ENTITY_EXTRACTION_PROVIDER=openrouter` | `OPENROUTER_API_KEY` + `OPENAI_API_KEY` |
+| **Self-hosted (TEI / bge-m3)** | `--profile embed-local` + `OPENAI_EMBEDDING_BASE_URL=http://tei:80/v1`<br>+ `OPENAI_EMBEDDING_MODEL=BAAI/bge-m3`<br>+ `OPENAI_EMBEDDING_SEND_DIMENSIONS=false` | none — runs locally |
 
-Anthropic, Gemini, and OpenRouter don't offer embedding APIs here — pair them with OpenAI for embeddings. You can mix providers freely. Gemini uses the [Google AI Studio](https://aistudio.google.com/) key-auth Developer API (no GCP project/ADC required).
+Anthropic, Gemini, and OpenRouter don't offer embedding APIs here — pair them with OpenAI (or with TEI) for embeddings. You can mix providers freely. Gemini uses the [Google AI Studio](https://aistudio.google.com/) key-auth Developer API (no GCP project/ADC required). The self-hosted TEI row keeps `EMBEDDING_PROVIDER=openai` because TEI speaks the same OpenAI-compatible API; see [`docs/local-embedder.md`](docs/local-embedder.md) for hardware sizing, GPU setup, and model swapping.
 
 </details>
 
@@ -170,6 +181,8 @@ OSS supports three auth paths. Pick one and add it to your `.env`, then `docker 
 IS_STANDALONE=true
 ```
 No API key required for REST. MCP still expects a non-empty `X-API-Key` header — any value works.
+
+> Pair Standalone mode with `--profile embed-local` (see [`docs/local-embedder.md`](docs/local-embedder.md)) for a fully self-contained deployment: no admin keys, no external API calls, all embeddings computed locally. Useful for offline / air-gapped environments and personal-laptop installs.
 
 **Admin key** — multi-tenant with full access:
 ```env
