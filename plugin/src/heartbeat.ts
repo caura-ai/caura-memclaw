@@ -219,41 +219,32 @@ export async function sendHeartbeat(): Promise<void> {
     const sharedSkillPath = join(getPluginDir(), "skills", "memclaw", "SKILL.md");
     const sharedSkillPresent = existsSync(sharedSkillPath);
 
-    // Auto-educate any workspace missing TOOLS.md or AGENTS.md (new agents
-    // added after install).
-    const uneducatedWorkspaces: string[] = [];
-    for (const [ws, checks] of Object.entries(workspaceFiles)) {
-      if (!checks.tools_md) {
-        const wsAgent = ws === "workspace" ? "main" : ws.replace("workspace-", "");
-        uneducatedWorkspaces.push(wsAgent);
-      }
-    }
-    if (uneducatedWorkspaces.length > 0) {
-      try {
-        const filesResult = writeEducationFiles(
-          buildToolsMd(),
-          buildAgentsMd(),
-          uneducatedWorkspaces,
+    // Auto-educate every discovered workspace on each heartbeat. This is
+    // safe and cheap: writeEducationFiles uses versioned fence markers and
+    // is a no-op when each workspace already carries the current-version
+    // block. The pre-A1 filter ("only workspaces whose TOOLS.md does not
+    // already mention memclaw") would skip workspaces with stale-version
+    // content — exactly the population we now need to migrate.
+    try {
+      const filesResult = writeEducationFiles(
+        buildToolsMd(),
+        buildAgentsMd(),
+      );
+      if (filesResult.toolsUpdated > 0 || filesResult.agentsUpdated > 0) {
+        console.log(
+          `[memclaw] Auto-educated workspaces on heartbeat ` +
+            `(TOOLS.md: ${filesResult.toolsUpdated}, AGENTS.md: ${filesResult.agentsUpdated})`,
         );
-        if (filesResult.toolsUpdated > 0 || filesResult.agentsUpdated > 0) {
-          console.log(
-            `[memclaw] Auto-educated ${filesResult.toolsUpdated} new workspace(s) on heartbeat ` +
-              `(TOOLS.md: ${filesResult.toolsUpdated}, AGENTS.md: ${filesResult.agentsUpdated})`,
-          );
-          // Re-check after writing
-          for (const ws of uneducatedWorkspaces) {
-            const wsDir = ws === "main" ? "workspace" : `workspace-${ws}`;
-            const wsPath = join(ocBase, wsDir);
-            if (workspaceFiles[wsDir]) {
-              workspaceFiles[wsDir].tools_md =
-                existsSync(join(wsPath, "TOOLS.md")) &&
-                readFileSync(join(wsPath, "TOOLS.md"), "utf-8").toLowerCase().includes("memclaw");
-            }
-          }
+        // Re-check tools_md presence so setup_status reflects the write.
+        for (const wsDir of Object.keys(workspaceFiles)) {
+          const wsPath = join(ocBase, wsDir);
+          workspaceFiles[wsDir].tools_md =
+            existsSync(join(wsPath, "TOOLS.md")) &&
+            readFileSync(join(wsPath, "TOOLS.md"), "utf-8").toLowerCase().includes("memclaw");
         }
-      } catch {
-        // Auto-educate failed
       }
+    } catch (e: unknown) {
+      logError("Auto-educate failed", e);
     }
 
     // Backend reachability, populated by the 10-tick health probe below and
@@ -495,6 +486,7 @@ async function processCommand(cmd: {
       const payload = cmd.payload || {};
       const prompt = payload.prompt as string | undefined;
       const agent_ids = payload.agent_ids as string[] | undefined;
+      const force = payload.force === true;
       if (!prompt) {
         status = "failed";
         result = { error: "no prompt" };
@@ -505,6 +497,8 @@ async function processCommand(cmd: {
           buildToolsMd(),
           buildAgentsMd(),
           agent_ids,
+          undefined,
+          { force },
         );
         const noEffect =
           educateResult.verified === 0 &&

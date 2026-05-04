@@ -83,9 +83,69 @@ unless you need cross-agent context.
 If you need semantic search, it's a memory. If you need keyed lookup,
 it's a doc. If you already hold an ID, it's an entity.
 
-## Good memories
+## Where things go: MemClaw vs file scratchpads
 
-Dated, concrete, standalone, atomic, updated (not duplicated).
+MemClaw is the only place for cross-session, cross-agent knowledge. A
+file-based scratchpad in your workspace (e.g. `MEMORY.md`) is
+session-local — it lives in your bootstrap context every turn and pays
+input tokens for every byte.
+
+Keep `MEMORY.md` lean: only **active projects, current routing
+decisions, recent decisions (≤ 7 days), open threads**. Target a few
+KB; treat anything older or larger as smell. If the runtime promotes
+data into `MEMORY.md`, prune it on session start.
+
+Anything else goes to MemClaw via `memclaw_write`:
+- Historical decisions, finished projects, lessons → memories.
+- Reference data with a natural key (IP tables, contact lists, configs)
+  → `memclaw_doc` collections, fetched on demand.
+- People, projects, services as named graph objects → entities.
+
+Never copy MemClaw recall results into `MEMORY.md` — they're already
+retrievable. Never let `MEMORY.md` accumulate by append-only; pruning
+is part of the L2 / L3 capture cadence below.
+
+## Quality
+
+Every memory MUST include a date. Prefer concrete over vague, atomic
+over sprawling, **update over near-duplicate**. Each memory should be
+**self-contained** — readable by another agent six months from now
+without the surrounding session. Include the **why** (motivation,
+constraint, trigger) alongside the *what* — facts without context
+become unactionable. Before writing a key fact, recall for
+contradictions and transition the older memory to `outdated` in the
+same turn. One topic per memory; batch multiple discrete records into
+one `memclaw_write` call.
+
+## Capture cadence (L1 / L2 / L3)
+
+- **L1 — per turn.** After each meaningful outcome, write with date,
+  what, who, outcome, next.
+- **L2 — session boundary.** At > 60 % context or session end, write
+  a full summary.
+- **L3 — consolidation.** On periodic runtime sweeps, find gaps, merge
+  duplicates, transition contradicted facts to `outdated`.
+
+## Orchestrator + subagent protocol
+
+If your runtime dispatches subagents:
+- The spawning agent MUST write findings after every subagent completion.
+- The subagent MUST write its own findings before handing back.
+- Both writes MUST carry their own `agent_id`.
+
+Single-agent runtimes ignore this section.
+
+## Prohibitions
+
+- NEVER fabricate or impersonate `agent_id` / `fleet_id`.
+- NEVER delete memories you merely disagree with — transition them to
+  `outdated` or `archived`. `op=delete` is a soft-delete, requires
+  trust 3, and is reserved for genuinely wrong data.
+- NEVER write with org-wide visibility (`scope_org`) unless the memory
+  is genuinely org-relevant.
+- NEVER silently drop a denied call — surface the error so the
+  orchestrator can decide whether to escalate.
+- NEVER substitute local files or scratchpads for MemClaw writes.
 
 ## Discovering shared skills
 
@@ -123,7 +183,7 @@ mandatory.
 
 1. Recall — "what is known about this?" / "what happened since last session?"
 2. Work — act on the recalled context.
-3. Write — at checkpoints and session end.
+3. Write — at checkpoints and session end (see L1/L2/L3 above).
 4. Evolve — if you acted on specific memories, report the outcome (trust 2).
 
 ---
@@ -179,6 +239,12 @@ Close the loop. `outcome_type` ∈ {success, failure, partial}.
 `related_ids` = the recall IDs you acted on. Success reinforces weights;
 failure auto-creates `rule` memories. Trust 2.
 
+**`memclaw_stats(scope="agent", fleet_id=?, memory_type=?, status=?)`**
+Aggregate counts: `{total, by_type, by_agent, by_status, scope}`.
+Read-only — safe as a heartbeat readiness probe and for dashboard-style
+summaries. Never use a write+delete pattern for health checks; use this.
+`scope="fleet"` / `"all"` → trust 2.
+
 **`memclaw_share_skill(name, description, content, target_fleet_id, install_on_fleet=false, version=1)`**
 Share a SKILL.md. `name` is a slug (`[a-z0-9._-]`, 1-100 chars) used
 as the upsert key and on-disk directory. The `description` field is
@@ -207,6 +273,7 @@ SKILL.md (idempotent). Trust 1.
 - Acted on a recalled memory → `memclaw_evolve`
 - Recall quality off across queries → `memclaw_tune` (once, sticky)
 - Session boundary / orchestrator sweep → `memclaw_insights`
+- Heartbeat readiness probe / counts dashboard → `memclaw_stats`
 - Stuck on a non-trivial workflow → search by meaning (`GET /skills?query=...`) or browse (`memclaw_doc op=query collection=skills`) before improvising
 - Built a reusable workflow → `memclaw_share_skill` to teach the fleet
 - Skill is wrong / superseded → `memclaw_unshare_skill` to remove it
