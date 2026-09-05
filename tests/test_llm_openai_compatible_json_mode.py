@@ -212,7 +212,7 @@ class TestOptionalFieldsUnderStrictMode:
             assert prop.get("anyOf", [{}])[-1] == {"type": "null"}, name
         # A null is dropped for every field the model would have omitted, and
         # kept only where the source schema itself admits null.
-        reply = {name: None for name in source["properties"]}
+        reply = dict.fromkeys(source["properties"])
         nullable = {
             name
             for name, prop in source["properties"].items()
