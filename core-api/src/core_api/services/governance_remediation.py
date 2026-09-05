@@ -2,7 +2,7 @@
 
 In fast mode (the default) enrichment is deferred to core-worker, which PATCHes
 the LLM's ``contains_pii`` / ``business_relevance`` onto the already-persisted
-row. The ``memclaw.memory.enriched`` consumer then calls
+row. The ``caura.memory.enriched`` consumer then calls
 :func:`remediate_after_enrichment` to apply the tenant's configured action on
 that free-form signal — the fast-mode counterpart to the synchronous
 ``GovernanceDecision`` step (strong mode).

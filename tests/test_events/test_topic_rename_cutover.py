@@ -22,13 +22,14 @@ described:
 The rest is about which way each default points, because the two backends need
 opposite ones and a missing twin fails differently in each.
 
-THE CONTRACT CHANGES WHAT A DEFAULT-CONSTRUCTED BUS MEANS AGAIN. ``lifecycle``
-stays in ``FLIPPED_FAMILIES``, but all nine of its enum members now carry the
-current name. ``memory`` is deliberately still pre-contract: its members carry
-the legacy names, so its publisher flip makes the construction guard require
-dual-subscribe again. Tests about *the flag's parse rule* still take the
-``nothing_flipped`` fixture so their precondition cannot depend on cutover
-state; flip and contract assertions use the real set below.
+EVERY FLIPPED FAMILY IS NOW CONTRACTED, WHICH CHANGES WHAT THESE TESTS CAN USE.
+``lifecycle`` and ``memory`` both stay in ``FLIPPED_FAMILIES`` while carrying the
+current names, so ``renamed`` is the identity for them and a default-constructed
+bus is legal again. That also means the silent-failure state this file exists to
+pin can no longer be reached through any real declaration: a test that reaches
+for a real family to demonstrate it goes VACUOUS. Those tests use ``PRE_CONTRACT``
+instead. Tests about *the flag's parse rule* still take the ``nothing_flipped``
+fixture so their precondition cannot depend on cutover state.
 """
 
 from __future__ import annotations
@@ -49,12 +50,12 @@ from common.events.factory import get_event_bus, reset_event_bus_for_testing
 def nothing_flipped(monkeypatch: pytest.MonkeyPatch) -> None:
     """Decouple flag-parse tests from the current family cutover state.
 
-    Contracting ``lifecycle`` made ``dual=False`` constructible again; the
-    uncontracted ``memory`` flip makes the real set require dual-subscribe once
-    more. Tests using this fixture ask a separate question — whether blank
-    parses as off and whether the Pub/Sub backend defaults to one name. Emptying
-    the set keeps those tests independent of cutover state while leaving the
-    bus, factory and parser themselves untouched.
+    Contracting ``lifecycle`` and then ``memory`` made ``dual=False``
+    constructible again, and a later flip will make the real set require
+    dual-subscribe once more. Tests using this fixture ask a separate question —
+    whether blank parses as off and whether the Pub/Sub backend defaults to one
+    name. Emptying the set keeps those tests independent of cutover state while
+    leaving the bus, factory and parser themselves untouched.
 
     The alternative, passing ``dual_subscribe=True``, would silently change what
     those tests assert — they would stop covering the default path, which is the
@@ -65,8 +66,10 @@ def nothing_flipped(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def bus() -> PubSubEventBus:
-    # dual on: this is what all 12 pubsub-backed deployables actually run, and
-    # it is the required operational setting for the memory flip.
+    # dual on: what the pubsub-backed deployables actually run. Deliberately
+    # no count here -- ``check_flip_readiness.py`` reports "12/12" against a set
+    # it enumerates wrongly, and repeating the figure in a docstring is how a
+    # wrong denominator travels.
     b = PubSubEventBus(
         project_id="proj", subscription_prefix="test", dual_subscribe=True
     )
@@ -117,11 +120,18 @@ def test_subscribe_names_defaults_to_the_current_name_only() -> None:
 
 
 def test_subscribe_names_dual_returns_both_without_duplicates() -> None:
-    both = topics_mod.subscribe_names(Topics.Memory.EMBEDDED, dual=True)
-    assert both == (str(Topics.Memory.EMBEDDED), "caura.memory.embedded")
+    # Exercised through ``audit``, which has NOT been renamed. ``subscribe_names``
+    # never consults ``FLIPPED_FAMILIES`` — it returns two names whenever
+    # ``renamed`` moves the name — so the only requirement is a member still on
+    # the outgoing prefix. It used to be ``memory``; that member is contracted
+    # now and yields one name, which is the case asserted just below.
+    both = topics_mod.subscribe_names(Topics.Audit.EVENT_RECORDED, dual=True)
+    assert both == (str(Topics.Audit.EVENT_RECORDED), "caura.audit.event-recorded")
     # An already-renamed name must yield ONE entry, not the same string twice —
-    # a duplicate would register the handler twice and double-dispatch it.
-    assert topics_mod.subscribe_names("caura.memory.embedded", dual=True) == (
+    # a duplicate would register the handler twice and double-dispatch it. Read
+    # off a real contracted member rather than a hand-written string, so it stays
+    # true to what the module declares.
+    assert topics_mod.subscribe_names(Topics.Memory.EMBEDDED, dual=True) == (
         "caura.memory.embedded",
     )
 
@@ -136,6 +146,16 @@ def test_subscribe_names_dual_returns_both_without_duplicates() -> None:
 # equality in ``test_exactly_the_flipped_families_are_flipped`` is what turns the
 # second one into a deliberate stop rather than a chore.
 FLIPPED = frozenset({"lifecycle", "memory"})
+
+# A synthetic flipped-but-NOT-contracted topic, for the tests that need the
+# silent-failure state to exist. Every real family here is now either unflipped
+# or contracted, so that state can no longer be reached through the module's own
+# declarations -- and a test that reaches for a real family goes VACUOUS the day
+# that family contracts, passing whether or not the guard still works. Spelling
+# it makes these tests independent of how far the cutover has got. Deliberately
+# not a name any environment serves.
+PRE_CONTRACT = "legacy.pipeline.entity-extracted"
+PRE_CONTRACT_FAMILY = "pipeline"
 # Hand-spelled independently of ``Topics.Lifecycle`` so a new member requires an
 # explicit contract decision. An already-contracted family has no legacy twin to
 # bind: its current-topic infrastructure must exist before a new member ships.
@@ -327,10 +347,13 @@ def test_pubsub_subscribe_binds_both_names_when_enabled() -> None:
     b = PubSubEventBus(
         project_id="proj", subscription_prefix="core-api", dual_subscribe=True
     )
-    b.subscribe(Topics.Memory.EMBEDDED, handler)
+    # ``audit`` is still on the outgoing prefix, so it has a twin to bind.
+    # ``memory`` is contracted and would bind exactly one name, which would make
+    # this assertion pass without testing the expansion at all.
+    b.subscribe(Topics.Audit.EVENT_RECORDED, handler)
     assert sorted(b._handlers) == [
-        "caura.memory.embedded",
-        str(Topics.Memory.EMBEDDED),
+        "caura.audit.event-recorded",
+        str(Topics.Audit.EVENT_RECORDED),
     ]
     # One handler per name, not two on one name.
     assert all(len(hs) == 1 for hs in b._handlers.values())
@@ -374,10 +397,12 @@ def test_inprocess_binds_both_names_with_no_flag() -> None:
     flipped, instead of silently delivering to nobody.
     """
     b = InProcessEventBus()
-    b.subscribe(Topics.Memory.EMBEDDED, handler)
+    # ``audit`` for the same reason as the Pub/Sub case above: a contracted
+    # member binds one name and would make this pass vacuously.
+    b.subscribe(Topics.Audit.EVENT_RECORDED, handler)
     assert sorted(b._handlers) == [
-        "caura.memory.embedded",
-        str(Topics.Memory.EMBEDDED),
+        "caura.audit.event-recorded",
+        str(Topics.Audit.EVENT_RECORDED),
     ]
 
 
@@ -404,15 +429,21 @@ async def test_a_flipped_family_still_reaches_a_dual_bound_subscriber(
     receives it, exactly once. Without the dual binding this same flip delivers
     the event to nobody, with no error on either side.
     """
-    monkeypatch.setattr(topics_mod, "FLIPPED_FAMILIES", frozenset({"memory"}))
+    # PRE_CONTRACT, not a real family: with every real one contracted, the
+    # publish name and the single bound name would agree and this would pass
+    # without a dual binding existing at all — the exact opposite of what it
+    # claims to show. Its counterfactual sibling below uses the same topic.
+    monkeypatch.setattr(
+        topics_mod, "FLIPPED_FAMILIES", frozenset({PRE_CONTRACT_FAMILY})
+    )
     b = InProcessEventBus()
     seen: list[str] = []
 
     async def record(event: Event) -> None:
         seen.append(str(event.event_type))
 
-    b.subscribe(Topics.Memory.EMBEDDED, record)
-    await b.publish(Topics.Memory.EMBEDDED, Event(event_type=Topics.Memory.EMBEDDED))
+    b.subscribe(PRE_CONTRACT, record)
+    await b.publish(PRE_CONTRACT, Event(event_type=PRE_CONTRACT))
     await b.drain()
     assert len(seen) == 1
 
@@ -431,15 +462,17 @@ async def test_a_flipped_family_reaches_nobody_without_the_dual_binding(
     The event goes nowhere and nothing raises, which is precisely why this
     ordering is not optional.
     """
-    monkeypatch.setattr(topics_mod, "FLIPPED_FAMILIES", frozenset({"memory"}))
+    monkeypatch.setattr(
+        topics_mod, "FLIPPED_FAMILIES", frozenset({PRE_CONTRACT_FAMILY})
+    )
     b = InProcessEventBus()
     seen: list[str] = []
 
     async def record(event: Event) -> None:
         seen.append(str(event.event_type))
 
-    b._handlers[str(Topics.Memory.EMBEDDED)].append(record)  # single-name binding
-    await b.publish(Topics.Memory.EMBEDDED, Event(event_type=Topics.Memory.EMBEDDED))
+    b._handlers[PRE_CONTRACT].append(record)  # single-name binding
+    await b.publish(PRE_CONTRACT, Event(event_type=PRE_CONTRACT))
     await b.drain()
     assert seen == []
 
@@ -505,18 +538,21 @@ async def test_dual_subscribe_flag_reads_anything_but_an_explicit_yes_as_off(
 
 # ── the guard: refuse to publish where nothing is bound (#913) ───────────────
 #
-# A still-uncontracted flipped family publishing under its renamed name while a
-# dual-off subscriber binds only the legacy literal fails with no signal. The
-# construction guard refuses that mismatch, while permitting a contracted family
-# whose publish and subscribe names already agree. These tests pin both edges.
+# A flipped-but-not-yet-contracted family publishing under its renamed name
+# while a dual-off subscriber binds only the legacy literal fails with no
+# signal. The construction guard refuses that mismatch, while permitting a
+# contracted family whose publish and subscribe names already agree. These tests
+# pin both edges -- the hazardous one through ``PRE_CONTRACT``, since no real
+# family is in that state today.
 
 
 def test_nothing_publishes_unbound_in_the_configuration_the_services_run() -> None:
     """The deployed dual-on setting leaves no publisher unbound.
 
-    Contracted lifecycle members are safe with either setting, while the
-    uncontracted memory flip depends on dual-on. All 12 pubsub-backed
-    deployables were re-confirmed running this setting before the memory flip.
+    Every flipped family is contracted, so this holds for the same reason
+    ``dual=False`` does. It is asserted separately because dual-on is what the
+    deployables actually run, and the two settings are allowed to diverge again
+    the moment a new family flips.
     """
     assert topics_mod.unbound_publish_topics(dual=True) == ()
 
@@ -525,17 +561,24 @@ def test_unbound_publish_topics_names_a_flipped_family_when_dual_is_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Flipped + dual off is the hazard, and it is reported per topic."""
-    monkeypatch.setattr(topics_mod, "FLIPPED_FAMILIES", frozenset({"memory"}))
+    monkeypatch.setattr(
+        topics_mod, "FLIPPED_FAMILIES", frozenset({PRE_CONTRACT_FAMILY})
+    )
+    monkeypatch.setattr(
+        topics_mod, "all_topics", lambda: (PRE_CONTRACT, Topics.Audit.EVENT_RECORDED)
+    )
     unbound = topics_mod.unbound_publish_topics(dual=False)
     assert unbound, "a flipped family with dual off must be reported"
-    assert all(topics_mod.family(t) == "memory" for t in unbound)
+    assert all(topics_mod.family(t) == PRE_CONTRACT_FAMILY for t in unbound)
+    assert PRE_CONTRACT in unbound
     # Every reported topic really would go nowhere: the name it publishes under
     # is absent from the names a dual=False subscriber binds.
     for topic in unbound:
         assert topics_mod.publish_name(topic) not in topics_mod.subscribe_names(
             topic, dual=False
         )
-    # A family that has NOT flipped is not swept up in the report.
+    # A family that has NOT flipped is not swept up in the report — audit above
+    # all, since it is the one that must flip last.
     assert not any(topics_mod.family(t) == "audit" for t in unbound)
 
 
@@ -543,7 +586,10 @@ def test_dual_subscribe_makes_a_flipped_family_bound_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The same flip with dual on is exactly what step 2 bought."""
-    monkeypatch.setattr(topics_mod, "FLIPPED_FAMILIES", frozenset({"memory"}))
+    monkeypatch.setattr(
+        topics_mod, "FLIPPED_FAMILIES", frozenset({PRE_CONTRACT_FAMILY})
+    )
+    monkeypatch.setattr(topics_mod, "all_topics", lambda: (PRE_CONTRACT,))
     assert topics_mod.unbound_publish_topics(dual=True) == ()
 
 
@@ -556,7 +602,10 @@ def test_pubsub_bus_refuses_to_construct_when_a_flip_has_nothing_bound(
     ``start()``, so a check there would leave the write side unguarded, which is
     the side that does the losing.
     """
-    monkeypatch.setattr(topics_mod, "FLIPPED_FAMILIES", frozenset({"memory"}))
+    monkeypatch.setattr(
+        topics_mod, "FLIPPED_FAMILIES", frozenset({PRE_CONTRACT_FAMILY})
+    )
+    monkeypatch.setattr(topics_mod, "all_topics", lambda: (PRE_CONTRACT,))
     with pytest.raises(ValueError, match="does not bind"):
         PubSubEventBus(project_id="proj", subscription_prefix="test")
 
@@ -565,7 +614,10 @@ def test_pubsub_bus_constructs_when_the_flip_is_matched_by_dual_subscribe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The guard is about the MISMATCH, not about having flipped anything."""
-    monkeypatch.setattr(topics_mod, "FLIPPED_FAMILIES", frozenset({"memory"}))
+    monkeypatch.setattr(
+        topics_mod, "FLIPPED_FAMILIES", frozenset({PRE_CONTRACT_FAMILY})
+    )
+    monkeypatch.setattr(topics_mod, "all_topics", lambda: (PRE_CONTRACT,))
     b = PubSubEventBus(
         project_id="proj", subscription_prefix="test", dual_subscribe=True
     )
@@ -589,8 +641,10 @@ def test_the_guard_does_not_fire_once_lifecycle_is_fully_contracted(
     This uses the real nine-member family rather than a one-topic simulation so
     one missed literal cannot hide behind the other eight contracted members.
     """
-    # Isolate the contracted family from the real, still-uncontracted memory
-    # flip: non-empty FLIPPED_FAMILIES, dual off, and nothing is unbound.
+    # Isolate one contracted family: non-empty FLIPPED_FAMILIES, dual off, and
+    # nothing is unbound. ``memory`` is contracted too now, so this no longer
+    # needs to exclude it -- it is kept scoped so the assertion still names
+    # which family it is making the claim about.
     monkeypatch.setattr(topics_mod, "FLIPPED_FAMILIES", frozenset({"lifecycle"}))
     assert topics_mod.unbound_publish_topics(dual=False) == ()
     PubSubEventBus(project_id="proj", subscription_prefix="test")
