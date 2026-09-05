@@ -160,7 +160,7 @@ export class Caura {
     const payload = data as Record<string, unknown>;
     const supporting: unknown = payload.memories ?? payload.items;
     return {
-      summary: payload.summary ?? null,
+      summary: typeof payload.summary === "string" ? payload.summary : null,
       supportingMemories: Array.isArray(supporting)
         ? supporting.map((m) => toMemory(m as Record<string, any>))
         : [],
