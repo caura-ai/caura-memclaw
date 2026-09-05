@@ -212,8 +212,12 @@ class Caura:
                 retry_after = float(response.headers["Retry-After"])
             except (KeyError, ValueError):
                 retry_after = None
-            raise RateLimitError(response.status_code, message or "rate limit exceeded",
-                                 details=details, retry_after=retry_after)
+            raise RateLimitError(
+                response.status_code,
+                message or "rate limit exceeded",
+                details=details,
+                retry_after=retry_after,
+            )
         raise CauraAPIError(response.status_code, message or "request failed", details=details)
 
     # ------------------------------------------------------------- lifecycle
