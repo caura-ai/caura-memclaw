@@ -10,6 +10,14 @@ Only the most recent releases are listed below. Every release, including those
 no longer shown here, is published with its full notes at
 [github.com/caura-ai/caura/releases](https://github.com/caura-ai/caura/releases).
 
+## [2.48.1](https://github.com/caura-ai/caura/compare/backend-v2.48.0...backend-v2.48.1) (2026-09-05)
+
+
+### Bug Fixes
+
+* **events:** stop the malformed-message drop leaking its payload ([#1305](https://github.com/caura-ai/caura/issues/1305)) ([e1faa9c](https://github.com/caura-ai/caura/commit/e1faa9c01a498e5683a6b642f86e80a0666d03a0))
+* **startup:** reject blank and whitespace-padded production secrets ([#1308](https://github.com/caura-ai/caura/issues/1308)) ([5ba6460](https://github.com/caura-ai/caura/commit/5ba64609fd992e49e7bd93c4c8b5f3b513b4a370))
+
 ## [2.48.0](https://github.com/caura-ai/caura/compare/backend-v2.47.5...backend-v2.48.0) (2026-09-05)
 
 
