@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import SecretStr
 
-from core_api.app import _validate_startup_settings
+from core_api.app import _DANGEROUS_DEFAULTS, _validate_startup_settings
 from tests._legacy_contracts import LEGACY_API_KEY_FIELD
 
 
@@ -50,6 +50,7 @@ def test_non_production_environments_skip_production_only_guards(environment):
             gateway_shared_secret=None,
             admin_api_key=None,
             settings_encryption_key=None,
+            jwt_secret="",
             is_standalone=True,
         )
     )
@@ -130,6 +131,103 @@ def test_blank_storage_shared_secrets_are_also_rejected(secret_value):
 def test_production_refuses_the_default_jwt_secret():
     with pytest.raises(RuntimeError, match="JWT_SECRET must be changed"):
         _validate_startup_settings(_prod(jwt_secret="change-me-in-production"))
+
+
+_BLANKS = [
+    pytest.param(None, id="unset"),
+    pytest.param("", id="empty"),
+    pytest.param("   ", id="spaces"),
+    pytest.param("\t\n", id="tab-newline"),
+]
+
+
+@pytest.mark.parametrize("var", sorted(_DANGEROUS_DEFAULTS))
+@pytest.mark.parametrize("blank", _BLANKS)
+def test_production_refuses_a_blank_dangerous_default(var, blank):
+    """A blank secret is not "changed from the default" — it is worse.
+
+    ``SETTINGS_ENCRYPTION_KEY`` is checked for presence ten lines up; this loop
+    compared only against one literal, so ``JWT_SECRET=""`` was not equal to the
+    placeholder and production booted signing API tokens with an empty secret.
+
+    Parametrized over ``_DANGEROUS_DEFAULTS`` rather than naming the field, so
+    the next secret added there is covered the day it is added instead of
+    inheriting the exact gap this closes.
+    """
+    with pytest.raises(RuntimeError, match=f"{var.upper()} must be set"):
+        _validate_startup_settings(_prod(**{var: blank}))
+
+
+@pytest.mark.parametrize("var", sorted(_DANGEROUS_DEFAULTS))
+@pytest.mark.parametrize(
+    "blank", [pytest.param("", id="empty"), pytest.param("   ", id="spaces")]
+)
+def test_production_refuses_a_wrapped_blank_dangerous_default(var, blank):
+    """The unwrap must precede the presence check, not follow it.
+
+    ``SecretStr("")`` is an OBJECT, so it is truthy: a presence test run on the
+    wrapper passes a blank secret straight through. Distinct from the wrapped
+    *default* test below, which covers the equality path rather than this one.
+    """
+    with pytest.raises(RuntimeError, match=f"{var.upper()} must be set"):
+        _validate_startup_settings(_prod(**{var: SecretStr(blank)}))
+
+
+@pytest.mark.parametrize("var, bad_val", sorted(_DANGEROUS_DEFAULTS.items()))
+@pytest.mark.parametrize(
+    "pad",
+    [
+        pytest.param("{}\n", id="trailing-newline"),
+        pytest.param(" {}", id="leading-space"),
+        pytest.param("  {}  ", id="both"),
+    ],
+)
+def test_production_refuses_the_default_even_with_surrounding_whitespace(
+    var, bad_val, pad
+):
+    """The placeholder must not become bootable by picking up whitespace.
+
+    Presence stripped and equality did not, so ``change-me-in-production\n``
+    passed both checks and production signed API tokens with the published
+    default. A trailing newline is not contrived — it is what a file-mounted
+    secret yields (``cat key >> .env``, a k8s ``stringData`` block scalar),
+    which is the delivery path a left-in-place placeholder arrives by.
+    """
+    with pytest.raises(RuntimeError, match=f"{var.upper()} must be changed"):
+        _validate_startup_settings(_prod(**{var: pad.format(bad_val)}))
+
+
+@pytest.mark.parametrize(
+    "field, expected",
+    [
+        pytest.param(
+            "settings_encryption_key", "SETTINGS_ENCRYPTION_KEY", id="fernet-key"
+        ),
+        pytest.param("admin_api_key", "ADMIN_API_KEY", id="admin-key"),
+    ],
+)
+def test_production_refuses_a_whitespace_only_sibling_secret(field, expected):
+    """The same defect class, in the guards either side of the loop.
+
+    Each was a bare truthiness test, so ``"   "`` passed — including
+    SETTINGS_ENCRYPTION_KEY, the guard this fix's own reasoning cites as the
+    one that checked presence properly. It checked presence, not blankness.
+    """
+    with pytest.raises(RuntimeError, match=expected):
+        _validate_startup_settings(_prod(**{field: "   "}))
+
+
+def test_production_refuses_a_whitespace_only_perimeter():
+    """A whitespace gateway secret is an outage dressed as a perimeter.
+
+    HTTP strips optional whitespace from header values, so the gateway's own
+    injected secret arrives empty and every header-trust request 401s. Refusing
+    to boot is the louder failure this block already prefers.
+    """
+    with pytest.raises(RuntimeError, match=r"GATEWAY_SHARED_SECRET|CAURA_API_KEY"):
+        _validate_startup_settings(
+            _prod(gateway_shared_secret="   ", compat_api_key="\n")
+        )
 
 
 def test_a_secretstr_wrapped_default_is_still_caught():
