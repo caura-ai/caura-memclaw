@@ -18,10 +18,10 @@ import enum
 
 
 class Memory(enum.StrEnum):
-    EMBED_REQUESTED = "memclaw.memory.embed-requested"
-    EMBEDDED = "memclaw.memory.embedded"
-    ENRICH_REQUESTED = "memclaw.memory.enrich-requested"
-    ENRICHED = "memclaw.memory.enriched"
+    EMBED_REQUESTED = "caura.memory.embed-requested"
+    EMBEDDED = "caura.memory.embedded"
+    ENRICH_REQUESTED = "caura.memory.enrich-requested"
+    ENRICHED = "caura.memory.enriched"
 
 
 class Audit(enum.StrEnum):
@@ -201,8 +201,17 @@ def family(topic: str) -> str:
 # 16/16 active twin durables (8/environment) attached to their matching twin
 # topics, with no ephemerals. The gates still read configuration only: green is
 # necessary, not delivery proof. Its former blocker is cleared: the unused
-# ``.created`` declaration was removed rather than provisioned. The ``Memory``
-# enum members deliberately remain on the retired brand until contraction.
+# ``.created`` declaration was removed rather than provisioned.
+#
+# ``memory`` CONTRACTED 2026-09-05: the ``Memory`` members now carry the current
+# names, so ``renamed`` is the identity for them and ``subscribe_names`` returns
+# one name instead of two. Contracting it also repaired ``dual_subscribe=False``,
+# which is the DEFAULT: memory was the last family flipped but not contracted, so
+# until this ``unbound_publish_topics(dual=False)`` reported all four of its
+# topics and the bus refused to construct at all for every standalone and on-prem
+# process. It stays in the set below — see ``publish_name``, where membership is
+# a no-op once ``renamed`` is the identity — and comes out with the final sweep,
+# after the legacy topics are deleted.
 #
 # ``pipeline`` must NOT enter this set while it has zero live topics in either
 # environment: publishing to a topic that does not exist is silent loss, so

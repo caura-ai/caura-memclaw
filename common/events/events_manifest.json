@@ -8,9 +8,7 @@
       "caura.lifecycle.forge-distill-requested",
       "caura.lifecycle.insights-requested",
       "caura.memory.embedded",
-      "caura.memory.enriched",
-      "memclaw.memory.embedded",
-      "memclaw.memory.enriched"
+      "caura.memory.enriched"
     ],
     "core-worker": [
       "caura.lifecycle.archive-expired-requested",
@@ -18,9 +16,7 @@
       "caura.lifecycle.embed-backfill-requested",
       "caura.lifecycle.purge-soft-deleted-requested",
       "caura.memory.embed-requested",
-      "caura.memory.enrich-requested",
-      "memclaw.memory.embed-requested",
-      "memclaw.memory.enrich-requested"
+      "caura.memory.enrich-requested"
     ]
   }
 }
