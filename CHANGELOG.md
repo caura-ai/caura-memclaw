@@ -10,6 +10,13 @@ Only the most recent releases are listed below. Every release, including those
 no longer shown here, is published with its full notes at
 [github.com/caura-ai/caura/releases](https://github.com/caura-ai/caura/releases).
 
+## [2.48.2](https://github.com/caura-ai/caura/compare/backend-v2.48.1...backend-v2.48.2) (2026-09-05)
+
+
+### Bug Fixes
+
+* **events:** contract the memory enum so dual_subscribe=False works again ([#1307](https://github.com/caura-ai/caura/issues/1307)) ([2cfdd45](https://github.com/caura-ai/caura/commit/2cfdd45df86b9491d15eb3f50821327a5b27a14c))
+
 ## [2.48.1](https://github.com/caura-ai/caura/compare/backend-v2.48.0...backend-v2.48.1) (2026-09-05)
 
 
