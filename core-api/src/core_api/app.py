@@ -117,6 +117,40 @@ class SecurityHeadersMiddleware:
         await self.app(scope, receive, send_with_headers)
 
 
+# Secrets that ship with a known placeholder and MUST be replaced in production.
+# Module scope rather than a local, so the property is testable: a test
+# parametrized over this mapping covers whatever is added next, instead of
+# re-asserting presence for jwt_secret alone and leaving the following entry to
+# be found the way this one was.
+_DANGEROUS_DEFAULTS = {
+    "jwt_secret": "change-me-in-production",
+}
+
+
+def _unwrap_secret(value):  # type: ignore[no-untyped-def]
+    """Return a ``SecretStr``-style wrapper's value, or ``value`` unchanged."""
+    return value.get_secret_value() if hasattr(value, "get_secret_value") else value
+
+
+def _blank_secret(value) -> bool:  # type: ignore[no-untyped-def]
+    """True when a secret is missing, empty, or only whitespace.
+
+    Unwraps FIRST, and that ordering is load-bearing for whitespace rather than
+    for emptiness: ``SecretStr("")`` is falsy (``__len__`` is the secret's
+    length), but ``SecretStr("   ")`` has length 3 and ``str()`` of it is the
+    mask ``'**********'`` — so BOTH halves of this predicate pass on the
+    wrapper and a whitespace secret sails through. ``SecretStr("x") == "x"`` is
+    False for the same reason, which bypassed the equality check below once
+    already.
+
+    Note ``str.strip()`` removes only ``str.isspace()`` characters, so a secret
+    of U+200B or a UTF-8 BOM still reads as non-blank. Left as-is deliberately:
+    it is the convention every guard here shares, and narrowing it in one place
+    would recreate the asymmetry this function has already been bitten by.
+    """
+    return not str(_unwrap_secret(value) or "").strip()
+
+
 def _validate_startup_settings(app_settings) -> None:  # type: ignore[no-untyped-def]
     """Refuse to boot when a required safety control is missing.
 
@@ -127,10 +161,7 @@ def _validate_startup_settings(app_settings) -> None:  # type: ignore[no-untyped
     Storage authentication is required in every environment because the storage
     service enforces it unconditionally. The remaining guards are production-only.
     """
-    storage_secret = app_settings.core_storage_shared_secret
-    if hasattr(storage_secret, "get_secret_value"):
-        storage_secret = storage_secret.get_secret_value()
-    if not storage_secret or not str(storage_secret).strip():
+    if _blank_secret(app_settings.core_storage_shared_secret):
         raise RuntimeError("CORE_STORAGE_SHARED_SECRET is required for core-api")
     if app_settings.environment != "production":
         return
@@ -139,30 +170,38 @@ def _validate_startup_settings(app_settings) -> None:  # type: ignore[no-untyped
             "IS_STANDALONE=true is not allowed in production. "
             "Set IS_STANDALONE=false for production deployments."
         )
-    if not app_settings.settings_encryption_key:
+    if _blank_secret(app_settings.settings_encryption_key):
         raise RuntimeError(
             "SETTINGS_ENCRYPTION_KEY must be set when ENVIRONMENT=production. "
             'Generate one with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
         )
-    _dangerous = {
-        "jwt_secret": "change-me-in-production",
-    }
-    for var, bad_val in _dangerous.items():
-        val = getattr(app_settings, var, None)
-        # A SecretStr field wraps its value, so compare against the unwrapped
-        # one or the guard is silently bypassed — `SecretStr("x") == "x"` is
-        # False. Kept generic on purpose: nothing in ``_dangerous`` is SecretStr
-        # today (the only ones are platform_llm_api_key /
-        # platform_embedding_api_key), so this exists for whatever gets added
-        # next. The example that used to be here, postgres_password, no longer
-        # exists — core-api dropped its DB engine.
-        if hasattr(val, "get_secret_value"):
-            val = val.get_secret_value()
-        if val == bad_val:
+    for var, bad_val in _DANGEROUS_DEFAULTS.items():
+        # Nothing in ``_DANGEROUS_DEFAULTS`` is SecretStr today (the only ones
+        # are platform_llm_api_key / platform_embedding_api_key); the unwrap is
+        # here for whatever gets added next. The example that used to be named
+        # here, postgres_password, no longer exists — core-api dropped its DB
+        # engine.
+        val = _unwrap_secret(getattr(app_settings, var, None))
+        # Strip ONCE and test both properties against the stripped value. Doing
+        # only the first half — presence on the stripped value, equality on the
+        # raw one — leaves the published placeholder booting production the
+        # moment it carries surrounding whitespace, and
+        # ``change-me-in-production\n`` is exactly what a file-mounted secret
+        # yields (``cat key >> .env``, a k8s ``stringData`` block scalar). That
+        # is the delivery path a left-in-place placeholder actually arrives by.
+        stripped = str(val or "").strip()
+        # Presence first, and for every entry. This loop compared against one
+        # literal only, so ``JWT_SECRET=""`` was not equal to the placeholder
+        # and production booted signing API tokens with an empty secret.
+        if not stripped:
+            raise RuntimeError(f"{var.upper()} must be set to a non-blank value for production")
+        if stripped == bad_val:
             raise RuntimeError(f"{var.upper()} must be changed from default for production")
-    if not app_settings.admin_api_key:
+    if _blank_secret(app_settings.admin_api_key):
         raise RuntimeError("ADMIN_API_KEY must be set for production")
-    if not app_settings.gateway_shared_secret and not app_settings.memclaw_api_key:
+    no_gateway_secret = _blank_secret(app_settings.gateway_shared_secret)
+    no_compat_key = _blank_secret(app_settings.memclaw_api_key)  # legacy-name-ok: compat alias field
+    if no_gateway_secret and no_compat_key:
         # What production actually requires is A PERIMETER — not specifically the
         # gateway one. ``CAURA_API_KEY`` is the other way to have one: when it
         # is set, auth.py's "Path 2" either authenticates the request against
