@@ -106,10 +106,20 @@ def test_topic_name_prefix_and_no_op() -> None:
     assert noop._topic_name(EMBEDDED_TOPIC) == EMBEDDED_TOPIC
 
 
+def _decode_any(data: bytes) -> Event | None:
+    """``_decode`` with throwaway log context.
+
+    Only ``test_decode_failure_logs_subscription_and_message_id`` asserts on
+    the context, so every other call site passes placeholders through here
+    rather than restating the signature five times.
+    """
+    return PubSubEventBus._decode(data, subscription="sub-a", message_id="m-1")
+
+
 async def test_decode_accepts_well_formed_envelope() -> None:
     src = Event(event_type=Topics.Memory.ENRICHED, tenant_id="t1", payload={"k": "v"})
     bytes_ = src.model_dump_json().encode("utf-8")
-    decoded = PubSubEventBus._decode(bytes_)
+    decoded = _decode_any(bytes_)
     assert decoded is not None
     assert decoded.event_type == src.event_type
     assert decoded.tenant_id == "t1"
@@ -117,8 +127,82 @@ async def test_decode_accepts_well_formed_envelope() -> None:
 
 
 async def test_decode_returns_none_on_garbage() -> None:
-    assert PubSubEventBus._decode(b"not json at all") is None
-    assert PubSubEventBus._decode(b'{"missing": "event_type"}') is None
+    assert _decode_any(b"not json at all") is None
+    assert _decode_any(b'{"missing": "event_type"}') is None
+
+
+async def test_decode_failure_logs_subscription_and_message_id(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A dropped malformed message must be traceable to its source.
+
+    The traceback names the syntax fault but not WHICH message or subscription
+    produced it, and a payload this broken yields no event_type or tenant_id to
+    identify it by. The sibling foreign-env drop branch in ``_pull_loop``
+    already logs structured context; this is the same guarantee for the other
+    drop path.
+    """
+    with caplog.at_level("ERROR"):
+        _decode_any(b"not json at all")
+
+    # ``is None`` is already covered by test_decode_returns_none_on_garbage.
+    recs = [r for r in caplog.records if "failed to decode" in r.getMessage()]
+    assert len(recs) == 1, "exactly one record, so recs[0] below is unambiguous"
+    rec = recs[0]
+    # The JSON arm keeps its traceback — it is safe to render and it names the
+    # syntax fault. Breaks if someone downgrades it to logger.error.
+    assert rec.exc_info is not None
+    assert rec.subscription == "sub-a"
+    assert rec.message_id == "m-1"
+    # ``dropped`` is the estate-wide marker for a silent discard; core-api and
+    # core-worker consumers set it on their own ack-drops and assert on it.
+    assert rec.dropped is True
+
+
+async def test_decode_validation_failure_never_logs_the_payload() -> None:
+    """A schema-invalid payload must not reach the log. This one can leak.
+
+    Pydantic renders the offending input into ``str(exc)`` as
+    ``input_value=...`` — the whole decoded document when a required field is
+    missing — so a ``logger.exception`` on this arm ships tenant data into
+    Cloud Logging and Datadog on every malformed message.
+
+    Asserted against the FULLY FORMATTED record, not ``getMessage()``:
+    ``LogRecord.getMessage()`` renders only ``msg % args`` and structurally
+    excludes ``exc_info``, so a test written against it passes while the
+    payload ships. That is not a hypothetical — it is the first version of
+    this test, and it stayed green against a leaking implementation.
+    """
+    import json as _json
+    import logging
+
+    secret = "ssn-123-45-6789"
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture()
+    bus_logger = logging.getLogger("common.events.pubsub")
+    bus_logger.addHandler(handler)
+    try:
+        # Valid JSON, invalid Event: takes the pydantic arm, not the JSON one.
+        assert _decode_any(_json.dumps({"note": secret}).encode()) is None
+    finally:
+        bus_logger.removeHandler(handler)
+
+    assert len(records) == 1
+    rec = records[0]
+    rendered = logging.Formatter().format(rec)
+    assert secret not in rendered, "tenant payload reached the log"
+    assert "input_value" not in rendered, "pydantic echoed the input document"
+    # The diagnostic that makes the drop actionable must survive the scrubbing:
+    # which field failed, and why.
+    errors = rec.validation_errors
+    assert [e["loc"] for e in errors] == [("event_type",)]
+    assert errors[0]["type"] == "missing"
+    assert all("input" not in e for e in errors)
 
 
 async def test_dispatch_all_returns_true_when_all_handlers_succeed(
@@ -996,13 +1080,13 @@ async def test_decode_handles_pydantic_validation_error() -> None:
 
     # Missing the required `event_type` field.
     bad_payload = _json.dumps({"tenant_id": "t1", "payload": {}}).encode()
-    assert PubSubEventBus._decode(bad_payload) is None
+    assert _decode_any(bad_payload) is None
 
     # Wrong type for `occurred_at` — invalid datetime string.
     bad_ts = _json.dumps(
         {"event_type": "memclaw.memory.enriched", "occurred_at": "not-a-date"}  # legacy-name-ok: rule 3 — pins the wire format a live subscriber must still decode
     ).encode()
-    assert PubSubEventBus._decode(bad_ts) is None
+    assert _decode_any(bad_ts) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1015,17 +1099,25 @@ async def test_decode_handles_pydantic_validation_error() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _make_received(data: bytes, ack_id: str, attributes: dict[str, str]) -> Any:
+def _make_received(
+    data: bytes,
+    ack_id: str,
+    attributes: dict[str, str],
+    message_id: str = "msg-default",
+) -> Any:
     """Build a fake Pub/Sub ReceivedMessage with real-dict attributes.
 
     A bare ``MagicMock`` would make ``message.attributes.get(...)`` return a
     truthy mock, defeating the guard's "attribute absent" branch — so the
-    attributes must be a real mapping.
+    attributes must be a real mapping. ``message_id`` is real for the same
+    reason: ``_pull_loop`` forwards it to ``_decode`` for the drop log, and a
+    MagicMock there would satisfy any assertion.
     """
     received = MagicMock()
     received.ack_id = ack_id
     received.message.data = data
     received.message.attributes = attributes
+    received.message.message_id = message_id
     return received
 
 
@@ -1183,6 +1275,56 @@ async def test_pull_loop_drops_foreign_env_message_before_dispatch() -> None:
     assert result["dispatched"] == []
     assert result["acked"] == ["ack-foreign"]
     assert result["nacked"] == []
+
+
+async def test_pull_loop_malformed_message_acks_and_logs_real_context() -> None:
+    """Pin the ONLY production call site of ``_decode``.
+
+    The unit test above proves ``_decode`` logs what it is handed. This proves
+    ``_pull_loop`` hands it the right things — the short ``subscription_name``
+    rather than ``sub_path`` (``projects/proj/subscriptions/test-sub``), and
+    the message's real id. Both are plausible to get wrong and neither is
+    caught by a test that calls ``_decode`` directly with literals.
+    """
+    import logging
+
+    bus = PubSubEventBus(
+        project_id="proj",
+        subscription_prefix="test",
+        env="production",
+        dual_subscribe=True,
+    )
+    junk = _make_received(
+        b"not a valid envelope",
+        "ack-junk",
+        {"source_env": "production"},
+        message_id="msg-from-the-wire",
+    )
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture()
+    bus_logger = logging.getLogger("common.events.pubsub")
+    bus_logger.addHandler(handler)
+    try:
+        result = await _drive_one_batch(bus, [junk])
+    finally:
+        bus_logger.removeHandler(handler)
+
+    # Ack-dropped, never dispatched, never nacked — a poison payload must not
+    # loop the subscription.
+    assert result["dispatched"] == []
+    assert result["acked"] == ["ack-junk"]
+    assert result["nacked"] == []
+
+    drops = [r for r in records if "failed to decode" in r.getMessage()]
+    assert len(drops) == 1, "exactly one drop log per malformed message"
+    assert drops[0].subscription == "test-sub"
+    assert drops[0].message_id == "msg-from-the-wire"
 
 
 async def test_pull_loop_processes_same_env_message() -> None:

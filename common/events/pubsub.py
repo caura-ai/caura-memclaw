@@ -1106,7 +1106,11 @@ class PubSubEventBus(EventBus):
                 ack_ids: list[str] = []
                 nack_ids: list[str] = []
                 for received in response.received_messages:
-                    foreign_env = self._foreign_source_env(received.message)
+                    # Hoisted: proto-plus re-wraps the nested message on every
+                    # ``.message`` access, so reading it three times costs
+                    # three wrapper allocations per message on the hot path.
+                    msg = received.message
+                    foreign_env = self._foreign_source_env(msg)
                     if foreign_env is not None:
                         # Fan-out copy from a sibling environment sharing
                         # this project's topics. Ack-drop *before* decode
@@ -1127,10 +1131,16 @@ class PubSubEventBus(EventBus):
                             },
                         )
                         continue
-                    event = self._decode(received.message.data)
+                    event = self._decode(
+                        msg.data,
+                        subscription=subscription_name,
+                        message_id=msg.message_id,
+                    )
                     if event is None:
                         # Malformed message — ack so we don't redeliver
-                        # forever, log for alerting.
+                        # forever, log for alerting. The log is ``_decode``'s,
+                        # not this branch's: adding one here would double-count
+                        # the drop in any alert that counts occurrences.
                         ack_ids.append(received.ack_id)
                         continue
                     success = await self._dispatch_all(handlers, event)
@@ -1240,7 +1250,7 @@ class PubSubEventBus(EventBus):
                 continue
 
     @staticmethod
-    def _decode(data: bytes) -> Event | None:
+    def _decode(data: bytes, *, subscription: str, message_id: str) -> Event | None:
         # Pydantic shifted `ValidationError`'s base across v2 minors
         # (v1 + current ≥2.4 inherit from ValueError, 2.0-2.3 did not),
         # so we catch both explicitly rather than assume either. A
@@ -1250,11 +1260,69 @@ class PubSubEventBus(EventBus):
         # `json.JSONDecodeError` already inherits from ValueError since
         # Python 3.5, so ValueError covers it — listed explicitly would
         # be redundant.
+        #
+        # ``subscription`` / ``message_id`` are required keyword args: they
+        # exist only to be logged, so a default would let a caller drop the
+        # context and leave the log as unusable as it was before. They go in
+        # ``extra=`` rather than ``bind_contextvars`` (which this repo does
+        # configure, via ``merge_contextvars`` in ``structlog_config``) because
+        # contextvars are merged at emit time inside ``ProcessorFormatter`` and
+        # never reach the ``LogRecord`` — so ``caplog`` cannot see them, and
+        # every other drop site in the estate is asserted through the record.
+        #
+        # The two failure modes are caught SEPARATELY, and not for tidiness:
+        # only one of them can be logged with a traceback.
         try:
             parsed: dict[str, Any] = json.loads(data.decode("utf-8"))
             return Event.model_validate(parsed)
-        except (ValueError, ValidationError):
-            logger.exception("failed to decode pubsub message; acking to drop")
+        except ValidationError as exc:
+            # MUST precede the ValueError arm: pydantic ≥2.4 makes
+            # ValidationError a ValueError subclass, so the order is what
+            # selects this branch at all.
+            #
+            # No ``exc_info`` here, deliberately. Pydantic renders the
+            # offending input into ``str(exc)`` as ``input_value=...`` — the
+            # whole decoded document when a required field is missing — and
+            # ``structlog_config``'s ``format_exc_info`` ships the rendered
+            # traceback to Cloud Logging and Datadog. That payload is tenant-
+            # or attacker-supplied and may carry personal data, so a
+            # ``logger.exception`` here silently exfiltrates it on every
+            # malformed message. ``errors(include_input=False)`` keeps the
+            # part that aids triage — which field failed and why — and drops
+            # the value. Verified against pydantic 2.13.4; the
+            # ``include_input`` kwarg is what the guarantee rests on.
+            logger.error(
+                "failed to decode pubsub message; acking to drop",
+                extra={
+                    "subscription": subscription,
+                    "message_id": message_id,
+                    "dropped": True,
+                    "validation_errors": exc.errors(
+                        include_input=False, include_url=False
+                    ),
+                },
+            )
+            return None
+        except ValueError:
+            # Malformed bytes/JSON. ``json.JSONDecodeError.__str__`` carries
+            # only a position ("Expecting value: line 1 column 1"), never the
+            # document — it hangs off ``.doc``, which is never rendered — so
+            # this arm keeps its traceback safely.
+            #
+            # Context matters most here: the traceback names the syntax fault
+            # but not WHICH message or subscription produced it, and a payload
+            # this broken yields no event_type or tenant_id to identify it by.
+            # ``message_id`` is what makes the dropped message findable after
+            # the fact, across ~60 prod subscriptions spanning two topic
+            # families mid-rename.
+            logger.exception(
+                "failed to decode pubsub message; acking to drop",
+                extra={
+                    "subscription": subscription,
+                    "message_id": message_id,
+                    "dropped": True,
+                },
+            )
             return None
 
     async def _dispatch_all(self, handlers: list[EventHandler], event: Event) -> bool:
