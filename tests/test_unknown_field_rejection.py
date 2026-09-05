@@ -28,7 +28,6 @@ import pytest
 from tests.conftest import get_test_auth, new_tenant_id
 from tests.conftest import uid as _uid
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
