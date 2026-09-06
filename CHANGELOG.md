@@ -10,6 +10,14 @@ Only the most recent releases are listed below. Every release, including those
 no longer shown here, is published with its full notes at
 [github.com/caura-ai/caura/releases](https://github.com/caura-ai/caura/releases).
 
+## [2.48.6](https://github.com/caura-ai/caura/compare/backend-v2.48.5...backend-v2.48.6) (2026-09-06)
+
+
+### Bug Fixes
+
+* **memory:** reserve the platform-written keys C25 left forgeable ([#1324](https://github.com/caura-ai/caura/issues/1324)) ([74ba88e](https://github.com/caura-ai/caura/commit/74ba88ea0f3d607357496dced50b5e6e59be2d6c))
+* **memory:** sanitize caller metadata on the bulk and update write paths ([#1322](https://github.com/caura-ai/caura/issues/1322)) ([882367c](https://github.com/caura-ai/caura/commit/882367c131bca8d69f78923bd83fd87c0857bcf8))
+
 ## [2.48.5](https://github.com/caura-ai/caura/compare/backend-v2.48.4...backend-v2.48.5) (2026-09-06)
 
 
