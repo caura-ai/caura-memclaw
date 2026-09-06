@@ -8,6 +8,8 @@ import re
 import socket
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from urllib.parse import urlparse
 
@@ -96,6 +98,17 @@ INGEST_MAX_INPUT_BYTES = 3_000_000  # 3 MB
 
 # Back-compat alias for code/tests written before the unification.
 MAX_INGEST_CONTENT_BYTES = INGEST_MAX_INPUT_BYTES
+
+# M-43. Redirects are walked by hand so every hop can be checked BEFORE it is
+# requested, which means this module owns the cap httpx used to own. Lower than
+# httpx's default of 20: a legitimate document fetch does not need five hops,
+# and each one is an outbound request from inside the deployment network.
+#
+# This also TIGHTENS the wall-clock ceiling rather than loosening it. httpx
+# applies ``timeout`` per hop (``_send_handling_redirects`` calls
+# ``_send_single_request`` in a loop), so the old ``follow_redirects=True`` with
+# the default 20-redirect cap allowed ~21 x 30s. Six hops is 3.5x less.
+MAX_INGEST_REDIRECTS = 5
 
 # Explicit deny-list for cloud-metadata service IPs that aren't always
 # caught by ipaddress.is_link_local (AWS 169.254.169.254 IS link-local;
@@ -394,28 +407,205 @@ def _is_blocked_ip(addr: str) -> bool:
     )
 
 
-def _check_hostname_safe(url: str) -> None:
-    """Resolve the URL's hostname and reject if it points at private infra.
+# Wall-clock ceiling for one hop's DNS. Real answers land in milliseconds; this
+# is generous for a slow-but-honest resolver and short against a hostile one.
+DNS_RESOLUTION_TIMEOUT = 5.0
 
-    Light-weight SSRF defense. Does NOT handle DNS rebinding between this
-    resolution and the actual TCP connect — that's a Tier 3 hardening item.
-    Covers the accidental-misuse case (localhost, RFC1918, cloud metadata).
+# Ceiling for the WHOLE fetch, redirect chain included. Reasoned about in
+# ``_fetch_url_text``; the short version is that per-hop budgets multiply and
+# this is the only number a caller-supplied chain cannot inflate.
+MAX_INGEST_FETCH_SECONDS = 60.0
+
+# DNS runs HERE rather than on the default executor, and the two protections
+# are not interchangeable:
+#
+#   asyncio.wait_for bounds the REQUEST. It does NOT reclaim the thread — a
+#   concurrent.futures future that is already running cannot be cancelled, so
+#   the worker stays inside getaddrinfo until the resolver answers or the OS
+#   gives up. Measured: after a 0.5s wait_for timeout on a 3s blocking call,
+#   the next task on a 1-worker pool still waited 2.52s for its turn.
+#
+#   The dedicated pool bounds the BLAST RADIUS. Because the timeout cannot free
+#   threads, hostile DNS can pin every worker it is allowed to reach; the only
+#   question is which pool those are. On the default executor that is the one
+#   the whole ASGI app shares, so one tenant's slow resolver could stall
+#   unrelated blocking work — a cross-tenant DoS. Confined here, a saturated
+#   pool degrades ingest (later hops queue, then time out with a 400) and
+#   nothing else.
+#
+# The hostname is attacker-supplied by design on this endpoint, so treat both
+# as load-bearing rather than defensive decoration.
+#
+# KNOWN LIMITATION, recorded because there is no call that fixes it. A worker
+# stuck in getaddrinfo delays interpreter exit: concurrent.futures.thread's
+# atexit hook joins it, so SIGTERM during a hostile-DNS fetch can outlast the
+# shutdown grace period. Registering a shutdown on the app's lifespan does NOT
+# help — a running worker cannot be cancelled, the same limitation that makes
+# the timeout above insufficient on its own. Measured, 5s blocking call, time
+# to process exit: no shutdown 5.03s, shutdown(wait=False) 5.03s,
+# shutdown(wait=False, cancel_futures=True) 5.03s.
+#
+# And do not reach for the workaround: dropping these threads from
+# ``concurrent.futures.thread._threads_queues`` so atexit skips them leaves
+# ``threading._shutdown`` waiting on a non-daemon thread that can no longer be
+# woken, and the process hangs forever instead of for seconds. Measured too.
+#
+# What actually bounds this is the OS resolver's own timeout and max_workers.
+_DNS_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ingest-dns")
+
+
+def _resolve_and_vet(url: str) -> list[str]:
+    """Resolve the URL's hostname, reject private infra, and RETURN the addresses.
+
+    Returning the vetted addresses rather than just raising is what lets the
+    caller CONNECT to one of them instead of resolving the name a second time.
+    Every address the name resolves to must pass — an attacker who can return
+    one public and one private answer must not get to pick.
     """
     parsed = urlparse(url)
     host = parsed.hostname
     if not host:
         raise HTTPException(status_code=400, detail=f"Invalid URL: no hostname in {url!r}")
+    # A redirect ``Location`` is attacker-controlled once the fetched server
+    # answers, and nothing downstream rejects a non-HTTP scheme:
+    # ``ftp://public-host/x`` resolves, vets and pins cleanly, then dies inside
+    # httpx's transport selection as ``UnsupportedProtocol`` — an exception
+    # this module does not catch, so it escapes as a 500 from the one function
+    # that turns every other malformed input into a 400.
+    #
+    # AFTER the hostname check, not before: the schemes that reach here are the
+    # ones carrying a host. ``file:///etc/passwd`` and a bare
+    # ``not-a-valid-url`` have none, and both were already refused above —
+    # putting scheme first would only change which message they get.
+    #
+    # An https -> http downgrade stays permitted. This fetches public content,
+    # and credentials cannot ride a downgrade: only an ABSOLUTE ``Location``
+    # can change the scheme, and an absolute reference replaces the whole
+    # authority, dropping userinfo with it.
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported URL scheme {parsed.scheme!r} in {url!r} (http/https only)",
+        )
+    # ``.port`` raises ValueError on a non-integer port, and it is read later by
+    # _pin_url_to_address. Touching it HERE means a malformed port is rejected
+    # at the same point as every other invalid URL, with the same 400, instead
+    # of passing vetting and then escaping this module as a 500.
+    try:
+        _ = parsed.port
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid port in URL {url!r}: {e}")
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror as e:
         raise HTTPException(status_code=400, detail=f"DNS resolution failed for {host}: {e}")
-    for family, _, _, _, sockaddr in infos:
+    addrs: list[str] = []
+    for _family, _, _, _, sockaddr in infos:
         addr = str(sockaddr[0])
         if _is_blocked_ip(addr) or addr in _CLOUD_METADATA_IPS:
             raise HTTPException(
                 status_code=400,
                 detail=f"Blocked: {host} resolves to {addr} (private/loopback/link-local/metadata)",
             )
+        if addr not in addrs:
+            addrs.append(addr)
+    if not addrs:
+        raise HTTPException(status_code=400, detail=f"DNS resolution failed for {host}: no addresses")
+    return addrs
+
+
+async def _resolve_and_vet_async(url: str) -> list[str]:
+    """``_resolve_and_vet``, off the event loop.
+
+    ``socket.getaddrinfo`` blocks and takes no timeout, and M-43's per-hop loop
+    runs it up to ``MAX_INGEST_REDIRECTS + 1`` times where the old code ran it
+    twice. Six blocking resolutions inline is six chances for one tenant's slow
+    DNS to stall every other request sharing the worker — a fair objection to
+    the per-hop check, and cheaper to answer than to argue with.
+
+    A wrapper rather than making the vetting itself async: it is the policy
+    function and its logic has no business knowing about event loops.
+
+    This deliberately has NO branch for "skip pinning". An earlier cut decided
+    that by comparing the module-level checker against a snapshot taken at
+    import, so that tests substituting a yes/no stand-in kept working — which
+    made a security-critical behaviour toggle on whether a private module
+    attribute had been reassigned, silently and without a log line. Tests patch
+    this function or :func:`_resolve_and_vet` instead.
+
+    The timeout and the dedicated pool do two DIFFERENT jobs, and neither
+    substitutes for the other. See :data:`_DNS_EXECUTOR`.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(_DNS_EXECUTOR, _resolve_and_vet, url),
+            timeout=DNS_RESOLUTION_TIMEOUT,
+        )
+    except TimeoutError:  # asyncio.TimeoutError is an alias of this since 3.11
+        host = urlparse(url).hostname or url
+        raise HTTPException(
+            status_code=400,
+            detail=f"DNS resolution timed out after {DNS_RESOLUTION_TIMEOUT}s for {host}",
+        )
+
+
+@asynccontextmanager
+async def _stream_request(client: httpx.AsyncClient, request: httpx.Request):
+    """``client.stream(...)``, but for a request built in advance.
+
+    ``client.stream`` builds its own request internally, so it cannot carry the
+    pinned URL, the ``Host`` header and the SNI extension. ``send(stream=True)``
+    can, but hands back a plain ``Response`` that has to be closed by hand —
+    ``httpx.Response`` is not an async context manager.
+    """
+    resp = await client.send(request, stream=True)
+    try:
+        yield resp
+    finally:
+        await resp.aclose()
+
+
+def _pin_url_to_address(url: str, addr: str) -> tuple[str, str]:
+    """Rewrite ``url`` to connect to ``addr``, returning (connect_url, host_header).
+
+    DNS rebinding is the gap :func:`_resolve_and_vet` cannot close on its own:
+    it resolves a name, and then httpx resolves the SAME name again when it
+    connects. An attacker serving a public answer to the first lookup and a
+    private one to the second walks straight through a check that passed
+    honestly. Connecting to the address we already vetted removes the second
+    lookup, and with it the window.
+
+    The hostname still travels — as the ``Host`` header, and as the TLS SNI name
+    the caller sets — so virtual hosting still works and the certificate is
+    still verified against the NAME, not the address. Verified against a real
+    server: with the SNI override the request succeeds; without it, or with the
+    wrong name, the handshake is refused.
+    """
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    # Both halves need brackets around an IPv6 literal: the authority so the URL
+    # parses back, and the Host header so it is valid per RFC 7230. ``hostname``
+    # strips the brackets the source URL had, so a v6 literal SOURCE host needs
+    # them put back too — otherwise "::1" with port 8443 emits the unparseable
+    # ``Host: ::1:8443``.
+    host_literal = f"[{host}]" if ":" in host else host
+    host_header = f"{host_literal}:{parsed.port}" if parsed.port else host_literal
+    literal = f"[{addr}]" if ":" in addr else addr
+    authority = f"{literal}:{parsed.port}" if parsed.port else literal
+    # Userinfo rides along, or pinning would silently strip credentials that
+    # httpx turns into a Basic auth header — a URL the old code fetched fine
+    # would start coming back 401. Taken verbatim from the netloc rather than
+    # via ``parsed.username``/``password`` so percent-encoding round-trips.
+    # It never belongs in the Host header.
+    #
+    # Cross-host redirects do not carry it: the next hop's URL comes from
+    # joining Location onto the logical URL, and an absolute Location replaces
+    # the whole authority, userinfo included.
+    userinfo = parsed.netloc.rpartition("@")[0]
+    if userinfo:
+        authority = f"{userinfo}@{authority}"
+    return parsed._replace(netloc=authority).geturl(), host_header
 
 
 # Kreuzberg config used by ``_extract_with_kreuzberg``. We request markdown
@@ -513,6 +703,40 @@ async def _extract_with_kreuzberg(body: bytes, mime: str) -> str:
 
 
 async def _fetch_url_text(url: str) -> str:
+    """One deadline for the whole fetch, however the hops divide it up.
+
+    The per-hop budgets do not compose into a bound worth having. Each hop
+    pays its own DNS timeout plus the client's request timeout, and with
+    ``MAX_INGEST_REDIRECTS`` that is 6 x (5 + 30) = 210s of wall clock a
+    caller-supplied chain can spend, every second of it holding a request
+    coroutine — a server answering each hop just under the timeout gets that
+    for free.
+
+    That ceiling is LOWER than what this code replaced, which is why it is
+    being tightened rather than introduced: httpx's ``DEFAULT_MAX_REDIRECTS``
+    is 20 and its timeout applies per hop, so ``follow_redirects=True`` allowed
+    ~21 x 30s, plus two unbounded ``getaddrinfo`` calls ON the event loop.
+    Lower is not the same as low enough: 210s still overruns the 120s request
+    timeout this platform's services are deployed with, so the caller would
+    see the proxy's 504 rather than the clean 400 this module otherwise
+    promises.
+
+    60s is chosen against the size cap, not picked round: at 100 KB/s — far
+    below any real server — ``MAX_INGEST_CONTENT_BYTES`` (3 MB) transfers in
+    30s, so this leaves 2x headroom for the body plus every redirect hop, and
+    still lands well inside 120s.
+    """
+    try:
+        async with asyncio.timeout(MAX_INGEST_FETCH_SECONDS):
+            return await _walk_redirects_and_fetch(url)
+    except TimeoutError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"URL fetch exceeded its {MAX_INGEST_FETCH_SECONDS}s budget: {url!r}",
+        )
+
+
+async def _walk_redirects_and_fetch(url: str) -> str:
     """Fetch URL, validate MIME + size, decode safely, and extract text.
 
     For ``TEXT_INGEST_MIME_TYPES`` the body is decoded with the response
@@ -521,82 +745,169 @@ async def _fetch_url_text(url: str) -> str:
     Kreuzberg for format-specific extraction.
 
     Raises ``HTTPException`` for:
-    - 400: invalid URL, DNS failure, hostname resolves to a blocked IP range
+    - 400: invalid URL, DNS failure, hostname resolves to a blocked IP range,
+           or the redirect chain exceeds ``MAX_INGEST_REDIRECTS``
     - 413: fetched body exceeds ``MAX_INGEST_CONTENT_BYTES``
     - 422: response Content-Type isn't in the allowlist, or Kreuzberg
            rejected the content (encrypted PDF, malformed file, empty
            text extraction, etc.)
     - 4xx/5xx: passed through from the upstream server
+
+    M-43. The redirect chain is walked HERE, one hop at a time, because
+    ``follow_redirects=True`` checks nothing on the way. httpx walks the whole
+    chain inside ``client.stream`` — issuing a real GET to every hop — and only
+    hands back the final response, so a check on ``resp.url`` afterwards runs
+    long after the request to the private host was sent and answered. The
+    previous version did exactly that, and its comment claimed the check
+    "re-validates the FINAL host post-redirect (the upstream may have redirected
+    us to a private host)". It did not prevent that request; it only prevented
+    reading its body. ``raise_for_status()`` even ran first, so the internal
+    host's status code surfaced to the caller too.
+
+    That is a live SSRF: an authenticated tenant submits a URL they control
+    which 302s to ``169.254.169.254`` or any RFC1918 address, and core-api
+    issues the GET from inside the deployment network.
+
+    Checking each hop before requesting it is the only ordering that helps,
+    which is why the cap moved here as well — ``follow_redirects=False`` means
+    httpx no longer enforces one.
+
+    DNS rebinding, the gap this deliberately left open at first, is closed too:
+    each hop CONNECTS to an address that was just vetted rather than resolving
+    the name a second time. See :func:`_pin_url_to_address`.
     """
-    _check_hostname_safe(url)
-
-    async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-        async with client.stream("GET", url) as resp:
-            resp.raise_for_status()
-
-            # Re-validate the FINAL host post-redirect (the upstream may
-            # have redirected us to a private host). httpx exposes the
-            # ultimate URL via resp.url; ``follow_redirects=True`` already
-            # walked the chain.
-            _check_hostname_safe(str(resp.url))
-
-            # MIME allowlist on the final response, not the initial request.
-            content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
-            if content_type and content_type not in ALLOWED_INGEST_MIME_TYPES:
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        f"Unsupported content type: {content_type}. "
-                        f"Allowed: {sorted(ALLOWED_INGEST_MIME_TYPES)}"
-                    ),
-                )
-
-            # Pre-check Content-Length if the server bothered to send it.
-            # Saves us from downloading anything when the server is honest.
-            cl_header = resp.headers.get("content-length")
-            if cl_header:
-                try:
-                    if int(cl_header) > MAX_INGEST_CONTENT_BYTES:
-                        raise HTTPException(
-                            status_code=413,
-                            detail=(f"Content too large: {cl_header} bytes (max {MAX_INGEST_CONTENT_BYTES})"),
-                        )
-                except ValueError:
-                    # Malformed Content-Length — fall through to streaming.
-                    pass
-
-            # Stream the body, abort if it exceeds the cap after
-            # decompression. httpx transparently decompresses gzip/br
-            # within ``aiter_bytes`` so this measures decompressed bytes
-            # (gzip-bomb guard).
-            chunks: list[bytes] = []
-            total = 0
-            async for chunk in resp.aiter_bytes():
-                total += len(chunk)
-                if total > MAX_INGEST_CONTENT_BYTES:
+    # No keep-alive. httpcore pools connections by the request URL's origin and
+    # reads ``sni_hostname`` only when it OPENS one, so once every hop is pinned
+    # to an address, two hops with different hostnames on one IP look like one
+    # origin — and the second would ride a TLS session verified for the first
+    # one's name. Today nothing is pooled anyway, because a redirect response is
+    # closed without its body being read and httpcore cannot resync a half-read
+    # HTTP/1.1 connection. That is an accident of body handling, not a promise:
+    # draining a redirect body, here or in some later change, restores reuse and
+    # the hole with it. Measured — drained bodies reuse, this setting stops it.
+    async with httpx.AsyncClient(
+        follow_redirects=False,
+        timeout=30.0,
+        limits=httpx.Limits(max_keepalive_connections=0),
+    ) as client:
+        current = url
+        for _hop in range(MAX_INGEST_REDIRECTS + 1):
+            # BEFORE the request, every time — including the first.
+            # Non-empty or it raised — there is no path here that vets a name
+            # and then connects to it by name anyway.
+            addrs = await _resolve_and_vet_async(current)
+            connect_url, host_header = _pin_url_to_address(current, addrs[0])
+            request = client.build_request(
+                "GET",
+                connect_url,
+                headers={"Host": host_header},
+                extensions={"sni_hostname": urlparse(current).hostname or ""},
+            )
+            async with _stream_request(client, request) as resp:
+                if resp.is_redirect and not resp.has_redirect_location:
+                    # A 3xx with no Location. ``is_redirect`` is the STATUS CODE
+                    # ALONE — httpx's own docstring says to use
+                    # ``has_redirect_location`` when the header matters — so
+                    # indexing ``headers["location"]`` behind an ``is_redirect``
+                    # check raises KeyError on a response a hostile server can
+                    # simply choose to send.
+                    #
+                    # 400 rather than falling through to the normal path: there
+                    # ``raise_for_status()`` raises on 3xx as well, and
+                    # ``upstream_http_error_handler`` re-raises anything under
+                    # 500 into the catch-all, so falling through is another 500
+                    # — which is what the pre-M-43 code did here too. Neither
+                    # the old 500 nor a KeyError is right for a malformed
+                    # upstream reply to a caller-supplied URL. Same 400 as the
+                    # redirect cap, for the same reason.
                     raise HTTPException(
-                        status_code=413,
+                        status_code=400,
+                        detail=f"Upstream returned {resp.status_code} with no Location header for {current!r}",
+                    )
+
+                if resp.has_redirect_location:
+                    # Location may be relative, so it is resolved against a
+                    # base.
+                    #
+                    # That base is ``current`` — the LOGICAL url — and NOT
+                    # ``resp.url``, which since pinning is the address-rewritten
+                    # one. Joining "/next" against the pinned form would produce
+                    # an address-based URL, dropping the hostname needed for the
+                    # next hop's Host header, its SNI name and its own vetting.
+                    current = str(httpx.URL(current).join(resp.headers["location"]))
+                    continue
+
+                resp.raise_for_status()
+
+                # MIME allowlist on the final response, not the initial request.
+                content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+                if content_type and content_type not in ALLOWED_INGEST_MIME_TYPES:
+                    raise HTTPException(
+                        status_code=422,
                         detail=(
-                            f"Content too large: exceeded {MAX_INGEST_CONTENT_BYTES} bytes "
-                            f"after decompression"
+                            f"Unsupported content type: {content_type}. "
+                            f"Allowed: {sorted(ALLOWED_INGEST_MIME_TYPES)}"
                         ),
                     )
-                chunks.append(chunk)
-            body = b"".join(chunks)
 
-            # ---- PR #8: binary formats route through Kreuzberg ----
-            if content_type in BINARY_INGEST_MIME_TYPES:
-                return await _extract_with_kreuzberg(body, content_type)
+                # Pre-check Content-Length if the server bothered to send it.
+                # Saves us from downloading anything when the server is honest.
+                cl_header = resp.headers.get("content-length")
+                if cl_header:
+                    try:
+                        if int(cl_header) > MAX_INGEST_CONTENT_BYTES:
+                            raise HTTPException(
+                                status_code=413,
+                                detail=(
+                                    f"Content too large: {cl_header} bytes (max {MAX_INGEST_CONTENT_BYTES})"
+                                ),
+                            )
+                    except ValueError:
+                        # Malformed Content-Length — fall through to streaming.
+                        pass
 
-            # Decode using the response's declared charset, falling back
-            # to UTF-8. httpx's default is ISO-8859-1 when no charset is
-            # advertised, which mojibakes any UTF-8 page that omits a
-            # charset declaration.
-            encoding = resp.charset_encoding or "utf-8"
+                # Stream the body, abort if it exceeds the cap after
+                # decompression. httpx transparently decompresses gzip/br
+                # within ``aiter_bytes`` so this measures decompressed bytes
+                # (gzip-bomb guard).
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if total > MAX_INGEST_CONTENT_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=(
+                                f"Content too large: exceeded {MAX_INGEST_CONTENT_BYTES} bytes "
+                                f"after decompression"
+                            ),
+                        )
+                    chunks.append(chunk)
+                body = b"".join(chunks)
 
-    # PR #9: shared decoder. HTML still gets the tag-strip path;
-    # markdown / plain / csv preserve newlines.
-    return decode_text_body(body, content_type, encoding)
+                # ---- PR #8: binary formats route through Kreuzberg ----
+                if content_type in BINARY_INGEST_MIME_TYPES:
+                    return await _extract_with_kreuzberg(body, content_type)
+
+                # Decode using the response's declared charset, falling back
+                # to UTF-8. httpx's default is ISO-8859-1 when no charset is
+                # advertised, which mojibakes any UTF-8 page that omits a
+                # charset declaration.
+                encoding = resp.charset_encoding or "utf-8"
+
+            # PR #9: shared decoder. HTML still gets the tag-strip path;
+            # markdown / plain / csv preserve newlines. Outside the ``stream``
+            # context so the connection is released before we decode.
+            return decode_text_body(body, content_type, encoding)
+
+        # Fell out of the loop: every iteration was a redirect. httpx used to
+        # raise ``TooManyRedirects`` here; walking the chain by hand means this
+        # module has to say so itself, and as a 400 rather than a 500 — a URL
+        # that redirects forever is the caller's input, not our fault.
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many redirects (max {MAX_INGEST_REDIRECTS}) starting from {url!r}",
+        )
 
 
 async def _find_prior_ingest_by_doc_hash(tenant_id: str, doc_hash: str) -> list[dict]:
