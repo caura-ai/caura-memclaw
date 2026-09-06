@@ -371,6 +371,11 @@ _ENTITY_UPDATABLE_FIELDS = frozenset({"canonical_name", "entity_type", "attribut
 # wire — two copies could drift apart and reintroduce the existence oracle one
 # word at a time. The true cause is logged, never returned.
 _LINK_REJECTED = "entity link rejected: memory_id or entity_id does not exist, or the link already exists"
+# M-64. One answer for "no such entity" and "that entity is another tenant's",
+# for the reason ``_LINK_REJECTED`` already carries: this service authenticates
+# no request, so a distinguishable refusal turns the route into an existence
+# oracle over the whole entity id space (GHSA-wgvw-28pq-jc36).
+_RELATION_REJECTED = "relation rejected: from_entity_id or to_entity_id does not exist"
 
 
 # Migration 037 added ``embedded_content_hash`` on 2026-08-16, and every writer
@@ -4643,8 +4648,27 @@ class PostgresService:
 
             link_rows = (
                 await session.execute(
+                    # M-64, and not part of that finding's text — the same
+                    # disclosure through a second door. The MEMORY is
+                    # tenant-checked above, the link row has no tenant column of
+                    # its own, and the entity was joined on id alone: a
+                    # straddling link (this tenant's memory, another tenant's
+                    # entity) handed back that entity's ``canonical_name`` and
+                    # ``attributes`` below. The write path has refused to create
+                    # those since #1085/#1124, which is exactly why the ones that
+                    # remain are historical and unreachable by any later guard.
+                    #
+                    # Stays an OUTER join, so the entry keeps its ``entity_id``
+                    # and ``role`` and simply loses the fields it should never
+                    # have carried — the None branch below already handles it.
                     select(MemoryEntityLink, Entity)
-                    .outerjoin(Entity, MemoryEntityLink.entity_id == Entity.id)
+                    .outerjoin(
+                        Entity,
+                        and_(
+                            MemoryEntityLink.entity_id == Entity.id,
+                            Entity.tenant_id == tenant_id,
+                        ),
+                    )
                     .where(MemoryEntityLink.memory_id == memory_id)
                 )
             ).all()
@@ -6116,8 +6140,40 @@ class PostgresService:
         the response to clients should treat the returned fleet_id as
         authoritative. The row id is preserved across upserts so
         callers reading by id still find the relation.
+
+        M-64. Both entity ends must belong to ``data["tenant_id"]``, and this is
+        the only place that can enforce it. The FKs require the rows to exist in
+        SOME tenant, not this one; ``Relation.tenant_id`` describes the edge, not
+        its endpoints; and upstream ``core-api`` (``entity_service.upsert_relation``)
+        only calls ``enforce_tenant`` on the body before forwarding the raw ids.
+
+        Unenforced, a write key for tenant T could point an edge at a victim
+        entity UUID in tenant U and then read U's ``canonical_name`` and
+        ``attributes`` straight back out of ``relation_get_outgoing``. Refusing
+        the write is the half that stops new ones being created; the tenant
+        predicate added to that reader is what closes the rows already there.
+
+        Raises ``ValueError`` — which the router maps to 409 — with the same
+        message whichever end is at fault, and the same message a nonexistent id
+        gets. See ``_RELATION_REJECTED``.
         """
         async with get_session() as session:
+            from_id, to_id = data["from_entity_id"], data["to_entity_id"]
+            if not isinstance(from_id, UUID):
+                from_id = UUID(str(from_id))
+            if not isinstance(to_id, UUID):
+                to_id = UUID(str(to_id))
+            owned = await self._owned_entities(session, data["tenant_id"], {from_id, to_id})
+            if from_id not in owned or to_id not in owned:
+                # The distinct log line is what keeps the real cause available to
+                # an operator while the wire answer stays uniform.
+                logger.info(
+                    "Relation rejected for %s → %s: an endpoint is not in tenant %s",
+                    from_id,
+                    to_id,
+                    data["tenant_id"],
+                )
+                raise ValueError(_RELATION_REJECTED)
             insert_stmt = pg_insert(Relation).values(**data)
             upsert_stmt = insert_stmt.on_conflict_do_update(
                 constraint="uq_relations_natural_key",
@@ -6179,11 +6235,27 @@ class PostgresService:
         entity_id: UUID,
         tenant_id: str,
     ) -> list[tuple[Relation, Entity]]:
-        """Return outgoing relations with their target entities."""
+        """Return outgoing relations with their target entities.
+
+        M-64. The join carries ``Entity.tenant_id`` as well, not just
+        ``Relation.tenant_id``. The edge belonging to this tenant says nothing
+        about where its TARGET lives: an edge written before the write-side
+        guard (or by any caller reaching storage directly) can name an entity in
+        another tenant, and this method hands the row's ``canonical_name`` and
+        ``attributes`` back to whoever asked.
+
+        An INNER join, so such an edge disappears from this endpoint entirely
+        rather than returning with a hollow target. That is a visible change for
+        any tenant holding one — but every row it hides is an edge into somebody
+        else's data, and there is no version of showing it that is safe.
+        """
         async with get_session() as session:
             stmt = (
                 select(Relation, Entity)
-                .join(Entity, Entity.id == Relation.to_entity_id)
+                .join(
+                    Entity,
+                    and_(Entity.id == Relation.to_entity_id, Entity.tenant_id == tenant_id),
+                )
                 .where(
                     Relation.from_entity_id == entity_id,
                     Relation.tenant_id == tenant_id,
@@ -6631,14 +6703,28 @@ class PostgresService:
                 )
             ).all()
         )
-        owned_entities = set(
+        return owned_memories, await self._owned_entities(session, tenant_id, entity_ids)
+
+    async def _owned_entities(
+        self,
+        session: AsyncSession,
+        tenant_id: str,
+        entity_ids: set[UUID],
+    ) -> set[UUID]:
+        """Which of these entity ids belong to ``tenant_id``.
+
+        Split out of :meth:`_owned_link_endpoints` so "an entity this tenant
+        owns" has ONE definition. M-64 needed the same test for relation
+        endpoints, where there is no memory side to check, and a second inline
+        copy is how the two drift apart.
+        """
+        return set(
             (
                 await session.scalars(
                     select(Entity.id).where(Entity.id.in_(entity_ids), Entity.tenant_id == tenant_id)
                 )
             ).all()
         )
-        return owned_memories, owned_entities
 
     async def entity_add_entity_link(self, tenant_id: str, data: dict) -> MemoryEntityLink:
         """Create one memory→entity link, both ends scoped to ``tenant_id``.
