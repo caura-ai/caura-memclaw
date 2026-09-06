@@ -10,6 +10,7 @@ import httpx
 from fastapi import HTTPException
 from sqlalchemy.exc import SQLAlchemyError
 
+from common.constants import LIVE_MEMORY_STATUSES
 from common.enrichment.constants import (
     CLASSIFIER_DEPRECATED_MEMORY_TYPES,
     DEFAULT_MEMORY_TYPE,
@@ -578,7 +579,25 @@ async def _run_crystallization(
 
     # Process each cluster
     for cluster_ids in selected_clusters:
-        cluster_memories = [memories_by_id[mid] for mid in cluster_ids if mid in memories_by_id]
+        # M-61. Live rows only, checked again HERE and not only in the two
+        # queries that built the pairs. The pairs were computed at the top of
+        # this run — ``_check_near_duplicates`` runs in the checks loop, with the
+        # health, usage and issue passes in between — so a row archived by
+        # anything else in that window is still named in a cluster, and the
+        # archive step below is unconditional and irreversible in the direction
+        # that matters. ``bulk_get_memories`` cannot carry the filter itself:
+        # ``entity_service`` reads evidence rows through it and legitimately
+        # needs archived ones.
+        #
+        # This is a narrow race guard, not the fix — the two query filters are
+        # what close the reported loop. It earns its place by making the
+        # invariant checkable next to the delete instead of depending on two
+        # remote queries staying right.
+        cluster_memories = [
+            memories_by_id[mid]
+            for mid in cluster_ids
+            if mid in memories_by_id and memories_by_id[mid].get("status") in LIVE_MEMORY_STATUSES
+        ]
         if len(cluster_memories) < CRYSTALLIZER_MIN_CLUSTER_SIZE:
             continue
 

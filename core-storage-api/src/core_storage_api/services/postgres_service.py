@@ -3823,6 +3823,18 @@ class PostgresService:
         batch_size: int,
         offset: int = 0,
     ) -> list[tuple]:
+        """Rows the crystallizer has not yet dedup-checked. LIVE rows only.
+
+        M-61. The status filter is half of a pair — see
+        ``memory_find_neighbors_by_embedding`` for the other half and for why
+        both ends are needed. This one keeps an archived row from entering a
+        cluster as the CANDIDATE side of a pair.
+
+        ``deleted_at IS NULL`` was the only state filter here, and soft-deletion
+        is not the state that matters: crystallization archives its sources, so
+        the rows this sweep must stop revisiting are precisely the ones it
+        archived itself.
+        """
         async with get_session() as session:
             scope, params = _scope_sql(tenant_id, fleet_id)
             result = await session.execute(
@@ -3832,11 +3844,17 @@ class PostgresService:
                 WHERE {scope}
                   AND m.embedding IS NOT NULL
                   AND m.deleted_at IS NULL
+                  AND m.status = ANY(:live_statuses)
                   AND m.last_dedup_checked_at IS NULL
                 ORDER BY m.created_at DESC
                 LIMIT :batch_size OFFSET :batch_offset
             """),
-                {**params, "batch_size": batch_size, "batch_offset": offset},
+                {
+                    **params,
+                    "batch_size": batch_size,
+                    "batch_offset": offset,
+                    "live_statuses": list(LIVE_MEMORY_STATUSES),
+                },
             )
             return result.all()  # type: ignore[return-value]
 
@@ -3849,6 +3867,28 @@ class PostgresService:
         threshold: float,
         limit: int,
     ) -> list[tuple]:
+        """Near neighbours of one embedding, for the crystallizer's dedup sweep.
+
+        M-61. LIVE rows only, and this is the half of the fix that closes the
+        reported loop. A crystallized fact stays >=0.95 similar to the sources it
+        was merged from — that is what made them a cluster — and those sources
+        are ARCHIVED by the run that created it. Returning them here re-formed
+        the cluster {F, S1, S2} on the next sweep, re-sent it to the LLM, and
+        then archived F, because the archive step takes every cluster member and
+        does not care that one of them is the crystal produced an hour earlier.
+
+        Filtering the CANDIDATE query alone would not have been enough: a pair is
+        (candidate, neighbour), so an archived row excluded from one end still
+        reaches a cluster through the other. Both queries carry the filter, and
+        neither has any caller outside this sweep — the crystallizer is the only
+        production consumer of either, which is what makes filtering safe to do
+        in the query rather than at the call site.
+
+        Deliberately ``LIVE_MEMORY_STATUSES`` rather than ``!= 'archived'``:
+        ``outdated`` and ``conflicted`` are no better as merge inputs, and naming
+        the live set means a status added later is excluded by default rather
+        than silently admitted.
+        """
         async with get_session() as session:
             scope, params = _scope_sql(tenant_id, fleet_id, table="n")
             result = await session.execute(
@@ -3859,6 +3899,7 @@ class PostgresService:
                 WHERE {scope}
                   AND n.embedding IS NOT NULL
                   AND n.deleted_at IS NULL
+                  AND n.status = ANY(:live_statuses)
                   AND n.id != :self_id
                   AND 1 - (n.embedding <=> :query_emb) >= :threshold
                 ORDER BY n.embedding <=> :query_emb
@@ -3870,6 +3911,7 @@ class PostgresService:
                     "self_id": exclude_id,
                     "threshold": threshold,
                     "k": limit,
+                    "live_statuses": list(LIVE_MEMORY_STATUSES),
                 },
             )
             return result.all()  # type: ignore[return-value]
