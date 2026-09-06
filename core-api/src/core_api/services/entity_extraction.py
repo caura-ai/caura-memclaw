@@ -39,6 +39,18 @@ Rules:
 - canonical_name: lowercase, no articles (the, a, an)
 - entity_type: one of person, organization, technology, project, concept, location, event, identifier, artifact, role
 - role: one of subject, object, mentioned
+- The SUBJECT is the entity the statement is ABOUT — the grammatical subject of
+  the main clause. The VALUE being asserted about it is the object, even when
+  that value is itself a named person, place or quantity. Choose the subject the
+  same way every time: it does not change because the value changed.
+    "The billing service owner is Dana."   -> subject: billing service owner
+                                              object:  dana
+    "The deploy window is 03:00 UTC."      -> subject: deploy window
+                                              object:  03:00 utc
+  Marking "dana" the subject there would make an UPDATE to that fact look like a
+  statement about a different subject, and the update would never supersede the
+  value it replaces. Exactly one entity carries role=subject unless the content
+  genuinely asserts facts about two independent subjects.
 - relation_type: short verb phrase like works_on, uses, belongs_to, created_by, depends_on, manages, located_in
 - Extract every distinct named subject. Include identifiers (PR-2025-A, build-734), product codes (Vermillion-7), model names (gpt-5.4-nano), and version strings as entity_type=identifier or entity_type=artifact when they refer to a specific named thing.
 - Job titles (ceo, engineer, manager, director, officer) classify as entity_type=role — NOT person. Use entity_type=person only when a named individual is referenced (e.g., "Anna Bergstrom"). "the CEO" alone is a role; "Anna, the CEO" is one person entity plus one role entity.
