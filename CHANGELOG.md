@@ -10,6 +10,14 @@ Only the most recent releases are listed below. Every release, including those
 no longer shown here, is published with its full notes at
 [github.com/caura-ai/caura/releases](https://github.com/caura-ai/caura/releases).
 
+## [2.48.3](https://github.com/caura-ai/caura/compare/backend-v2.48.2...backend-v2.48.3) (2026-09-06)
+
+
+### Bug Fixes
+
+* **crystallizer:** stop the dedup sweep re-clustering rows it archived itself ([#1313](https://github.com/caura-ai/caura/issues/1313)) ([ef2f58d](https://github.com/caura-ai/caura/commit/ef2f58dec643ac2719465eb257fd31f0d5962972))
+* **governance:** remove the entity rows mined out of a dropped memory ([#1297](https://github.com/caura-ai/caura/issues/1297)) ([89223d3](https://github.com/caura-ai/caura/commit/89223d34b4d2e363db575a022e44219195987ab8))
+
 ## [2.48.2](https://github.com/caura-ai/caura/compare/backend-v2.48.1...backend-v2.48.2) (2026-09-05)
 
 
