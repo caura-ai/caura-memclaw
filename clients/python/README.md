@@ -40,6 +40,28 @@ with Caura("standalone", tenant_id="default", base_url="http://localhost:8000") 
     ...
 ```
 
+## Retrying transient read failures
+
+Retries are disabled by default. Set `retries` to the number of additional
+attempts and `retry_backoff` to the initial delay in seconds:
+
+```python
+with Caura("mc_xxx", tenant_id="my-team", retries=2, retry_backoff=0.5) as mc:
+    memories = mc.search("Q3 revenue target")
+```
+
+Only `search`, `recall`, `health`, and `get_document` retry. `write` and
+`submit_interview` never retry, even when retries are enabled, because an
+ambiguous failure could otherwise duplicate a write. Reads retry HTTP transport
+errors and statuses 429, 502, 503, and 504. Other responses retain the existing
+error mapping immediately. After exhaustion, the final error is propagated.
+
+Delays double between retries. A valid numeric or HTTP-date `Retry-After`
+header can extend the delay; invalid values fall back to the backoff.
+`timeout` still applies per request, so the total call can take longer when
+retries are enabled. These synchronous delays block the calling thread.
+
+
 ## API
 
 | Method | Endpoint | Returns |

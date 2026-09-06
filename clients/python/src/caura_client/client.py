@@ -6,7 +6,10 @@ A thin wrapper over the Caura REST API. Point it at a managed
 
 from __future__ import annotations
 
+import math
+import time
 import urllib.parse
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -38,12 +41,20 @@ class Caura:
         base_url: str = DEFAULT_BASE_URL,
         agent_id: str | None = None,
         timeout: float = 30.0,
+        retries: int = 0,
+        retry_backoff: float = 0.5,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         if not api_key:
             raise ValueError("api_key is required")
         if not tenant_id:
             raise ValueError("tenant_id is required")
+        if not isinstance(retries, int) or retries < 0:
+            raise ValueError("retries must be a non-negative integer")
+        if not math.isfinite(retry_backoff) or retry_backoff < 0:
+            raise ValueError("retry_backoff must be finite and non-negative")
+        self._retries = retries
+        self._retry_backoff = retry_backoff
         self.tenant_id = tenant_id
         self.agent_id = agent_id
         self._http = httpx.Client(
@@ -94,7 +105,7 @@ class Caura:
         if filter_agent_id:
             body["filter_agent_id"] = filter_agent_id
         body.update(extra)
-        data = self._post("/api/v1/search", body)
+        data = self._post("/api/v1/search", body, retry=True)
         if not isinstance(data, dict):
             raise CauraAPIError(200, "search response must be a JSON object")
         if "items" not in data:
@@ -108,11 +119,11 @@ class Caura:
         """Search + LLM summary. Returns a ``RecallResult`` context brief (POST /api/v1/recall)."""
         body: dict[str, Any] = {"tenant_id": self.tenant_id, "query": query, "top_k": top_k}
         body.update(extra)
-        return RecallResult.from_dict(self._post("/api/v1/recall", body))
+        return RecallResult.from_dict(self._post("/api/v1/recall", body, retry=True))
 
     def health(self) -> dict[str, Any]:
         """Liveness probe (GET /api/v1/health)."""
-        response = self._http.get("/api/v1/health")
+        response = self._request("GET", "/api/v1/health", retry=True)
         self._raise_for_status(response)
         return response.json()
 
@@ -132,8 +143,10 @@ class Caura:
         # paths, so a doc_id containing '/' would hit a different route and
         # '?' would inject query params.
         encoded = urllib.parse.quote(doc_id, safe="")
-        response = self._http.get(
+        response = self._request(
+            "GET",
             f"/api/v1/documents/{encoded}",
+            retry=True,
             params={"tenant_id": tenant_id or self.tenant_id, "collection": collection},
         )
         self._raise_for_status(response)
@@ -180,10 +193,42 @@ class Caura:
         return result
 
     # ------------------------------------------------------------- internals
-    def _post(self, path: str, body: dict[str, Any]) -> Any:
-        response = self._http.post(path, json=body)
+    def _post(self, path: str, body: dict[str, Any], *, retry: bool = False) -> Any:
+        response = self._request("POST", path, retry=retry, json=body)
         self._raise_for_status(response)
         return response.json()
+
+    def _request(self, method: str, path: str, *, retry: bool = False, **kwargs: Any) -> httpx.Response:
+        attempts = self._retries if retry else 0
+        delay = self._retry_backoff
+        for attempt in range(attempts + 1):
+            retry_after = None
+            try:
+                response = self._http.request(method, path, **kwargs)
+            except httpx.TransportError:
+                if attempt == attempts:
+                    raise
+            else:
+                if response.status_code not in (429, 502, 503, 504) or attempt == attempts:
+                    return response
+                retry_after = response.headers.get("Retry-After")
+                response.close()
+            time.sleep(self._retry_delay(delay, retry_after))
+            delay *= 2
+        raise AssertionError("retry loop must return or raise")
+
+    @staticmethod
+    def _retry_delay(backoff: float, retry_after: str | None) -> float:
+        if retry_after is None:
+            return backoff
+        try:
+            seconds = float(retry_after)
+        except ValueError:
+            try:
+                seconds = parsedate_to_datetime(retry_after).timestamp() - time.time()
+            except (ValueError, TypeError, OverflowError):
+                return backoff
+        return max(backoff, seconds) if math.isfinite(seconds) else backoff
 
     @staticmethod
     def _raise_for_status(response: httpx.Response) -> None:
