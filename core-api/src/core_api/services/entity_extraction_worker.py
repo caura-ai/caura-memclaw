@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import re
+from typing import Any, Literal
 from uuid import UUID
 
 from common.embedding import get_embedding
@@ -93,6 +94,129 @@ async def _discover_cross_links_for_memory(
         )
 
 
+async def _purge_written_artifacts_if_dropped(
+    sc: Any, memory_id: UUID, tenant_id: str
+) -> Literal["live", "dropped", "unknown"]:
+    """Undo our own graph writes when the memory died while we were making them.
+
+    Reports WHAT IT FOUND and leaves the policy to the caller, because the two
+    call sites want different things from the same answer. An earlier revision
+    returned a bool meaning "you must stop", which forced the indeterminate case
+    to pick one of the two real answers and pretend — it chose "stop", and that
+    silently discarded the audit-log entry, the contradiction trigger and
+    cross-link discovery for a memory that a transient read timeout had said
+    nothing bad about. Three states, named:
+
+    ``dropped``
+        The row is gone or soft-deleted, and its graph rows have been purged
+        (or the purge failed, loudly — either way it is not coming back).
+    ``live``
+        The row is there. Nothing was purged and nothing should stop.
+    ``unknown``
+        The read itself failed. Nothing is known and nothing was purged.
+
+    Purging is only half of the job at the first call site: everything after the
+    link upsert — relation upserts carrying ``evidence_memory_id``, the subject
+    write-back, cross-link discovery — writes MORE graph rows for this memory. A
+    version that purged and fell through cleaned the table and then immediately
+    refilled it, moving the leak from the link table to the relation table rather
+    than closing it.
+
+    H-02. The liveness check before the persistence block narrows the window; it
+    cannot close it. Between that check and the links landing there are embedding
+    round-trips and three storage calls, and a governance drop can complete
+    inside them — including its own purge, which finds nothing because these rows
+    do not exist yet. The entities then land moments later and nothing ever
+    revisits them: the memory is gone, so no verdict names it again.
+
+    Re-checking AFTER the writes closes it, and the argument is about what is
+    observable rather than about timing:
+
+    * the drop committed before our writes — its purge found nothing, but this
+      check sees the row deleted, and we purge what we just wrote,
+    * the drop commits after our writes — its own purge sees our rows and takes
+      them,
+    * the drop commits between the two — whichever purge runs later sees the
+      rows, and both are keyed on the same ``memory_id``.
+
+    That argument only holds for rows written BEFORE the call, which is why
+    ``process_entity_extraction`` calls this THREE times rather than once. An
+    earlier revision called it once, after the link upsert, and claimed "there is
+    no ordering left in which the rows survive" — untrue of everything written
+    afterwards: the subject write-back, the relation upserts, the links
+    cross-link discovery creates. The call sites, and what each is for:
+
+    * after the link upsert — an optimisation. It saves the relation upserts and
+      a cross-link pass when the row is already gone, and is allowed to fall
+      through on anything short of ``dropped``.
+    * at the end of the ``try`` — the guarantee for the path that completes. It
+      sits after every graph-mutating write, so the rows it can find are all of
+      them.
+    * in the ``except`` — the same guarantee for the path that leaves by
+      raising, which the previous one cannot reach.
+
+    Both of the trailing two are guarded on ``wrote_graph_rows``, so a run that
+    wrote nothing does not pay for a read, and the ``except`` one also runs on
+    failures early enough that ``sc`` does not exist yet.
+
+    The WRITER read is load-bearing at every site for the same reason as the
+    pre-write check: the whole question is whether a delete that just committed
+    is visible.
+
+    A failed PURGE still reports ``dropped``: the memory is gone whether or not
+    the cleanup worked, and the caller's decision does not change. Only a failed
+    READ is ``unknown``.
+    """
+    try:
+        live = await sc.get_memory(str(memory_id), tenant_id, read=False)
+    except Exception:
+        logger.exception(
+            "entity extraction: could not establish whether memory %s survived its own "
+            "extraction; nothing purged and nothing concluded",
+            memory_id,
+            extra={"liveness_check": "unknown", "memory_id": str(memory_id)},
+        )
+        return "unknown"
+
+    if live is not None and live.get("deleted_at") is None:
+        return "live"
+
+    try:
+        counts = await sc.purge_entity_artifacts(tenant_id, str(memory_id))
+    except Exception:
+        logger.exception(
+            "entity extraction: memory %s was dropped while its entities were being "
+            "written, and the rows just written could NOT be purged; they are live in "
+            "the graph for content the policy removed",
+            memory_id,
+        )
+        return "dropped"
+    if not isinstance(counts, dict):
+        # Same gap as the governance-side purge: reading ``counts`` as a dict
+        # would raise from outside the try above. Lower stakes at two of this
+        # function's three call sites, which sit inside the worker's catch-all —
+        # but NOT at the one in the ``except`` handler, where a raise escapes
+        # ``process_entity_extraction`` entirely and surfaces as an unhandled
+        # task exception. The purge still happened as far as anything here can
+        # tell; only the counts are unreadable.
+        logger.warning(
+            "entity extraction: memory %s was dropped mid-extraction and the purge "
+            "answered with %s rather than an object, so what it removed is unknown",
+            memory_id,
+            type(counts).__name__,
+        )
+        return "dropped"
+    logger.warning(
+        "entity extraction: memory %s was dropped mid-extraction; purged the graph "
+        "rows just written for it (links=%s relations=%s entities=%s)",
+        memory_id,
+        counts.get("links"),
+        counts.get("relations"),
+        counts.get("entities"),
+    )
+    return "dropped"
+
+
 async def process_entity_extraction(
     memory_id: UUID,
     tenant_id: str,
@@ -109,6 +233,18 @@ async def process_entity_extraction(
     # calls. Full migration: CAURA-593 lands Pub/Sub first, then a new
     # worker service subscribes to ``Topics.Pipeline.ENTITY_EXTRACT_REQUESTED``
     # and this function becomes its handler body.
+    #
+    # H-02. Guards both of the trailing liveness checks — the one at the end of
+    # the ``try`` and the one in the ``except``. It means "this memory MAY have
+    # graph rows", not "the persistence block ran": there are two independent
+    # writers below (the entity/link upserts, and cross-link discovery, which
+    # runs even when every extracted name was filtered out), and both set it.
+    #
+    # False means nothing was written, so there is nothing to purge and no reason
+    # to spend a writer read. That matters because the early exits above the
+    # persistence block — no entities extracted, row already gone — are the
+    # common case, and because ``sc`` is not yet bound on the first of them.
+    wrote_graph_rows = False
     try:
         # A5c: resolve tenant_config BEFORE the extraction call so the
         # tenant-level ``entity_extraction.provider`` / ``.model``
@@ -124,6 +260,33 @@ async def process_entity_extraction(
             return
 
         sc = get_storage_client()
+
+        # H-02: is the memory still there? This is scheduled fire-and-forget at
+        # write time on both non-inline paths, in parallel with the enrichment
+        # that carries the governance verdict — so by the time the LLM call above
+        # returns, the policy may already have dropped the row. Writing entities
+        # for it would re-create the leak the drop exists to close, in a table
+        # the drop does not reach.
+        #
+        # ``read=False`` — the WRITER. The whole point is to observe a delete
+        # that just committed; a replica under lag would report the row live and
+        # this check would pass exactly when it most needed to fail.
+        #
+        # This check alone does NOT close the window, and it is not claimed to:
+        # the writes below are several round-trips away, so a drop can land after
+        # it passes. ``_purge_written_artifacts_if_dropped`` at the end of the
+        # persistence block is what closes that; this one is here to avoid doing
+        # the work at all in the common case where the row is already gone.
+        live = await sc.get_memory(str(memory_id), tenant_id, read=False)
+        if live is None or live.get("deleted_at") is not None:
+            logger.info(
+                "entity extraction: memory %s is gone by the time extraction finished; "
+                "discarding %d extracted entit(ies) rather than writing them to a "
+                "dropped row's graph",
+                memory_id,
+                len(graph.entities),
+            )
+            return
 
         blocklist = tenant_cfg.entity_blocklist
 
@@ -342,6 +505,18 @@ async def process_entity_extraction(
             # the TOCTOU race where another writer created the natural-
             # key match between our resolve and our upsert — semantically
             # equivalent to ``updated`` for the worker.
+            # H-02. From here this memory MAY have graph rows, so every exit
+            # from this function owes it a liveness check — including the ones
+            # that leave by raising.
+            #
+            # Set BEFORE the await, not after. "The call raised" does not mean
+            # "nothing was written": a timeout can land on a request the storage
+            # side already committed, and a malformed response does not un-write
+            # rows either. The flag has to mean "might have written", because
+            # the only failure it is allowed to make is the cheap one — a wasted
+            # writer read on a call that never landed, on a path that is already
+            # an error. Getting it wrong the other way leaks the rows.
+            wrote_graph_rows = True
             upserted = await sc.bulk_upsert_entities(items=upsert_items)
             # Explicit loop (not a comprehension) so an out-of-range
             # ``input_idx`` from a misbehaving storage response surfaces
@@ -349,6 +524,12 @@ async def process_entity_extraction(
             # length-mismatch warning above on ``bulk_resolve_entities``
             # — same "treat malformed responses defensively" pattern.
             name_to_id: dict[str, UUID] = {}
+            # H-02. Only the rows THIS run brought into existence. An entity that
+            # already existed is reachable through whatever linked it before and
+            # is nobody's orphan; a created one is reachable only through the link
+            # we are about to write. See the link upsert below for why that
+            # distinction is worth carrying.
+            created_entity_ids: list[str] = []
             for r in upserted:
                 if not r.get("entity_id"):
                     continue
@@ -361,6 +542,8 @@ async def process_entity_extraction(
                     )
                     continue
                 name_to_id[filtered[idx][0]] = UUID(r["entity_id"])
+                if r.get("action") == "created":
+                    created_entity_ids.append(str(r["entity_id"]))
 
             # ---- Step 3: bulk entity-link upsert ----
             #
@@ -401,7 +584,74 @@ async def process_entity_extraction(
                 )
                 link_idx += 1
             if link_items:
-                link_result = await sc.bulk_upsert_entity_links(tenant_id, items=link_items)
+                try:
+                    link_result = await sc.bulk_upsert_entity_links(tenant_id, items=link_items)
+                except Exception:
+                    # H-02, and this is the one gap the purge cannot close from
+                    # its own side. ``memory_purge_entity_artifacts`` finds
+                    # entities THROUGH the memory's links — deliberately, because
+                    # the first draft swept every unlinked entity in the tenant
+                    # and would have raced a concurrent writer that had created
+                    # an entity but not yet linked it. Over-deleting is the
+                    # direction that does not come back.
+                    #
+                    # The cost of that bounding is exactly here: entities
+                    # committed a moment ago whose links never landed are
+                    # reachable by nothing, so a purge for this memory runs,
+                    # finds no links, and honestly reports zero. Indistinguishable
+                    # in the audit trail from "there was nothing to purge" —
+                    # which is what makes it worth a log rather than nothing.
+                    #
+                    # Widening the candidate set instead was considered and not
+                    # done: passing these ids to the purge re-introduces the same
+                    # race the bounding exists to prevent, since an id we upserted
+                    # may be a row another writer created and is about to link.
+                    # A person with a concrete list can check that; a query
+                    # cannot.
+                    #
+                    # Re-raised, so the except handler below still runs its
+                    # liveness check and purges whatever IS reachable.
+                    if created_entity_ids:
+                        logger.exception(
+                            "entity extraction: entity rows for memory %s were committed but "
+                            "their links were not, so a governance purge for this memory will "
+                            "find and report nothing while these rows survive; entity ids "
+                            "created by this run: %s",
+                            memory_id,
+                            ", ".join(created_entity_ids),
+                            extra={
+                                "unlinked_entity_ids": created_entity_ids,
+                                "memory_id": str(memory_id),
+                                "tenant_id": tenant_id,
+                            },
+                        )
+                    raise
+                # H-02: the rows exist NOW, so from here the leak is recoverable
+                # by the same purge governance uses. See the helper for why this
+                # is where the window actually closes.
+                #
+                # The RETURN has to be honoured, not just the purge. Everything
+                # below writes more graph rows for this memory — relations
+                # carrying ``evidence_memory_id``, the subject write-back,
+                # cross-link discovery. Purging and then falling through refills
+                # the table we just cleaned.
+                #
+                # ``dropped`` ONLY. This site is an optimisation — it saves the
+                # relation upserts and a cross-link discovery pass — so it must
+                # not act on ``unknown``. Stopping here also skips the audit-log
+                # entry below, and losing an audit record to a read timeout is a
+                # real cost with no later repair.
+                #
+                # Falling through on ``unknown`` is safe because a later check
+                # covers every remaining exit: the one at the end of the ``try``
+                # if the rest of the run succeeds, the one in the ``except`` if
+                # it raises. Neither is a guarantee that the rows are cleaned —
+                # both call the same read, and a read that failed once will
+                # likely fail again — but the failure is a bounded leak that
+                # governance's purge can still reach, and the alternative was
+                # destroying an audit record nothing rebuilds.
+                if await _purge_written_artifacts_if_dropped(sc, memory_id, tenant_id) == "dropped":
+                    return
                 # Surface any FK violations from the per-item path
                 # (storage-side reports ``error="fk_violation"`` for rows
                 # whose memory_id or entity_id no longer exists). Same
@@ -520,6 +770,17 @@ async def process_entity_extraction(
 
         # Cross-link discovery (non-fatal)
         if tenant_cfg.auto_entity_linking_enabled:
+            # H-02. This writes ``memory_entity_links`` rows for THIS memory —
+            # storage-side it is an ON CONFLICT DO NOTHING insert into exactly
+            # the table the purge deletes from — and it does not go through the
+            # persistence block above, so it is a second, independent way for
+            # this memory to acquire graph rows. It runs even when every
+            # extracted name was filtered out and ``bulk_upsert_entities`` was
+            # never called.
+            #
+            # Before the await, for the same reason as the upsert: a call that
+            # raised may still have committed.
+            wrote_graph_rows = True
             try:
                 await _discover_cross_links_for_memory(memory_id, tenant_id, fleet_id)
             except Exception:
@@ -529,5 +790,63 @@ async def process_entity_extraction(
                     exc_info=True,
                 )
 
+        # H-02, and this is the call that actually closes the window. The check
+        # after the link upsert only covers rows written UP TO it; everything
+        # between the two — the subject write-back, the relation upserts carrying
+        # ``evidence_memory_id``, the links cross-link discovery creates — is
+        # written after it has already passed. A drop landing in that stretch
+        # runs its own purge against rows that do not exist yet, and nothing
+        # revisits them.
+        #
+        # This one runs after every graph-mutating write for this memory, so the
+        # rows it finds are all of them. The earlier check is kept as an early
+        # exit: it saves the relation upserts and a cross-link discovery pass in
+        # the common case where the row was already gone.
+        #
+        # It covers the SUCCESSFUL path only. The ``except`` handler carries the
+        # same check for the path where something in between raised.
+        #
+        # Contradiction detection above is deliberately not covered here. It is
+        # spawned via ``track_task`` and writes conflict rows rather than graph
+        # rows, and it re-checks ``deleted_at`` itself for exactly this race.
+        #
+        # Guarded on the flag, so a run that reached here having written nothing
+        # — every extracted name filtered out AND cross-link discovery disabled —
+        # does not pay for a writer read to find nothing. Note what the flag has
+        # to mean for that to be safe: "this memory may have graph rows", not
+        # "the persistence block ran". Cross-link discovery sets it too, and
+        # gating on the narrower reading would leak exactly the links it creates.
+        #
+        # The result is not branched on: nothing follows this, so ``live`` and
+        # ``unknown`` are the same instruction — do nothing — and ``dropped`` has
+        # already purged by the time it returns.
+        if wrote_graph_rows:
+            await _purge_written_artifacts_if_dropped(sc, memory_id, tenant_id)
+
     except Exception:
         logger.exception("Entity extraction failed for memory %s (non-fatal)", memory_id)
+        # H-02, and the reason the check below is duplicated rather than moved
+        # into a ``finally``. The normal-path call at the end of the ``try`` is
+        # unreachable once anything between the link upsert and it raises — the
+        # relation upserts, the subject write-back, the audit log — and the rows
+        # already written stay behind for a memory that may have been dropped.
+        # That is the leak this PR exists to close, arriving by a different door.
+        #
+        # A ``finally`` would cover this in one place, but it also fires on the
+        # three early ``return``s in the ``try``, and all three are wrong for it:
+        # the no-entities exit happens before ``sc`` is even bound, so an
+        # unguarded ``finally`` raises ``NameError`` out of a fire-and-forget
+        # task; the already-dropped exit would spend a writer read to learn what
+        # it just learned; and the ``dropped`` exit would repeat a purge that had
+        # just run. Those are the common paths, not the rare ones. The flag would
+        # have to gate a ``finally`` anyway, so all ``finally`` buys is one fewer
+        # call site.
+        #
+        # Nothing is branched on. ``dropped`` has purged by the time it returns;
+        # ``live`` and ``unknown`` both mean leave it alone. ``unknown`` is the
+        # likely answer when the storage failure that landed us here is still
+        # going, and the rows do leak in that case — bounded to what was written
+        # before the raise, and reachable by governance's own purge later. The
+        # alternative was losing the audit record outright.
+        if wrote_graph_rows:
+            await _purge_written_artifacts_if_dropped(sc, memory_id, tenant_id)
