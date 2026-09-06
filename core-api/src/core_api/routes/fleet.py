@@ -317,9 +317,22 @@ async def delete_fleet(
     tenant_id: str = Query(...),
     auth: AuthContext = Depends(get_auth_context),
 ):
-    """Delete a fleet and all its nodes. Memories are NOT deleted (they retain fleet_id for history)."""
+    """Delete a fleet and all its nodes. Memories are NOT deleted (they retain fleet_id for history).
+
+    Auth: a write-capable tenant-owner key. Agent-scoped credentials are
+    blocked (BFLA) — fleet lifecycle is admin-plane, the same call the sibling
+    ``POST /fleet/{fleet_id}/purge`` makes.
+
+    Why it is needed rather than implied: ``fleet_id`` is not bound to the
+    caller's scope, and ``enforce_tenant`` only compares tenants. So without
+    this an agent-scoped key — scoped to one agent in one fleet, never to the
+    tenant — could delete ANY fleet in its tenant, taking every node row and
+    every command row belonging to those nodes (completed history included,
+    since the delete is not filtered by status).
+    """
     auth.enforce_read_only()
     auth.enforce_tenant(tenant_id)
+    auth.enforce_not_agent_credential("delete a fleet")
 
     sc = get_storage_client()
 

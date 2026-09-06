@@ -912,3 +912,72 @@ async def test_heartbeat_delivers_commands_to_a_writing_credential(client, as_au
     delivered = [c for c in resp.json()["commands"] if c["id"] == command_id]
     assert delivered, f"command {command_id} was not delivered: {resp.text}"
     assert delivered[0]["command"] == "ping"
+
+
+# ---------------------------------------------------------------------------
+# M-25: DELETE /fleet/{fleet_id} accepted an agent-scoped credential.
+#
+# ``enforce_not_agent_credential`` names fleet operations as admin-plane in its
+# own docstring, and the sibling ``POST /fleet/{fleet_id}/purge`` calls it. This
+# route carried the policy everywhere except the line enforcing it.
+#
+# These assert on STATE, not only the status code: without the guard the call
+# does not merely return 2xx, it actually deletes the fleet's node rows. A
+# status-only test would still pass against a version that refused the response
+# after doing the work.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_fleet(client, as_auth, tenant: str) -> str:
+    """Heartbeat one node into a fresh fleet; return the fleet_id."""
+    fleet_id = f"fleet-{_uid()}"
+    as_auth(tenant)
+    resp = await client.post(
+        "/api/v1/fleet/heartbeat",
+        json={"tenant_id": tenant, "node_name": f"node-{_uid()}", "fleet_id": fleet_id},
+    )
+    assert resp.status_code == 200, resp.text
+    return fleet_id
+
+
+async def _node_count(client, as_auth, tenant: str, fleet_id: str) -> int:
+    """Nodes still in ``fleet_id``. Scoped to the fleet, so it says what it means.
+
+    Re-arms the tenant credential first: the caller under test may hold an
+    agent-scoped one, which is not what should be reading this back.
+    """
+    as_auth(tenant)
+    resp = await client.get(
+        f"/api/v1/fleet/nodes?tenant_id={tenant}&fleet_id={fleet_id}"
+    )
+    assert resp.status_code == 200, resp.text
+    return len(resp.json())
+
+
+async def test_agent_credential_cannot_delete_a_fleet(client, as_auth):
+    """The finding. The key is scoped to one agent; the path param is any fleet."""
+    tenant = f"tenant-{_uid()}"
+    fleet_id = await _seed_fleet(client, as_auth, tenant)
+
+    as_auth(tenant, agent_id=f"agent-{_uid()}")
+    resp = await client.delete(f"/api/v1/fleet/{fleet_id}?tenant_id={tenant}")
+    assert resp.status_code == 403, resp.text
+
+    assert await _node_count(client, as_auth, tenant, fleet_id) == 1, (
+        f"fleet {fleet_id} was deleted despite the refusal — the guard has to "
+        "run before the storage call, not after it"
+    )
+
+
+async def test_a_tenant_credential_can_still_delete_a_fleet(client, as_auth):
+    """OVER-REFUSAL GUARD. Blocking every caller would satisfy the test above."""
+    tenant = f"tenant-{_uid()}"
+    fleet_id = await _seed_fleet(client, as_auth, tenant)
+
+    as_auth(tenant)
+    resp = await client.delete(f"/api/v1/fleet/{fleet_id}?tenant_id={tenant}")
+    assert resp.status_code == 204, resp.text
+
+    assert await _node_count(client, as_auth, tenant, fleet_id) == 0, (
+        "the fleet's node survived a delete by a credential that may delete it"
+    )
