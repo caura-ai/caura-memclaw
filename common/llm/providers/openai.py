@@ -37,6 +37,7 @@ from common.llm.constants import (
 )
 from common.llm.providers._shape_error import ProviderResponseShapeError
 from common.llm.providers._truncation import raise_if_truncated
+from common.provider_names import ProviderName
 
 logger = logging.getLogger(__name__)
 
@@ -99,11 +100,7 @@ def _is_hosted_openai(base_url: str) -> bool:
 
     The decision is by host, not by string: ``http://api.openai.com/v1`` or
     a trailing slash still count as hosted. A proxy or regional alias on
-    another host does not, on purpose: the request shapes below are chosen
-    for what the *server* accepts, and a proxy that is not api.openai.com
-    has to be assumed to take the strict shapes every compatible server
-    takes. Pointing ``OPENAI_CHAT_BASE_URL`` at such a proxy therefore
-    gives it the non-hosted shapes, which hosted OpenAI accepts as well.
+    another host does not.
     """
     return (urlsplit(base_url).hostname or "").lower() == _HOSTED_OPENAI_HOST
 
@@ -363,11 +360,11 @@ class OpenAILLMProvider:
         The ``response_format`` sent depends on the endpoint, because the
         compatible servers do not agree on what they accept:
 
-        - Hosted OpenAI (``OPENAI_HOSTED_CHAT_BASE_URL``) keeps the shapes
-          it always got: ``json_object`` without a schema, and a
-          non-strict ``json_schema`` with one.
-        - Any other base URL (a self-hosted server, Anthropic's compatible
-          endpoint, OpenRouter) gets no ``response_format`` without a
+        - Hosted OpenAI (``OPENAI_HOSTED_CHAT_BASE_URL``) and OpenRouter keep
+          the shapes they previously received: ``json_object`` without a
+          schema, and a non-strict ``json_schema`` with one.
+        - Any other base URL (a self-hosted server or Anthropic's compatible
+          endpoint) gets no ``response_format`` without a
           schema, because LM Studio and Anthropic both reject
           ``json_object``; the prompt already asks for JSON and a code
           fence in the reply is stripped before parsing. With a schema it
@@ -386,11 +383,10 @@ class OpenAILLMProvider:
 
         ``response_schema`` (A5b #3): when provided, switches to
         ``response_format={"type": "json_schema", ...}`` so the API
-        enforces the output shape server-side. ``strict=False`` —
-        Pydantic-generated schemas don't always satisfy OpenAI's strict-
-        mode requirements (additionalProperties=false everywhere); the
-        client-side Pydantic parse is the real guardrail. Passing
-        ``None`` preserves today's shape-less behaviour.
+        enforces the output shape server-side. Hosted OpenAI and OpenRouter
+        receive the source schema with ``strict=False``. Other endpoints
+        receive a closed schema from ``_strict_schema`` with ``strict=True``.
+        Passing ``None`` preserves today's shape-less behaviour.
 
         ``reasoning_effort`` (E3): forwarded to the chat completions API
         only when set, so callers doing bounded classification work (the
@@ -404,7 +400,10 @@ class OpenAILLMProvider:
         see the inline note at the call.
         """
         t0 = time.perf_counter()
-        hosted = _is_hosted_openai(self._base_url)
+        uses_openai_format = (
+            self._provider_name == ProviderName.OPENROUTER
+            or _is_hosted_openai(self._base_url)
+        )
         create_kwargs: dict = {
             "model": self._model,
             "messages": [{"role": "user", "content": prompt}],
@@ -420,12 +419,14 @@ class OpenAILLMProvider:
                 "json_schema": {
                     "name": "response",
                     "schema": (
-                        response_schema if hosted else _strict_schema(response_schema)
+                        response_schema
+                        if uses_openai_format
+                        else _strict_schema(response_schema)
                     ),
-                    "strict": not hosted,
+                    "strict": not uses_openai_format,
                 },
             }
-        elif hosted:
+        elif uses_openai_format:
             create_kwargs["response_format"] = {"type": "json_object"}
         if seed is not None:
             create_kwargs["seed"] = seed
@@ -464,7 +465,7 @@ class OpenAILLMProvider:
         parsed = json.loads(_strip_code_fence(content))
         if not isinstance(parsed, dict):
             raise OpenAIResponseShapeError(content, type(parsed).__name__)
-        if response_schema is not None and not hosted:
+        if response_schema is not None and not uses_openai_format:
             parsed = _drop_optional_nulls(parsed, response_schema)
         return parsed
 

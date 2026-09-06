@@ -32,10 +32,17 @@ from common.llm.providers.openai import (
 )
 
 HOSTED = "https://api.openai.com/v1"
+OPENROUTER = "https://openrouter.ai/api/v1"
 SELF_HOSTED = "http://localhost:1234/v1"
 
 
-def _provider(base_url: str, reply: str, sent: list[dict]) -> OpenAILLMProvider:
+def _provider(
+    base_url: str,
+    reply: str,
+    sent: list[dict],
+    *,
+    provider_name: str = "openai",
+) -> OpenAILLMProvider:
     """A real provider whose socket records the request body and answers ``reply``."""
 
     def _handler(request: httpx.Request) -> httpx.Response:
@@ -63,7 +70,10 @@ def _provider(base_url: str, reply: str, sent: list[dict]) -> OpenAILLMProvider:
         )
 
     provider = OpenAILLMProvider(
-        api_key="test-key", model="test-model", base_url=base_url
+        api_key="test-key",
+        model="test-model",
+        base_url=base_url,
+        provider_name=provider_name,
     )
     provider._client._client._transport = httpx.MockTransport(_handler)
     return provider
@@ -104,6 +114,14 @@ class TestNoSchema:
         assert await provider.complete_json("give me json") == {"ok": True}
         assert "response_format" not in sent[0]
 
+    async def test_openrouter_keeps_json_object(self):
+        sent: list[dict] = []
+        provider = _provider(
+            OPENROUTER, '{"ok": true}', sent, provider_name="openrouter"
+        )
+        assert await provider.complete_json("give me json") == {"ok": True}
+        assert sent[0]["response_format"] == {"type": "json_object"}
+
     async def test_a_fenced_reply_parses(self):
         sent: list[dict] = []
         provider = _provider(SELF_HOSTED, '```json\n{"ok": true}\n```', sent)
@@ -132,6 +150,16 @@ class TestWithSchema:
         entity = schema["$defs"]["Entity"]
         assert entity["additionalProperties"] is False
         assert entity["required"] == ["name", "kind"]
+
+    async def test_openrouter_keeps_the_compatible_schema_shape(self):
+        sent: list[dict] = []
+        provider = _provider(
+            OPENROUTER, '{"entities": []}', sent, provider_name="openrouter"
+        )
+        await provider.complete_json("extract", response_schema=SCHEMA)
+        fmt = sent[0]["response_format"]
+        assert fmt["json_schema"]["strict"] is False
+        assert fmt["json_schema"]["schema"] == SCHEMA
 
 
 class TestStrictSchema:
@@ -250,6 +278,7 @@ class TestHostedDetection:
             ("https://api.openai.com/v1/", True),
             ("http://api.openai.com/v1", True),
             ("https://API.OpenAI.com/v1", True),
+            (OPENROUTER, False),
             ("https://my-proxy.example.com/v1", False),
             ("http://localhost:1234/v1", False),
         ],
