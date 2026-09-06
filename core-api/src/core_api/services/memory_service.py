@@ -804,13 +804,18 @@ async def create_memory(data: MemoryCreate) -> MemoryOut:
         enforce_reserved_write_id(data.agent_id)
     except ReservedAgentIdError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    # C25 — sanitize caller metadata at the single entry chokepoint, BEFORE any
-    # platform writer touches it: forgeable platform-only keys (llm_ms,
-    # write_latency_ms, pii flags, …) and the _system namespace are stripped
-    # from caller input here, so everything a downstream step (governance
+    # C25 — sanitize caller metadata for the SINGLE-write path, BEFORE any
+    # platform writer touches it, so everything a downstream step (governance
     # gate, enrichment merge, row writer) adds is authentically
     # platform-written. Doing this later — e.g. in MergeEnrichmentFields —
     # would nuke the governance gate's own PII flags along with the forgeries.
+    #
+    # One of three call sites, one per write surface; bulk and update reach
+    # storage without passing through this function. Bulk and update each have
+    # a route-level test that fails if its own call is removed. THIS site does
+    # not: every test of the sanitizer drives it directly, which is exactly how
+    # the other two gaps stayed invisible. If a fourth write path appears, it
+    # needs its own call and its own route-level test.
     if data.metadata:
         data.metadata = sanitize_caller_metadata(data.metadata)
     if _USE_PIPELINE_WRITE:
@@ -1847,6 +1852,7 @@ async def create_memories_bulk(
     data: BulkMemoryCreate,
     *,
     bulk_attempt_id: str,
+    memory_type_is_agent_set: bool | None = None,
 ) -> BulkMemoryResponse:
     """Create multiple memories with per-attempt idempotency (CAURA-602).
 
@@ -1886,6 +1892,24 @@ async def create_memories_bulk(
     t0 = time.perf_counter()
     items = data.items
     n = len(items)
+
+    # C25 (M-48). This path does not go through ``create_memory``, so its
+    # sanitation did not cover POST /memories/bulk or the MCP batch tool.
+    # BEFORE the governance gate — same ordering reason as ``create_memory``,
+    # spelled out at its call site.
+    #
+    # Note what this means for the four internal callers (ingest, insights,
+    # interview, and any future one): item metadata is treated as caller input
+    # here, so a platform key placed in it is stripped like any forgery. That is
+    # the intended direction — ``PLATFORM_ONLY_KEYS`` belongs to the platform,
+    # not to a dict that arrives alongside caller content — but it means an
+    # internal caller cannot use ``metadata`` to pre-set one. Ingest was doing
+    # exactly that with ``memory_type_agent_set``; it now passes
+    # ``memory_type_is_agent_set`` instead, which is a parameter and therefore
+    # not reachable from a request body.
+    for item in items:
+        if item.metadata:
+            item.metadata = sanitize_caller_metadata(item.metadata)
 
     # -- Per-item validation. Short content used to raise a 422 for the
     # whole batch; now it's a per-item "error" result. Indices in this
@@ -2302,11 +2326,16 @@ async def create_memories_bulk(
         ts_valid_start = item.ts_valid_start
         ts_valid_end = item.ts_valid_end
 
-        # CAURA-703: provenance of memory_type. Ingest pre-stamps this False on
-        # its items (the type comes from the extraction LLM, not the caller), so
-        # honour an existing value; otherwise the type is agent-set iff the item
+        # CAURA-703: provenance of memory_type. Assigned, not ``setdefault``:
+        # the key is platform-only, so C25 sanitation above has already removed
+        # any copy that arrived in item metadata and there is nothing left to
+        # defer to. A trusted caller says so through the parameter — ingest
+        # passes False because the type comes from the extraction LLM rather
+        # than the calling agent. Otherwise the type is agent-set iff the item
         # carried one.
-        metadata.setdefault("memory_type_agent_set", item.memory_type is not None)
+        metadata["memory_type_agent_set"] = (
+            memory_type_is_agent_set if memory_type_is_agent_set is not None else item.memory_type is not None
+        )
         # Provenance of ``weight``, same three values as the single-write path
         # (MergeEnrichmentFields). Bulk items go through this merge rather than
         # the pipeline, so the flag has to be set here too or a bulk write would
@@ -4057,6 +4086,18 @@ async def update_memory(
     # regression for any caller that relied on null-as-clear. Force
     # them to opt into ``replace`` so the intent is explicit.
     if "metadata" in fields_set:
+        # C25 (M-52) — an update is caller input like any other write, and this
+        # path never sanitised it. Both modes carried it, via the two writes
+        # described above.
+        #
+        # Unlike the create-side gap, this one REWRITES governance output on an
+        # existing row: ``contains_pii``/``pii_types`` set by the gate at
+        # creation could be flipped or cleared afterwards by the same credential
+        # that wrote the memory.
+        #
+        # Falsy (``None`` or ``{}``) — nothing to strip either way.
+        if data.metadata:
+            data.metadata = sanitize_caller_metadata(data.metadata)
         effective_mode = data.metadata_mode or "merge"
         # Explicit None-check: ``{}`` is falsy, so ``or`` would
         # silently fall through to the legacy ``"metadata"`` key

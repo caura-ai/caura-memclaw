@@ -158,7 +158,7 @@ async def test_commit_stamps_doc_hash_in_metadata_when_echoed(monkeypatch):
             default_write_mode="fast",
         )
 
-    async def _fake_bulk(data, *, bulk_attempt_id):
+    async def _fake_bulk(data, *, bulk_attempt_id, memory_type_is_agent_set=None):
         import uuid as _uuid
 
         from core_api.schemas import BulkItemResult, BulkMemoryResponse
@@ -218,7 +218,7 @@ async def test_commit_does_not_stamp_doc_hash_when_omitted(monkeypatch):
             default_write_mode="fast",
         )
 
-    async def _fake_bulk(data, *, bulk_attempt_id):
+    async def _fake_bulk(data, *, bulk_attempt_id, memory_type_is_agent_set=None):
         import uuid as _uuid
 
         from core_api.schemas import BulkItemResult, BulkMemoryResponse
@@ -277,7 +277,7 @@ async def test_commit_stamps_salience_when_present_on_ingestfact(monkeypatch):
             default_write_mode="fast",
         )
 
-    async def _fake_bulk(data, *, bulk_attempt_id):
+    async def _fake_bulk(data, *, bulk_attempt_id, memory_type_is_agent_set=None):
         import uuid as _uuid
 
         from core_api.schemas import BulkItemResult, BulkMemoryResponse

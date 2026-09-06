@@ -1046,12 +1046,15 @@ async def ingest_commit(request: IngestCommitRequest) -> dict:
             # supplied request URL wins, else the fact's own source_uri
             # from preview, else "text-input".
             effective_source = request_url_override or fact.source_uri or "text-input"
+            # CAURA-703 used to be stamped here as
+            # ``metadata["memory_type_agent_set"] = False``. It moved to the
+            # ``memory_type_is_agent_set`` argument on the bulk call below,
+            # because C25 sanitation now strips PLATFORM_ONLY_KEYS from item
+            # metadata — this dict is caller-adjacent, and a platform flag put
+            # in it is indistinguishable from a forged one.
             metadata: dict = {
                 "source": "ingest",
                 "ingest_url": request_url_override or fact.source_uri or None,
-                # CAURA-703: ingest types come from the extraction LLM's
-                # suggested_type, not the calling agent — mark as not agent-set.
-                "memory_type_agent_set": False,
             }
             if request.doc_hash:
                 metadata["doc_hash"] = request.doc_hash
@@ -1108,7 +1111,13 @@ async def ingest_commit(request: IngestCommitRequest) -> dict:
                 items=batch,
             )
             try:
-                bulk_response = await create_memories_bulk(bulk_data, bulk_attempt_id=run_id)
+                bulk_response = await create_memories_bulk(
+                    bulk_data,
+                    bulk_attempt_id=run_id,
+                    # CAURA-703: every item's type came from the extraction
+                    # LLM's ``suggested_type``, never from the calling agent.
+                    memory_type_is_agent_set=False,
+                )
                 created += bulk_response.created
                 skipped_in_loop += bulk_response.duplicates
                 errored += bulk_response.errors
