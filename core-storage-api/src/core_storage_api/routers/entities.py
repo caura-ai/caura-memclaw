@@ -346,7 +346,15 @@ async def get_full_graph(
 @router.post("/relations")
 async def create_relation(request: Request) -> dict:
     body: dict = await request.json()
-    relation = await _svc.relation_add(body)
+    try:
+        relation = await _svc.relation_add(body)
+    except ValueError as e:
+        # M-64. Without this the service's endpoint-ownership refusal would
+        # surface as a 500 — indistinguishable from storage being broken, which
+        # is the same conflation ``entity_add`` and ``create_memory_entity_link``
+        # already resolved as 409. A caller naming an entity it does not own is
+        # a client error.
+        raise HTTPException(status_code=409, detail=str(e))
     return orm_to_dict(relation, RELATION_FIELDS)
 
 
