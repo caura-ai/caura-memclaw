@@ -10,6 +10,15 @@ Only the most recent releases are listed below. Every release, including those
 no longer shown here, is published with its full notes at
 [github.com/caura-ai/caura/releases](https://github.com/caura-ai/caura/releases).
 
+## [2.48.5](https://github.com/caura-ai/caura/compare/backend-v2.48.4...backend-v2.48.5) (2026-09-06)
+
+
+### Bug Fixes
+
+* **extraction:** define what "subject" means, so updates can supersede (A66) ([#1317](https://github.com/caura-ai/caura/issues/1317)) ([a1e278e](https://github.com/caura-ai/caura/commit/a1e278e31318a586ac1c487efd449755181557ed))
+* **fleet:** block agent-scoped keys from DELETE /fleet/{fleet_id} ([#1321](https://github.com/caura-ai/caura/issues/1321)) ([7f4a1a5](https://github.com/caura-ai/caura/commit/7f4a1a5f1e2e58b300af3963b4fbdbf3d1b95f13))
+* **llm:** unwrap singleton JSON arrays instead of discarding valid answers ([#1320](https://github.com/caura-ai/caura/issues/1320)) ([c8c35bd](https://github.com/caura-ai/caura/commit/c8c35bda493817882207b255e02198e2b2752445))
+
 ## [2.48.4](https://github.com/caura-ai/caura/compare/backend-v2.48.3...backend-v2.48.4) (2026-09-06)
 
 
