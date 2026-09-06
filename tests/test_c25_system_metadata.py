@@ -347,3 +347,139 @@ async def test_bulk_infers_agent_set_when_no_caller_says_otherwise():
     assert (mem["metadata_"] or {}).get("memory_type_agent_set") is True, mem[
         "metadata_"
     ]
+
+
+# --- the registry was incomplete, which made the boundary partial ------------
+#
+# M-48/M-52 fixed WHERE sanitation runs. This is WHAT it strips. Twelve keys
+# were reserved; the platform writes considerably more than twelve, and every
+# one it wrote without reserving was accepted verbatim from callers on all
+# three surfaces — including the create path, which C25 always "covered".
+#
+# Governance verdicts are the sharp end, the same class as ``contains_pii``:
+# ``GovernanceDecision`` writes ``nonbusiness_kept_private`` to record that it
+# kept a non-business memory private, and a caller could simply assert it.
+# ``near_duplicate_of`` is worse than telemetry in a different way — it is
+# documented as read back by callers to decide whether to merge or undo, so a
+# forged one redirects a decision rather than just misreporting one.
+
+_NEWLY_RESERVED: dict = {
+    # governance verdicts
+    "governance_llm_uncertain": "FORGED",
+    "nonbusiness_kept_private": "FORGED",
+    # dedup / near-duplicate outcomes
+    "near_duplicate_of": "FORGED",
+    "near_duplicate_similarity": -1.0,
+    "near_dup_skipped_reason": "FORGED",
+    "dedup_skipped_reason": "FORGED",
+    "dedup_candidate_similarity": -1.0,
+    "dedup_judge_confidence": -1.0,
+    "dedup_subject_preflight": "FORGED",
+    # timing
+    "near_dup_check_ms": -1,
+    "dedup_judge_ms": -1,
+    "triple_emission_ms": -1,
+    # lineage and enrichment output
+    "parent_memory_id": "FORGED",
+    "auto_chunked": "FORGED",
+    "child_count": -1,
+    "retrieval_hint": "FORGED",
+}
+
+
+async def _write_with_metadata(client, headers, tenant_id: str, surface: str, metadata):
+    """Write ``metadata`` through one of the three caller-facing surfaces."""
+    if surface == "create":
+        resp = await client.post(
+            "/api/v1/memories",
+            json={
+                "tenant_id": tenant_id,
+                "agent_id": f"c25-reg-{uid()}",
+                "content": f"registry boundary create {uid()}",
+                "memory_type": "fact",
+                "metadata": metadata,
+            },
+            headers=headers,
+        )
+        assert resp.status_code in (200, 201), resp.text
+        return resp.json()["id"]
+
+    if surface == "bulk":
+        resp = await client.post(
+            "/api/v1/memories/bulk",
+            json={
+                "tenant_id": tenant_id,
+                "agent_id": f"c25-reg-{uid()}",
+                "items": [
+                    {
+                        "content": f"registry boundary bulk {uid()}",
+                        "metadata": metadata,
+                    }
+                ],
+            },
+            headers={**headers, "X-Bulk-Attempt-Id": f"c25-reg-{uid()}"},
+        )
+        assert resp.status_code in (200, 201), resp.text
+        results = resp.json()["results"]
+        assert len(results) == 1, resp.text
+        memory_id = results[0].get("id")
+        assert memory_id, f"bulk item came back without an id: {results!r}"
+        return memory_id
+
+    created = await client.post(
+        "/api/v1/memories",
+        json={
+            "tenant_id": tenant_id,
+            "agent_id": f"c25-reg-{uid()}",
+            "content": f"registry boundary update {uid()}",
+            "memory_type": "fact",
+        },
+        headers=headers,
+    )
+    assert created.status_code in (200, 201), created.text
+    memory_id = created.json()["id"]
+    patched = await client.patch(
+        f"/api/v1/memories/{memory_id}?tenant_id={tenant_id}",
+        json={"metadata": metadata, "metadata_mode": "merge"},
+        headers=headers,
+    )
+    assert patched.status_code == 200, patched.text
+    return memory_id
+
+
+@pytest.mark.parametrize("surface", ["create", "bulk", "update"])
+async def test_platform_keys_outside_the_registry_are_not_forgeable(client, surface):
+    """Every reserved key, on every surface.
+
+    Asserts on the forged VALUES rather than key absence: several of these are
+    legitimately platform-written, and a test that demanded their absence would
+    fail the day the platform started writing one — reporting a security
+    regression that had not happened.
+
+    ``create`` is in the parametrize list on purpose. Before this, no test drove
+    the sanitizer through the create ROUTE at all — every one called the helper
+    directly, which is precisely how M-48 and M-52 stayed invisible.
+    """
+    tenant_id, headers = get_test_auth()
+    payload = {**_NEWLY_RESERVED, "mine": "keep me"}
+
+    memory_id = await _write_with_metadata(client, headers, tenant_id, surface, payload)
+    metadata = await _get_metadata(client, headers, tenant_id, memory_id)
+
+    survived = {k: metadata[k] for k in _NEWLY_RESERVED if k in metadata}
+    forged = {k: v for k, v in survived.items() if v == _NEWLY_RESERVED[k]}
+    assert not forged, f"caller-forged platform values reached the row: {forged!r}"
+
+    assert metadata.get("mine") == "keep me", (
+        f"over-refusal: the caller's own key was stripped: {metadata!r}"
+    )
+
+
+def test_source_is_deliberately_not_reserved():
+    """``source`` is written by the platform AND by callers.
+
+    Reserving it would strip ingest's own ``{"source": "ingest"}`` stamp — the
+    M-48 regression shape. Pinned so the next person widening this registry has
+    to read the reason before overriding it.
+    """
+    assert "source" not in PLATFORM_ONLY_KEYS

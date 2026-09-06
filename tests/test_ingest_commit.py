@@ -301,6 +301,38 @@ async def test_ingest_marks_memory_type_not_agent_set(captured):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_ingest_item_metadata_holds_no_reserved_platform_key(captured):
+    """Generalises the assertion above to the whole registry.
+
+    ``create_memories_bulk`` treats item metadata as caller input, so ANY key
+    ingest puts there that is (or later becomes) reserved is silently deleted
+    before the row is written. That is how ``memory_type_agent_set`` was lost:
+    the flag had no in-repo consumer, so nothing failed.
+
+    This fails for the next such key too — whether it is added to ingest, or
+    added to ``PLATFORM_ONLY_KEYS`` while ingest is still stamping it — which
+    the key-specific test above cannot do.
+    """
+    from core_api.services.system_metadata import PLATFORM_ONLY_KEYS, SYSTEM_NAMESPACE
+
+    req = _request("t1", "fact one", "fact two")
+    await ingest_service.ingest_commit(request=req)
+
+    assert captured.writes, "ingest wrote nothing; the assertion below is vacuous"
+    for mc in captured.writes:
+        reserved = (set(mc.metadata or {}) & PLATFORM_ONLY_KEYS) | (
+            {SYSTEM_NAMESPACE} & set(mc.metadata or {})
+        )
+        assert not reserved, (
+            f"ingest is stamping reserved platform key(s) {sorted(reserved)} into "
+            f"item metadata, where C25 sanitation deletes them before the write. "
+            f"Pass them as an argument to create_memories_bulk instead. "
+            f"metadata={mc.metadata}"
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_parent_document_written_once_per_batch(captured):
     """One ingest_commit produces exactly one ``documents`` row with
     ``collection='ingest-sources'`` and ``doc_id == run_id``. The
