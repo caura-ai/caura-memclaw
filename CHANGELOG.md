@@ -10,6 +10,13 @@ Only the most recent releases are listed below. Every release, including those
 no longer shown here, is published with its full notes at
 [github.com/caura-ai/caura/releases](https://github.com/caura-ai/caura/releases).
 
+## [2.48.4](https://github.com/caura-ai/caura/compare/backend-v2.48.3...backend-v2.48.4) (2026-09-06)
+
+
+### Bug Fixes
+
+* **storage:** scope a relation's ENDPOINTS to the tenant, not just the edge ([#1314](https://github.com/caura-ai/caura/issues/1314)) ([3e1fe1b](https://github.com/caura-ai/caura/commit/3e1fe1b9b22484b9ee2bd9a59e511ccf2ed1b5f3))
+
 ## [2.48.3](https://github.com/caura-ai/caura/compare/backend-v2.48.2...backend-v2.48.3) (2026-09-06)
 
 
